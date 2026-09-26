@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.0.3"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -51,6 +51,7 @@ class CnlangSigninV2(_PluginBase):
     _notify_style = "style1"
     _use_proxy = False
     _user_agent = None
+    _use_browser = False
 
     # 站点基础地址
     _base_url = "https://cnlang.org"
@@ -84,6 +85,7 @@ class CnlangSigninV2(_PluginBase):
         self._notify_style = config.get("notify_style") or "style1"
         self._use_proxy = bool(config.get("use_proxy"))
         self._user_agent = config.get("user_agent")
+        self._use_browser = bool(config.get("use_browser"))
         try:
             self._history_days = int(config.get("history_days") or 30)
         except (TypeError, ValueError):
@@ -118,6 +120,7 @@ class CnlangSigninV2(_PluginBase):
             "notify_style": self._notify_style,
             "use_proxy": self._use_proxy,
             "user_agent": self._user_agent,
+            "use_browser": self._use_browser,
         })
 
     def get_state(self) -> bool:
@@ -184,7 +187,14 @@ class CnlangSigninV2(_PluginBase):
 
         # 步骤1：获取签到页面，解析用户名与 formhash
         logger.info("步骤1: 获取签到页面信息...")
-        res = self.__get_res(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
+        sign_page_url = f"{self._base_url}/dsu_paulsign-sign.html?mobile=no"
+        res = self.__get_res(sign_page_url)
+        # 被 Cloudflare 拦截且开启了浏览器模式时，自动过验证刷新 Cookie 后重试
+        if self.__is_cf_blocked(res) and self._use_browser:
+            logger.info("疑似被Cloudflare拦截，启动浏览器模式过验证...")
+            if self.__refresh_cookie_by_browser():
+                logger.info("Cookie已刷新，重试获取签到页面...")
+                res = self.__get_res(sign_page_url)
         if not res or res.status_code != 200:
             reason = (f"status_code={res.status_code}" if res
                       else "无响应（网络不通或被Cloudflare拦截：请确认Cookie包含cf_clearance且UA与浏览器一致）")
@@ -293,6 +303,83 @@ class CnlangSigninV2(_PluginBase):
             return self._DIRECT_PROXIES
         logger.info("使用系统代理访问站点")
         return proxy
+
+    @staticmethod
+    def __is_cf_blocked(res) -> bool:
+        """判断响应是否疑似被 Cloudflare 拦截（无响应超时，或返回 403/503 挑战页）。"""
+        return res is None or res.status_code in (403, 503)
+
+    def __refresh_cookie_by_browser(self) -> bool:
+        """启动无头浏览器访问签到页，等待 Cloudflare 验证通过后提取最新 Cookie 与 UA 并回写配置。"""
+        try:
+            from app.sdk.browser import launch_browser_context
+        except ImportError:
+            logger.error("当前宿主不支持浏览器自动化，无法使用浏览器模式")
+            return False
+
+        ctx = None
+        try:
+            launch_kwargs = {"headless": True}
+            # 浏览器使用与插件一致的 UA，保证 cf_clearance 对 requests 流程同样有效
+            if self._user_agent:
+                launch_kwargs["user_agent"] = self._user_agent
+            # 开启代理时浏览器同样走系统代理
+            if self._use_proxy:
+                proxy = getattr(settings, "PROXY", None)
+                if proxy and proxy.get("https"):
+                    launch_kwargs["proxy"] = {"server": proxy["https"]}
+
+            ctx = launch_browser_context(**launch_kwargs)
+            page = ctx.new_page()
+            page.set_default_timeout(60000)
+            if self._cookie:
+                page.set_extra_http_headers({"cookie": self._cookie})
+
+            logger.info("浏览器模式：正在访问签到页，等待Cloudflare验证（最长约60秒）...")
+            page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
+                      wait_until="domcontentloaded", timeout=60000)
+
+            # 轮询页面内容，出现登录用户标识即说明验证已通过
+            passed = False
+            for _ in range(30):
+                html = page.content() or ""
+                if 'title="访问我的空间"' in html:
+                    passed = True
+                    break
+                time.sleep(2)
+
+            if not passed:
+                logger.error("浏览器模式：等待超时，Cloudflare验证未通过（可能需要人工完成交互验证）")
+                return False
+
+            # 提取浏览器上下文中的最新 Cookie（含 cf_clearance）
+            cookies = ctx.cookies() or []
+            cookie_str = "; ".join(f"{c.get('name')}={c.get('value')}"
+                                   for c in cookies if c.get("name"))
+            if not cookie_str:
+                logger.error("浏览器模式：未能从浏览器上下文中提取Cookie")
+                return False
+            if "cf_clearance" not in cookie_str:
+                logger.warning("浏览器模式：Cookie中未包含cf_clearance，验证可能未完全通过")
+
+            # cf_clearance 与 UA 绑定，记录浏览器实际 UA 供 requests 流程使用
+            browser_ua = page.evaluate("navigator.userAgent")
+            if browser_ua:
+                self._user_agent = browser_ua
+
+            self._cookie = cookie_str
+            self.__update_config()
+            logger.info("浏览器模式：Cloudflare验证已通过，Cookie已刷新并保存")
+            return True
+        except Exception as err:
+            logger.error(f"浏览器模式执行失败：{err}")
+            return False
+        finally:
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
 
     def __get_res(self, url: str):
         """GET 请求站点：按配置走代理，代理无响应时自动回退显式直连一次。"""
@@ -485,6 +572,23 @@ class CnlangSigninV2(_PluginBase):
                                                             'label': '使用代理',
                                                             'color': 'primary',
                                                             'prepend-icon': 'mdi-proxy'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 3},
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'use_browser',
+                                                            'label': '浏览器模式',
+                                                            'color': 'success',
+                                                            'prepend-icon': 'mdi-robot',
+                                                            'hint': '被Cloudflare拦截时自动过验证并刷新Cookie',
+                                                            'persistent-hint': True
                                                         }
                                                     }
                                                 ]
@@ -695,7 +799,8 @@ class CnlangSigninV2(_PluginBase):
             "cron": "0 7 * * *",
             "notify_style": "style1",
             "use_proxy": False,
-            "user_agent": ""
+            "user_agent": "",
+            "use_browser": False
         }
 
     # ------------------------------------------------------------------
