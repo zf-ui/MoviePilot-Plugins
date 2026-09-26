@@ -21,7 +21,7 @@ class CnlangSigninV2(_PluginBase):
     """国语视界（cnlang.org）站点自动签到插件，MoviePilot V3 规范实现。"""
 
     # 插件名称
-    plugin_name = "国语视界签到V2"
+    plugin_name = "国语视界签到V3"
     # 插件描述
     plugin_desc = "美观实用的站点签到助手"
     # 插件图标
