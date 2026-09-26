@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -50,11 +50,15 @@ class CnlangSigninV2(_PluginBase):
     _clear = False
     _notify_style = "style1"
     _use_proxy = False
+    _user_agent = None
 
     # 站点基础地址
     _base_url = "https://cnlang.org"
     # 显式直连：requests 默认会读取 HTTP(S)_PROXY 环境变量，传 None 值字典可强制绕过
     _DIRECT_PROXIES = {"http": None, "https": None}
+    # 默认 UA；Cloudflare 的 cf_clearance 与 UA 绑定，建议配置为与浏览器一致
+    _default_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     # 签到心情默认文案（一言接口不可用时的兜底）
     _default_todaysay = "一别之后，两地相思，只道是三四月，又谁知五六年。"
 
@@ -79,6 +83,7 @@ class CnlangSigninV2(_PluginBase):
         self._clear = bool(config.get("clear"))
         self._notify_style = config.get("notify_style") or "style1"
         self._use_proxy = bool(config.get("use_proxy"))
+        self._user_agent = config.get("user_agent")
         try:
             self._history_days = int(config.get("history_days") or 30)
         except (TypeError, ValueError):
@@ -112,6 +117,7 @@ class CnlangSigninV2(_PluginBase):
             "clear": self._clear,
             "notify_style": self._notify_style,
             "use_proxy": self._use_proxy,
+            "user_agent": self._user_agent,
         })
 
     def get_state(self) -> bool:
@@ -180,7 +186,8 @@ class CnlangSigninV2(_PluginBase):
         logger.info("步骤1: 获取签到页面信息...")
         res = self.__get_res(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
         if not res or res.status_code != 200:
-            reason = f"status_code={res.status_code}" if res else "无响应（请检查网络或代理设置）"
+            reason = (f"status_code={res.status_code}" if res
+                      else "无响应（网络不通或被Cloudflare拦截：请确认Cookie包含cf_clearance且UA与浏览器一致）")
             self.__notify(False, f"获取基本信息失败-{reason}")
             return
 
@@ -273,8 +280,7 @@ class CnlangSigninV2(_PluginBase):
             "Cache-Control": "max-age=0",
             "Upgrade-Insecure-Requests": "1",
             "Cookie": self._cookie or "",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": self._user_agent or self._default_ua,
         }
 
     def __get_proxies(self) -> dict:
@@ -598,9 +604,25 @@ class CnlangSigninV2(_PluginBase):
                                                             'model': 'cookie',
                                                             'label': 'Cnlang Cookie',
                                                             'rows': 5,
-                                                            'placeholder': '请填写您的Cookie信息',
+                                                            'placeholder': '请填写完整Cookie，需包含 cf_clearance',
                                                             'prepend-inner-icon': 'mdi-cookie',
-                                                            'hint': '从浏览器中获取的Cookie信息'
+                                                            'hint': '从浏览器开发者工具复制完整Cookie，必须包含 cf_clearance（Cloudflare验证）'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12},
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'user_agent',
+                                                            'label': '浏览器UA（User-Agent）',
+                                                            'placeholder': '留空使用默认UA',
+                                                            'prepend-inner-icon': 'mdi-web',
+                                                            'hint': 'cf_clearance与UA绑定，请填写与浏览器完全一致的UA（开发者工具-网络-请求标头中的User-Agent）'
                                                         }
                                                     }
                                                 ]
@@ -672,7 +694,8 @@ class CnlangSigninV2(_PluginBase):
             "history_days": 30,
             "cron": "0 7 * * *",
             "notify_style": "style1",
-            "use_proxy": False
+            "use_proxy": False,
+            "user_agent": ""
         }
 
     # ------------------------------------------------------------------
