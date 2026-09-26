@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -176,10 +176,10 @@ class CnlangSigninV2(_PluginBase):
 
         # 步骤1：获取签到页面，解析用户名与 formhash
         logger.info("步骤1: 获取签到页面信息...")
-        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(
-            url=f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
+        res = self.__get_res(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
         if not res or res.status_code != 200:
-            self.__notify(False, f"获取基本信息失败-status_code={res.status_code if res else '无响应'}")
+            reason = f"status_code={res.status_code}" if res else "无响应（请检查网络或代理设置）"
+            self.__notify(False, f"获取基本信息失败-{reason}")
             return
 
         user_info = res.text or ""
@@ -210,7 +210,7 @@ class CnlangSigninV2(_PluginBase):
         todaysay = self.__get_todaysay()
         logger.info(f"最终想说的话：{todaysay}")
         logger.info("步骤2: 提交签到请求...")
-        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).post_res(
+        res = self.__post_res(
             url=f"{self._base_url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1",
             data={
                 "formhash": formhash_value,
@@ -220,7 +220,8 @@ class CnlangSigninV2(_PluginBase):
                 "fastreply": "0",
             })
         if not res or res.status_code != 200:
-            self.__notify(False, f"请求签到接口失败-status_code={res.status_code if res else '无响应'}")
+            reason = f"status_code={res.status_code}" if res else "无响应（请检查网络或代理设置）"
+            self.__notify(False, f"请求签到接口失败-{reason}")
             return
 
         content_match = re.search(r'<div class="c">(.*?)</div>', res.text or "", re.DOTALL)
@@ -285,6 +286,22 @@ class CnlangSigninV2(_PluginBase):
         logger.info("使用系统代理访问站点")
         return proxy
 
+    def __get_res(self, url: str):
+        """GET 请求站点：按配置走代理，代理无响应时自动回退直连一次。"""
+        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(url=url)
+        if res is None and self._use_proxy:
+            logger.warning("代理请求无响应，自动回退直连重试...")
+            res = RequestUtils(headers=self.__get_headers()).get_res(url=url)
+        return res
+
+    def __post_res(self, url: str, data: dict):
+        """POST 请求站点：按配置走代理，代理无响应时自动回退直连一次。"""
+        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).post_res(url=url, data=data)
+        if res is None and self._use_proxy:
+            logger.warning("代理请求无响应，自动回退直连重试...")
+            res = RequestUtils(headers=self.__get_headers()).post_res(url=url, data=data)
+        return res
+
     def __random_sleep(self):
         """按 100-200 形式的配置随机 sleep；配置为空或格式错误时不延迟。"""
         if not self._random_delay:
@@ -314,9 +331,9 @@ class CnlangSigninV2(_PluginBase):
 
     def __fetch_money(self) -> str:
         """请求积分页面并解析当前大洋余额，失败时返回 0。"""
-        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(
-            url=f"{self._base_url}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1"
-                f"&ajaxtarget=extcreditmenu_menu")
+        res = self.__get_res(
+            f"{self._base_url}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1"
+            f"&ajaxtarget=extcreditmenu_menu")
         if res and res.status_code == 200:
             match = re.search(r'<span id="hcredit_2">(\d+)</span>', res.text or "")
             if match:
@@ -870,8 +887,7 @@ class CnlangSigninV2(_PluginBase):
 
         try:
             # 签到页面：用户名、本月签到、连续天数、今日是否已签
-            res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(
-                url=f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
+            res = self.__get_res(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
             if res and res.status_code == 200:
                 sign_info = res.text or ""
                 username_match = re.search(r'title="访问我的空间">(.*?)</a>', sign_info)
@@ -891,8 +907,7 @@ class CnlangSigninV2(_PluginBase):
             status_data["account"]["money"] = self.__fetch_money()
 
             # 用户组页面：当前用户组
-            group_res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(
-                url=f"{self._base_url}/home.php?mod=spacecp&ac=usergroup")
+            group_res = self.__get_res(f"{self._base_url}/home.php?mod=spacecp&ac=usergroup")
             if group_res and group_res.status_code == 200:
                 group_match = re.search(r'您目前属于用户组: <strong>(.*?)</strong>', group_res.text or "")
                 if group_match:
