@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -53,6 +53,8 @@ class CnlangSigninV2(_PluginBase):
 
     # 站点基础地址
     _base_url = "https://cnlang.org"
+    # 显式直连：requests 默认会读取 HTTP(S)_PROXY 环境变量，传 None 值字典可强制绕过
+    _DIRECT_PROXIES = {"http": None, "https": None}
     # 签到心情默认文案（一言接口不可用时的兜底）
     _default_todaysay = "一别之后，两地相思，只道是三四月，又谁知五六年。"
 
@@ -275,31 +277,31 @@ class CnlangSigninV2(_PluginBase):
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
 
-    def __get_proxies(self) -> Optional[dict]:
-        """按配置返回系统代理；未开启或未配置系统代理时返回 None。"""
+    def __get_proxies(self) -> dict:
+        """按配置返回代理：开启时使用系统代理，关闭时显式直连（绕过环境变量代理）。"""
         if not self._use_proxy:
-            return None
+            return self._DIRECT_PROXIES
         proxy = getattr(settings, "PROXY", None)
         if not proxy:
-            logger.warning("已开启使用代理，但未配置系统代理")
-            return None
+            logger.warning("已开启使用代理，但未配置系统代理，本次直连")
+            return self._DIRECT_PROXIES
         logger.info("使用系统代理访问站点")
         return proxy
 
     def __get_res(self, url: str):
-        """GET 请求站点：按配置走代理，代理无响应时自动回退直连一次。"""
+        """GET 请求站点：按配置走代理，代理无响应时自动回退显式直连一次。"""
         res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(url=url)
         if res is None and self._use_proxy:
             logger.warning("代理请求无响应，自动回退直连重试...")
-            res = RequestUtils(headers=self.__get_headers()).get_res(url=url)
+            res = RequestUtils(headers=self.__get_headers(), proxies=self._DIRECT_PROXIES).get_res(url=url)
         return res
 
     def __post_res(self, url: str, data: dict):
-        """POST 请求站点：按配置走代理，代理无响应时自动回退直连一次。"""
+        """POST 请求站点：按配置走代理，代理无响应时自动回退显式直连一次。"""
         res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).post_res(url=url, data=data)
         if res is None and self._use_proxy:
             logger.warning("代理请求无响应，自动回退直连重试...")
-            res = RequestUtils(headers=self.__get_headers()).post_res(url=url, data=data)
+            res = RequestUtils(headers=self.__get_headers(), proxies=self._DIRECT_PROXIES).post_res(url=url, data=data)
         return res
 
     def __random_sleep(self):
@@ -320,7 +322,8 @@ class CnlangSigninV2(_PluginBase):
         """从一言接口随机获取 6-50 字的签到心情，多次失败时使用默认文案。"""
         for attempt in range(1, 11):
             try:
-                res = RequestUtils().get_res("https://v1.hitokoto.cn/?encode=text")
+                res = RequestUtils(proxies=self._DIRECT_PROXIES).get_res(
+                    "https://v1.hitokoto.cn/?encode=text")
                 text = (res.text or "").strip() if res else ""
                 logger.info(f"尝试想说的话-{attempt}: {text}")
                 if 6 <= len(text) <= 50:
