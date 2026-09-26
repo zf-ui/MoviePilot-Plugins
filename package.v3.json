@@ -3,12 +3,13 @@
     "name": "国语视界签到V3",
     "description": "美观实用的站点签到助手",
     "labels": "站点,工具",
-    "version": "3.0.2",
+    "version": "3.0.3",
     "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png",
     "author": "xijin285",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.0.3": "新增自定义浏览器UA配置（cf_clearance与UA绑定）；优化Cloudflare拦截时的错误提示。",
       "v3.0.2": "直连时显式绕过容器代理环境变量，修复代理配置错误导致直连也失败的问题。",
       "v3.0.1": "代理请求无响应时自动回退直连重试；网络失败提示更明确。",
       "v3.0.0": "按 MoviePilot V3 插件开发规范重写：迁移至 app.sdk 稳定接口；定时任务改由宿主调度器托管；修复空响应、状态解析等多处潜在崩溃；精简页面与通知代码。"
