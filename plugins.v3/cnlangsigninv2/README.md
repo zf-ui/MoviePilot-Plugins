@@ -1,4 +1,4 @@
-# 国语视界签到V2 (CnlangSigninV2)
+# 国语视界签到V3 (CnlangSigninV2)
 
 美观实用的国语视界（cnlang.org）站点签到助手，MoviePilot V3 规范实现。
 
