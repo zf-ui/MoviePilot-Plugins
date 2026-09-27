@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -335,22 +335,42 @@ class CnlangSigninV2(_PluginBase):
             if self._cookie:
                 page.set_extra_http_headers({"cookie": self._cookie})
 
-            logger.info("浏览器模式：正在访问签到页，等待Cloudflare验证（最长约60秒）...")
-            page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
-                      wait_until="domcontentloaded", timeout=60000)
+            # 先访问站点首页：CF 验证对全站生效，首页更容易触发并完成挑战
+            logger.info("浏览器模式：正在访问站点，等待Cloudflare验证（最长约60秒）...")
+            page.goto(f"{self._base_url}/", wait_until="domcontentloaded", timeout=60000)
 
-            # 轮询页面内容，出现登录用户标识即说明验证已通过
-            passed = False
-            for _ in range(30):
-                html = page.content() or ""
-                if 'title="访问我的空间"' in html:
-                    passed = True
+            # 轮询等待 CF 签发 cf_clearance（验证通过的标志）
+            has_clearance = False
+            for i in range(30):
+                cookies = ctx.cookies() or []
+                if any(c.get("name") == "cf_clearance" for c in cookies):
+                    has_clearance = True
                     break
+                # 每10秒输出一次页面标题，便于诊断卡在哪个环节
+                if i % 5 == 0:
+                    try:
+                        logger.info(f"浏览器模式：等待验证中... 当前页面标题：{page.title()}")
+                    except Exception:
+                        pass
                 time.sleep(2)
 
-            if not passed:
+            if not has_clearance:
                 logger.error("浏览器模式：等待超时，Cloudflare验证未通过（可能需要人工完成交互验证）")
+                try:
+                    shot_path = self.get_data_path() / "cf_challenge_failed.png"
+                    shot_path.write_bytes(page.screenshot())
+                    logger.error(f"浏览器模式：失败页面截图已保存到 {shot_path}")
+                except Exception:
+                    pass
                 return False
+
+            # 验证已通过，访问签到页确认论坛登录态是否还有效
+            page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
+                      wait_until="domcontentloaded", timeout=60000)
+            time.sleep(2)
+            html = page.content() or ""
+            if 'title="访问我的空间"' not in html:
+                logger.warning("浏览器模式：CF验证已通过，但论坛登录态已失效，请重新复制完整Cookie")
 
             # 提取浏览器上下文中的最新 Cookie（含 cf_clearance）
             cookies = ctx.cookies() or []
@@ -359,8 +379,6 @@ class CnlangSigninV2(_PluginBase):
             if not cookie_str:
                 logger.error("浏览器模式：未能从浏览器上下文中提取Cookie")
                 return False
-            if "cf_clearance" not in cookie_str:
-                logger.warning("浏览器模式：Cookie中未包含cf_clearance，验证可能未完全通过")
 
             # cf_clearance 与 UA 绑定，记录浏览器实际 UA 供 requests 流程使用
             browser_ua = page.evaluate("navigator.userAgent")
