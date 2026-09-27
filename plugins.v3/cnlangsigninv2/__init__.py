@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.2.1"
+    plugin_version = "3.2.2"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -369,6 +369,11 @@ class CnlangSigninV2(_PluginBase):
             ctx = launch_browser_context(**launch_kwargs)
             page = ctx.new_page()
             page.set_default_timeout(60000)
+            # 诊断：确认配置Cookie中是否包含论坛登录态（auth）
+            has_auth = "_auth=" in (self._cookie or "")
+            cookie_keys = [p.split("=", 1)[0].strip() for p in (self._cookie or "").split(";") if "=" in p]
+            logger.info(f"浏览器模式：配置Cookie包含 {len(cookie_keys)} 个字段，"
+                        f"论坛登录态(auth)：{'有' if has_auth else '【无】'}")
             if self._cookie:
                 page.set_extra_http_headers({"cookie": self._cookie})
 
@@ -415,6 +420,13 @@ class CnlangSigninV2(_PluginBase):
 
             user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
             if not user_name_match:
+                try:
+                    logger.error(f"浏览器模式：签到页标题：{page.title()}")
+                    shot_path = self.get_data_path() / "signin_page_failed.png"
+                    shot_path.write_bytes(page.screenshot())
+                    logger.error(f"浏览器模式：签到页截图已保存到 {shot_path}")
+                except Exception:
+                    pass
                 self.__notify(False, "论坛登录态已失效，请重新复制完整Cookie（cf_clearance已自动刷新）")
                 return True
             user_name = user_name_match.group(1)
