@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -333,6 +333,14 @@ class CnlangSigninV2(_PluginBase):
         self.__update_config()
         logger.info("浏览器模式：Cookie已刷新并保存")
 
+    @staticmethod
+    def __is_cf_challenge_page(html: str, title: str) -> bool:
+        """判断页面是否为 Cloudflare 挑战页（挑战页标题固定为 Just a moment/请稍候）。"""
+        title = title or ""
+        if "Just a moment" in title or "请稍候" in title or "Attention Required" in title:
+            return True
+        return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
+
     def __signin_by_browser(self) -> bool:
         """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
 
@@ -368,22 +376,24 @@ class CnlangSigninV2(_PluginBase):
             logger.info("浏览器模式：正在访问站点，等待Cloudflare验证（最长约60秒）...")
             page.goto(f"{self._base_url}/", wait_until="domcontentloaded", timeout=60000)
 
-            # 轮询等待 CF 签发 cf_clearance（验证通过的标志）
-            has_clearance = False
+            # 轮询等待页面加载出真实内容（cf_clearance 未过期时 CF 不会重新签发，
+            # 因此以"不再是挑战页"为通过标准，而不是等待新 cf_clearance 出现）
+            passed = False
             for i in range(30):
-                cookies = ctx.cookies() or []
-                if any(c.get("name") == "cf_clearance" for c in cookies):
-                    has_clearance = True
+                try:
+                    html_now = page.content() or ""
+                    title_now = page.title() or ""
+                except Exception:
+                    html_now, title_now = "", ""
+                if html_now and not self.__is_cf_challenge_page(html_now, title_now):
+                    passed = True
                     break
                 # 每10秒输出一次页面标题，便于诊断卡在哪个环节
                 if i % 5 == 0:
-                    try:
-                        logger.info(f"浏览器模式：等待验证中... 当前页面标题：{page.title()}")
-                    except Exception:
-                        pass
+                    logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
                 time.sleep(2)
 
-            if not has_clearance:
+            if not passed:
                 logger.error("浏览器模式：等待超时，Cloudflare验证未通过（可能需要人工完成交互验证）")
                 try:
                     shot_path = self.get_data_path() / "cf_challenge_failed.png"
