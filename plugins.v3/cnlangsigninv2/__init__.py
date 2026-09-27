@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.2.3"
+    plugin_version = "3.2.4"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -129,11 +129,15 @@ class CnlangSigninV2(_PluginBase):
 
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
-        """注册远程命令 /新的一天打卡签到，通过 PluginAction 事件路由到本插件。"""
+        """注册远程命令 /cnlang_qiandao，通过 PluginAction 事件路由到本插件。
+
+        Telegram BotCommand 仅允许 a-z、0-9、下划线且不超过32字符，命令不能含中文；
+        中文说明放在 desc 中展示。
+        """
         return [{
-            "cmd": "/新的一天打卡签到",
+            "cmd": "/cnlang_qiandao",
             "event": EventType.PluginAction,
-            "desc": "国语视界打卡签到",
+            "desc": "新的一天打卡签到（国语视界）",
             "category": "站点",
             "data": {
                 "action": "cnlang_signin"
