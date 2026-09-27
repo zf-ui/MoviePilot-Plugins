@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.1.1"
+    plugin_version = "3.2.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -189,12 +189,13 @@ class CnlangSigninV2(_PluginBase):
         logger.info("步骤1: 获取签到页面信息...")
         sign_page_url = f"{self._base_url}/dsu_paulsign-sign.html?mobile=no"
         res = self.__get_res(sign_page_url)
-        # 被 Cloudflare 拦截且开启了浏览器模式时，自动过验证刷新 Cookie 后重试
+        # 被 Cloudflare 拦截且开启了浏览器模式时，由浏览器完成整个签到流程
         if self.__is_cf_blocked(res) and self._use_browser:
-            logger.info("疑似被Cloudflare拦截，启动浏览器模式过验证...")
-            if self.__refresh_cookie_by_browser():
-                logger.info("Cookie已刷新，重试获取签到页面...")
-                res = self.__get_res(sign_page_url)
+            logger.info("疑似被Cloudflare拦截，启动浏览器模式...")
+            if self.__signin_by_browser():
+                return  # 浏览器模式已完成本次签到流程（含成功与明确的失败通知）
+            logger.info("浏览器模式不可用，重试直接请求...")
+            res = self.__get_res(sign_page_url)
         if not res or res.status_code != 200:
             reason = (f"status_code={res.status_code}" if res
                       else "无响应（网络不通或被Cloudflare拦截：请确认Cookie包含cf_clearance且UA与浏览器一致）")
@@ -262,13 +263,16 @@ class CnlangSigninV2(_PluginBase):
                 f"签到时间：{sign_time}\n"
                 f"{content}")
         self.__notify(True, text)
+        self.__save_history(user_name, total_continuous_check_in, money, content, sign_time)
 
-        # 保存签到历史，并按保留天数裁剪
+    def __save_history(self, user_name: str, total_check_in: int, money: str,
+                       content: str, sign_time: str):
+        """保存一条签到历史，并按保留天数裁剪旧记录。"""
         history = self.get_data("history") or []
         history.append({
             "date": sign_time,
             "username": user_name,
-            "totalContinuousCheckIn": total_continuous_check_in,
+            "totalContinuousCheckIn": total_check_in,
             "money": money,
             "content": content,
         })
@@ -309,8 +313,33 @@ class CnlangSigninV2(_PluginBase):
         """判断响应是否疑似被 Cloudflare 拦截（无响应超时，或返回 403/503 挑战页）。"""
         return res is None or res.status_code in (403, 503)
 
-    def __refresh_cookie_by_browser(self) -> bool:
-        """启动无头浏览器访问签到页，等待 Cloudflare 验证通过后提取最新 Cookie 与 UA 并回写配置。"""
+    def __refresh_cookies_from_browser(self, ctx, page):
+        """合并浏览器新签发的Cookie与原配置Cookie（浏览器值优先），并记录浏览器实际UA。"""
+        merged = {}
+        for pair in (self._cookie or "").split(";"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                merged[key.strip()] = value.strip()
+        for c in ctx.cookies() or []:
+            if c.get("name"):
+                merged[c["name"]] = c.get("value", "")
+        self._cookie = "; ".join(f"{k}={v}" for k, v in merged.items())
+        try:
+            browser_ua = page.evaluate("navigator.userAgent")
+            if browser_ua:
+                self._user_agent = browser_ua
+        except Exception:
+            pass
+        self.__update_config()
+        logger.info("浏览器模式：Cookie已刷新并保存")
+
+    def __signin_by_browser(self) -> bool:
+        """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
+
+        cf_clearance 与 TLS 指纹绑定，requests 无法复用浏览器拿到的通行证，
+        因此签到请求必须在浏览器页面上下文内通过 fetch 完成。
+        返回 True 表示已完整处理（含成功与明确的失败通知），False 表示浏览器不可用。
+        """
         try:
             from app.sdk.browser import launch_browser_context
         except ImportError:
@@ -362,32 +391,80 @@ class CnlangSigninV2(_PluginBase):
                     logger.error(f"浏览器模式：失败页面截图已保存到 {shot_path}")
                 except Exception:
                     pass
-                return False
+                self.__notify(False, "Cloudflare验证未通过（浏览器模式等待超时）")
+                return True
 
-            # 验证已通过，访问签到页确认论坛登录态是否还有效
+            # CF 已通过，合并刷新 Cookie（保留原论坛登录态）
+            self.__refresh_cookies_from_browser(ctx, page)
+
+            # 访问签到页，解析用户名与 formhash
             page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
                       wait_until="domcontentloaded", timeout=60000)
             time.sleep(2)
             html = page.content() or ""
-            if 'title="访问我的空间"' not in html:
-                logger.warning("浏览器模式：CF验证已通过，但论坛登录态已失效，请重新复制完整Cookie")
 
-            # 提取浏览器上下文中的最新 Cookie（含 cf_clearance）
-            cookies = ctx.cookies() or []
-            cookie_str = "; ".join(f"{c.get('name')}={c.get('value')}"
-                                   for c in cookies if c.get("name"))
-            if not cookie_str:
-                logger.error("浏览器模式：未能从浏览器上下文中提取Cookie")
-                return False
+            user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
+            if not user_name_match:
+                self.__notify(False, "论坛登录态已失效，请重新复制完整Cookie（cf_clearance已自动刷新）")
+                return True
+            user_name = user_name_match.group(1)
+            logger.info(f"登录用户名为：{user_name}")
 
-            # cf_clearance 与 UA 绑定，记录浏览器实际 UA 供 requests 流程使用
-            browser_ua = page.evaluate("navigator.userAgent")
-            if browser_ua:
-                self._user_agent = browser_ua
+            if re.search(r'(您今天已经签到过了或者签到时间还未开始)', html):
+                self.__notify(True, "您今天已经签到过了或者签到时间还未开始")
+                return True
 
-            self._cookie = cookie_str
-            self.__update_config()
-            logger.info("浏览器模式：Cloudflare验证已通过，Cookie已刷新并保存")
+            formhash_match = re.search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
+            if not formhash_match:
+                self.__notify(False, "未获取到 formhash 值")
+                return True
+            formhash_value = formhash_match.group(1)
+
+            month_match = re.search(r'<p>您本月已累计签到:<b>(\d+)</b>', html)
+            total_continuous_check_in = int(month_match.group(1)) + 1 if month_match else 1
+
+            todaysay = self.__get_todaysay()
+            logger.info(f"最终想说的话：{todaysay}")
+
+            # 在浏览器页面上下文内提交签到（共享浏览器 Cookie 与 TLS 指纹）
+            logger.info("浏览器模式：提交签到请求...")
+            sign_resp = page.evaluate(
+                """async (data) => {
+                    const resp = await fetch('/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: new URLSearchParams(data).toString()
+                    });
+                    return await resp.text();
+                }""",
+                {"formhash": formhash_value, "qdxq": "kx", "qdmode": "1",
+                 "todaysay": todaysay, "fastreply": "0"})
+
+            content_match = re.search(r'<div class="c">(.*?)</div>', sign_resp or "", re.DOTALL)
+            if not content_match:
+                self.__notify(False, "获取签到后的响应内容失败")
+                return True
+            content = content_match.group(1).strip()
+            logger.info(content)
+
+            # 浏览器内获取积分信息
+            credit_html = page.evaluate(
+                """async () => {
+                    const resp = await fetch('/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu');
+                    return await resp.text();
+                }""")
+            money_match = re.search(r'<span id="hcredit_2">(\d+)</span>', credit_html or "")
+            money = money_match.group(1) if money_match else "0"
+            logger.info(f"当前大洋余额：{money}")
+
+            sign_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            text = (f"签到账号：{user_name}\n"
+                    f"累计签到：{total_continuous_check_in} 天\n"
+                    f"当前大洋：{money}\n"
+                    f"签到时间：{sign_time}\n"
+                    f"{content}")
+            self.__notify(True, text)
+            self.__save_history(user_name, total_continuous_check_in, money, content, sign_time)
             return True
         except Exception as err:
             logger.error(f"浏览器模式执行失败：{err}")
@@ -605,7 +682,7 @@ class CnlangSigninV2(_PluginBase):
                                                             'label': '浏览器模式',
                                                             'color': 'success',
                                                             'prepend-icon': 'mdi-robot',
-                                                            'hint': '被Cloudflare拦截时自动过验证并刷新Cookie',
+                                                            'hint': '被Cloudflare拦截时自动用浏览器完成签到并刷新Cookie',
                                                             'persistent-hint': True
                                                         }
                                                     }
