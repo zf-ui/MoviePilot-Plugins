@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.2.2"
+    plugin_version = "3.2.3"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -129,11 +129,11 @@ class CnlangSigninV2(_PluginBase):
 
     @staticmethod
     def get_command() -> list[dict[str, Any]]:
-        """注册远程命令 /cnlang_signin，通过 PluginAction 事件路由到本插件。"""
+        """注册远程命令 /新的一天打卡签到，通过 PluginAction 事件路由到本插件。"""
         return [{
-            "cmd": "/cnlang_signin",
+            "cmd": "/新的一天打卡签到",
             "event": EventType.PluginAction,
-            "desc": "国语视界签到",
+            "desc": "国语视界打卡签到",
             "category": "站点",
             "data": {
                 "action": "cnlang_signin"
