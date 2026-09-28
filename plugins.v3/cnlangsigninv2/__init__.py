@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.2.4"
+    plugin_version = "3.3.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -52,6 +52,8 @@ class CnlangSigninV2(_PluginBase):
     _use_proxy = False
     _user_agent = None
     _use_browser = False
+    _username = None
+    _password = None
 
     # 站点基础地址
     _base_url = "https://cnlang.org"
@@ -86,6 +88,8 @@ class CnlangSigninV2(_PluginBase):
         self._use_proxy = bool(config.get("use_proxy"))
         self._user_agent = config.get("user_agent")
         self._use_browser = bool(config.get("use_browser"))
+        self._username = config.get("username")
+        self._password = config.get("password")
         try:
             self._history_days = int(config.get("history_days") or 30)
         except (TypeError, ValueError):
@@ -121,6 +125,8 @@ class CnlangSigninV2(_PluginBase):
             "use_proxy": self._use_proxy,
             "user_agent": self._user_agent,
             "use_browser": self._use_browser,
+            "username": self._username,
+            "password": self._password,
         })
 
     def get_state(self) -> bool:
@@ -210,6 +216,11 @@ class CnlangSigninV2(_PluginBase):
 
         user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', user_info)
         if not user_name_match:
+            # 登录态失效：配置了账号密码且开启浏览器模式时，自动登录并接管签到
+            if self._use_browser and self._username and self._password:
+                logger.info("登录态失效，启动浏览器模式自动登录并签到...")
+                if self.__signin_by_browser():
+                    return
             self.__notify(False, "未获取到用户名-cookie或许已失效")
             return
         user_name = user_name_match.group(1)
@@ -345,6 +356,55 @@ class CnlangSigninV2(_PluginBase):
             return True
         return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
 
+    def __login_by_browser(self, page) -> bool:
+        """在浏览器页面上下文内用账号密码提交登录，自动恢复论坛登录态。"""
+        if not (self._username and self._password):
+            logger.error("浏览器模式：未配置登录账号密码，无法自动登录")
+            return False
+        try:
+            logger.info("浏览器模式：正在使用账号密码自动登录...")
+            # formhash 随会话生成，从当前页面提取；首页没有则访问登录页
+            html = page.content() or ""
+            formhash_match = re.search(r'name="formhash"[^>]*value="([^"]*)"', html)
+            if not formhash_match:
+                page.goto(f"{self._base_url}/member.php?mod=logging&action=login",
+                          wait_until="domcontentloaded", timeout=60000)
+                time.sleep(2)
+                html = page.content() or ""
+                formhash_match = re.search(r'name="formhash"[^>]*value="([^"]*)"', html)
+            if not formhash_match:
+                logger.error("浏览器模式：未获取到登录 formhash")
+                return False
+
+            login_resp = page.evaluate(
+                """async (data) => {
+                    const resp = await fetch('/member.php?mod=logging&action=login&loginsubmit=yes&inajax=1', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: new URLSearchParams(data).toString()
+                    });
+                    return await resp.text();
+                }""",
+                {"loginfield": "username", "username": self._username,
+                 "password": self._password, "questionid": "0", "answer": "",
+                 "formhash": formhash_match.group(1)})
+
+            resp_text = login_resp or ""
+            if "succeedhandle" in resp_text or "欢迎您回来" in resp_text:
+                logger.info("浏览器模式：账号密码登录成功")
+                return True
+
+            # 提取 Discuz 返回的失败原因（errorhandle_xxx('错误信息'））
+            err_match = re.search(r"errorhandle_\w+\('(.*?)'", resp_text)
+            err_text = err_match.group(1) if err_match else re.sub(r"<[^>]+>", "", resp_text)[:150]
+            logger.error(f"浏览器模式：登录失败 - {err_text}")
+            if "验证码" in err_text:
+                logger.error("浏览器模式：站点要求登录验证码，请在浏览器手动登录一次后重新复制Cookie")
+            return False
+        except Exception as err:
+            logger.error(f"浏览器模式：自动登录异常 - {err}")
+            return False
+
     def __signin_by_browser(self) -> bool:
         """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
 
@@ -423,6 +483,15 @@ class CnlangSigninV2(_PluginBase):
             html = page.content() or ""
 
             user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
+            if not user_name_match and self._username and self._password:
+                # 登录态失效，尝试账号密码自动登录后重试
+                if self.__login_by_browser(page):
+                    self.__refresh_cookies_from_browser(ctx, page)
+                    page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
+                              wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(2)
+                    html = page.content() or ""
+                    user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
             if not user_name_match:
                 try:
                     logger.error(f"浏览器模式：签到页标题：{page.title()}")
@@ -858,7 +927,56 @@ class CnlangSigninV2(_PluginBase):
                             }
                         ]
                     },
-                    # 使用说明卡片
+                    # 账号密码卡片（自动登录）
+                    {
+                        'component': 'VCard',
+                        'props': {'title': '账号密码（自动登录，可选）', 'variant': 'outlined', 'class': 'mb-4'},
+                        'content': [
+                            {
+                                'component': 'VCardText',
+                                'content': [
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 6},
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'username',
+                                                            'label': '论坛账号',
+                                                            'placeholder': '登录用户名',
+                                                            'prepend-inner-icon': 'mdi-account'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 6},
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'password',
+                                                            'label': '论坛密码',
+                                                            'type': 'password',
+                                                            'placeholder': '登录密码',
+                                                            'prepend-inner-icon': 'mdi-lock',
+                                                            'hint': '配置后，登录态失效时浏览器模式自动登录获取Cookie',
+                                                            'persistent-hint': True
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     {
                         'component': 'VCard',
                         'props': {'title': '使用说明', 'variant': 'outlined', 'class': 'mb-4'},
@@ -921,7 +1039,9 @@ class CnlangSigninV2(_PluginBase):
             "notify_style": "style1",
             "use_proxy": False,
             "user_agent": "",
-            "use_browser": False
+            "use_browser": False,
+            "username": "",
+            "password": ""
         }
 
     # ------------------------------------------------------------------
