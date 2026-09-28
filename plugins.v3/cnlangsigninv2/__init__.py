@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.4.0"
+    plugin_version = "3.4.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -481,57 +481,96 @@ class CnlangSigninV2(_PluginBase):
             return False
 
         ctx = None
+        page = None
         try:
             launch_kwargs = {"headless": True}
             # 浏览器使用与插件一致的 UA，保证 cf_clearance 对 requests 流程同样有效
             if self._user_agent:
                 launch_kwargs["user_agent"] = self._user_agent
             # 开启代理时浏览器同样走系统代理
+            proxy_url = None
             if self._use_proxy:
                 proxy = getattr(settings, "PROXY", None)
                 if proxy and proxy.get("https"):
-                    launch_kwargs["proxy"] = {"server": proxy["https"]}
+                    proxy_url = proxy["https"]
 
-            ctx = launch_browser_context(**launch_kwargs)
-            page = ctx.new_page()
-            page.set_default_timeout(60000)
             # 诊断：确认配置Cookie中是否包含论坛登录态（auth）
             has_auth = "_auth=" in (self._cookie or "")
             cookie_keys = [p.split("=", 1)[0].strip() for p in (self._cookie or "").split(";") if "=" in p]
             logger.info(f"浏览器模式：配置Cookie包含 {len(cookie_keys)} 个字段，"
                         f"论坛登录态(auth)：{'有' if has_auth else '【无】'}")
-            if self._cookie:
-                page.set_extra_http_headers({"cookie": self._cookie})
 
-            # 先访问站点首页：CF 验证对全站生效，首页更容易触发并完成挑战
-            logger.info("浏览器模式：正在访问站点，等待Cloudflare验证（最长约60秒）...")
-            page.goto(f"{self._base_url}/", wait_until="domcontentloaded", timeout=60000)
-
-            # 轮询等待页面加载出真实内容（cf_clearance 未过期时 CF 不会重新签发，
-            # 因此以"不再是挑战页"为通过标准，而不是等待新 cf_clearance 出现）
+            # 网络模式：配置了代理先走代理，失败后自动切直连重试一轮（代理失效不至于整轮报废）
+            network_modes = ["proxy", "direct"] if proxy_url else ["direct"]
             passed = False
-            for i in range(30):
+            for mode in network_modes:
+                if ctx:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    ctx, page = None, None
+                if mode == "proxy":
+                    launch_kwargs["proxy"] = {"server": proxy_url}
+                    logger.info("浏览器模式：按系统代理访问站点...")
+                else:
+                    launch_kwargs.pop("proxy", None)
+                    if len(network_modes) > 1:
+                        logger.info("浏览器模式：代理模式失败，改为直连重试...")
+
                 try:
-                    html_now = page.content() or ""
-                    title_now = page.title() or ""
-                except Exception:
-                    html_now, title_now = "", ""
-                if html_now and not self.__is_cf_challenge_page(html_now, title_now):
-                    passed = True
+                    ctx = launch_browser_context(**launch_kwargs)
+                    page = ctx.new_page()
+                    page.set_default_timeout(60000)
+                    if self._cookie:
+                        page.set_extra_http_headers({"cookie": self._cookie})
+
+                    # 先访问站点首页：CF 验证对全站生效，首页更容易触发并完成挑战
+                    logger.info("浏览器模式：正在访问站点，等待Cloudflare验证...")
+                    goto_failed = False
+                    try:
+                        page.goto(f"{self._base_url}/", wait_until="domcontentloaded", timeout=45000)
+                    except Exception as goto_err:
+                        # goto 超时不一定是死局：页面可能已部分加载，交给下面的轮询判断
+                        goto_failed = True
+                        logger.warning(f"浏览器模式：首页加载超时（{goto_err.__class__.__name__}），检查已加载内容...")
+                except Exception as launch_err:
+                    logger.error(f"浏览器模式：浏览器启动/访问异常 - {launch_err}")
+                    continue
+
+                # 轮询等待页面加载出真实内容（cf_clearance 未过期时 CF 不会重新签发，
+                # 因此以"不再是挑战页"为通过标准，而不是等待新 cf_clearance 出现）
+                for i in range(30):
+                    try:
+                        html_now = page.content() or ""
+                        title_now = page.title() or ""
+                    except Exception:
+                        html_now, title_now = "", ""
+                    # 连接被挂起时页面停留在空白页（about:blank），识别出来避免傻等
+                    no_content = len(html_now) < 500 and not title_now
+                    if not no_content and not self.__is_cf_challenge_page(html_now, title_now):
+                        passed = True
+                        break
+                    if goto_failed and no_content and i >= 2:
+                        logger.error("浏览器模式：服务器未返回页面内容（连接可能被挂起）")
+                        break
+                    # 每10秒输出一次页面标题，便于诊断卡在哪个环节
+                    if i % 5 == 0:
+                        logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
+                    time.sleep(2)
+
+                if passed:
                     break
-                # 每10秒输出一次页面标题，便于诊断卡在哪个环节
-                if i % 5 == 0:
-                    logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
-                time.sleep(2)
 
             if not passed:
                 logger.error("浏览器模式：等待超时，Cloudflare验证未通过（可能需要人工完成交互验证）")
-                try:
-                    shot_path = self.get_data_path() / "cf_challenge_failed.png"
-                    shot_path.write_bytes(page.screenshot())
-                    logger.error(f"浏览器模式：失败页面截图已保存到 {shot_path}")
-                except Exception:
-                    pass
+                if page:
+                    try:
+                        shot_path = self.get_data_path() / "cf_challenge_failed.png"
+                        shot_path.write_bytes(page.screenshot())
+                        logger.error(f"浏览器模式：失败页面截图已保存到 {shot_path}")
+                    except Exception:
+                        pass
                 self.__notify(False, "Cloudflare验证未通过（浏览器模式等待超时）")
                 return True
 
