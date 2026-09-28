@@ -11,6 +11,7 @@
 - 支持系统代理访问站点
 - 浏览器模式：被 Cloudflare 拦截时自动启动无头浏览器过验证、刷新 Cookie 与 UA 并重试
 - 账号密码自动登录：登录态失效时自动登录论坛获取 Cookie，无需手动复制
+- 验证码自动识别：站点开启登录验证码时自动 OCR 识别（需 `ddddocr`，见下文）
 
 ## 配置
 
@@ -33,6 +34,18 @@
 ## 远程命令
 
 - `/cnlang_qiandao`：立即执行一次签到（Telegram 命令仅支持英文/数字/下划线，故使用拼音）
+
+## 验证码自动识别（v3.4.0+）
+
+站点开启登录验证码时，插件会用 [ddddocr](https://github.com/sml2h3/ddddocr) 在浏览器模式内自动识别 4 位字符验证码，识别错误时换新验证码重试（最多 4 次，Discuz 每 15 分钟允许 5 次失败）。
+
+**依赖安装**：`ddddocr` 未内置，需在宿主环境可用。Docker 部署时在容器内执行：
+
+```bash
+pip install ddddocr
+```
+
+> 注意：`ddddocr` 依赖 onnxruntime，体积约几十 MB。若容器 Python 版本过新（如 3.14）导致 onnxruntime 无预编译包安装失败，可暂时改用「浏览器勾选自动登录后手动复制 Cookie」方式（Cookie 有效期约 30 天，期间 Cloudflare 验证由插件浏览器模式自动通过）。
 
 ## V3 重写说明（v3.0.0）
 
