@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.5.1"
+    plugin_version = "3.5.2"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -345,8 +345,34 @@ class CnlangSigninV2(_PluginBase):
             return True
         return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
 
-    def __wait_cf_pass(self, page, rounds: int = 30) -> bool:
-        """轮询等待当前页面通过 Cloudflare 验证（有真实内容且不再是挑战页）。"""
+    @staticmethod
+    def __try_click_cf_checkbox(page) -> None:
+        """尽力点击 Cloudflare Turnstile 人机验证复选框（交互式挑战不会自动通过，静默失败不影响流程）。"""
+        try:
+            frames = getattr(page, "frames", None) or []
+            mouse = getattr(page, "mouse", None)
+            if not mouse:
+                return
+            for frame in frames:
+                try:
+                    if "challenges.cloudflare.com" not in (frame.url or ""):
+                        continue
+                    el = frame.frame_element()
+                    box = el.bounding_box() if el else None
+                    if box:
+                        mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                        logger.info("浏览器模式：检测到交互式验证，已尝试点击人机验证框")
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def __wait_cf_pass(self, page, rounds: int = 30, click_checkbox: bool = False) -> bool:
+        """轮询等待当前页面通过 Cloudflare 验证（有真实内容且不再是挑战页）。
+
+        click_checkbox=True 时，等待过程中周期性尝试点击 Turnstile 复选框。
+        """
         for i in range(rounds):
             try:
                 html_now = page.content() or ""
@@ -356,6 +382,8 @@ class CnlangSigninV2(_PluginBase):
             no_content = len(html_now) < 500 and not title_now
             if not no_content and not self.__is_cf_challenge_page(html_now, title_now):
                 return True
+            if click_checkbox and not no_content and i % 3 == 1:
+                self.__try_click_cf_checkbox(page)
             if i % 5 == 0:
                 logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
             time.sleep(2)
@@ -416,8 +444,27 @@ class CnlangSigninV2(_PluginBase):
                     ctx = launch_browser_context(**launch_kwargs)
                     page = ctx.new_page()
                     page.set_default_timeout(60000)
+                    # 配置Cookie写入浏览器Cookie罐：避免请求头覆盖把浏览器新拿到的
+                    # cf_clearance 顶回旧值；add_cookies 不可用时回退请求头方式
                     if self._cookie:
-                        page.set_extra_http_headers({"cookie": self._cookie})
+                        add_cookies = getattr(ctx, "add_cookies", None)
+                        jar_cookies = []
+                        if add_cookies:
+                            for part in self._cookie.split(";"):
+                                if "=" not in part:
+                                    continue
+                                k, v = part.split("=", 1)
+                                jar_cookies.append({"name": k.strip(), "value": v.strip(),
+                                                    "domain": ".cnlang.org", "path": "/"})
+                        if add_cookies and jar_cookies:
+                            try:
+                                add_cookies(jar_cookies)
+                                logger.info(f"浏览器模式：{len(jar_cookies)} 个Cookie字段已写入浏览器会话")
+                            except Exception as cookie_err:
+                                logger.warning(f"浏览器模式：Cookie写入失败（{cookie_err}），改用请求头方式")
+                                page.set_extra_http_headers({"cookie": self._cookie})
+                        else:
+                            page.set_extra_http_headers({"cookie": self._cookie})
 
                     # 先访问站点首页：CF 验证对全站生效，首页更容易触发并完成挑战
                     logger.info("浏览器模式：正在访问站点，等待Cloudflare验证...")
@@ -478,7 +525,20 @@ class CnlangSigninV2(_PluginBase):
                           wait_until="domcontentloaded", timeout=45000)
             except Exception:
                 logger.warning("浏览器模式：签到页加载事件超时，检查已加载内容...")
-            if not self.__wait_cf_pass(page):
+            # 签到页可能单独再触发一次CF挑战：goto超时容忍，等待+重载最多3轮，
+            # 等待过程中周期性尝试点击Turnstile人机验证框（交互式挑战需点击）
+            sign_page_ok = False
+            for retry in range(3):
+                if self.__wait_cf_pass(page, rounds=10, click_checkbox=True):
+                    sign_page_ok = True
+                    break
+                if retry < 2:
+                    logger.info(f"浏览器模式：签到页挑战未通过，重载页面重试（第{retry + 2}/3轮）...")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        pass
+            if not sign_page_ok:
                 logger.error(f"浏览器模式：签到页标题：{page.title()}")
                 try:
                     shot_path = self.get_data_path() / "signin_page_failed.png"
