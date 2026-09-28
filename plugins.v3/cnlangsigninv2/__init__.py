@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.4.1"
+    plugin_version = "3.5.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -52,8 +52,6 @@ class CnlangSigninV2(_PluginBase):
     _use_proxy = False
     _user_agent = None
     _use_browser = False
-    _username = None
-    _password = None
 
     # 站点基础地址
     _base_url = "https://cnlang.org"
@@ -88,8 +86,6 @@ class CnlangSigninV2(_PluginBase):
         self._use_proxy = bool(config.get("use_proxy"))
         self._user_agent = config.get("user_agent")
         self._use_browser = bool(config.get("use_browser"))
-        self._username = config.get("username")
-        self._password = config.get("password")
         try:
             self._history_days = int(config.get("history_days") or 30)
         except (TypeError, ValueError):
@@ -125,8 +121,6 @@ class CnlangSigninV2(_PluginBase):
             "use_proxy": self._use_proxy,
             "user_agent": self._user_agent,
             "use_browser": self._use_browser,
-            "username": self._username,
-            "password": self._password,
         })
 
     def get_state(self) -> bool:
@@ -216,11 +210,6 @@ class CnlangSigninV2(_PluginBase):
 
         user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', user_info)
         if not user_name_match:
-            # 登录态失效：配置了账号密码且开启浏览器模式时，自动登录并接管签到
-            if self._use_browser and self._username and self._password:
-                logger.info("登录态失效，启动浏览器模式自动登录并签到...")
-                if self.__signin_by_browser():
-                    return
             self.__notify(False, "未获取到用户名-cookie或许已失效")
             return
         user_name = user_name_match.group(1)
@@ -356,117 +345,6 @@ class CnlangSigninV2(_PluginBase):
             return True
         return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
 
-    def __ocr_login_captcha(self, page, dialog: str) -> tuple[Optional[str], Optional[str]]:
-        """识别登录验证码，返回 (seccodehash, 识别文本)；识别不可用时返回 (None, None)。"""
-        try:
-            import base64 as b64
-            import ddddocr
-        except ImportError:
-            logger.error("浏览器模式：缺少 ddddocr 组件，无法识别验证码；"
-                         "可在容器内执行 pip install ddddocr 后重试")
-            return None, None
-        try:
-            hash_match = (re.search(r"updateseccode\('(\w+)'", dialog)
-                          or re.search(r"idhash=(\w+)", dialog)
-                          or re.search(r"seccode_(\w+)", dialog))
-            if not hash_match:
-                logger.error("浏览器模式：未找到验证码标识")
-                return None, None
-            seccodehash = hash_match.group(1)
-
-            # 在浏览器页面上下文内取验证码图片（保持会话一致），转 base64 交给 OCR
-            img_b64 = page.evaluate(
-                """async (url) => {
-                    const resp = await fetch(url);
-                    const buf = new Uint8Array(await resp.arrayBuffer());
-                    let bin = '';
-                    for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
-                    return btoa(bin);
-                }""",
-                f"/misc.php?mod=seccode&update={random.randint(10000, 99999)}&idhash={seccodehash}")
-            if not img_b64:
-                logger.error("浏览器模式：验证码图片获取失败")
-                return None, None
-            ocr = ddddocr.DdddOcr(show_ad=False)
-            code = ocr.classification(b64.b64decode(img_b64))
-            logger.info(f"浏览器模式：验证码识别结果 [{code}]")
-            return seccodehash, code
-        except Exception as err:
-            logger.error(f"浏览器模式：验证码识别异常 - {err}")
-            return None, None
-
-    def __login_by_browser(self, page) -> bool:
-        """在浏览器页面上下文内用账号密码提交登录，支持验证码自动识别与重试。"""
-        if not (self._username and self._password):
-            logger.error("浏览器模式：未配置登录账号密码，无法自动登录")
-            return False
-
-        # Discuz 默认每15分钟允许5次登录失败，最多尝试4次预留余量
-        max_attempts = 4
-        for attempt in range(1, max_attempts + 1):
-            try:
-                logger.info(f"浏览器模式：正在使用账号密码自动登录（第{attempt}次）...")
-                # 拉取登录浮窗：含本次会话的 formhash，需要验证码时也含 seccodehash
-                dialog = page.evaluate(
-                    """async () => {
-                        const resp = await fetch('/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login');
-                        return await resp.text();
-                    }""") or ""
-                formhash_match = re.search(r'name="formhash"[^>]*value="([^"]*)"', dialog)
-                if not formhash_match:
-                    logger.error("浏览器模式：未获取到登录 formhash")
-                    return False
-
-                payload = {
-                    "loginfield": "username",
-                    "username": self._username,
-                    "password": self._password,
-                    "questionid": "0",
-                    "answer": "",
-                    "formhash": formhash_match.group(1),
-                }
-
-                # 登录浮窗包含验证码时，自动识别并携带
-                if "seccode" in dialog:
-                    seccodehash, code = self.__ocr_login_captcha(page, dialog)
-                    if not code:
-                        return False
-                    payload["seccodehash"] = seccodehash
-                    payload["seccodeverify"] = code
-
-                login_resp = page.evaluate(
-                    """async (data) => {
-                        const resp = await fetch('/member.php?mod=logging&action=login&loginsubmit=yes&inajax=1', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
-                            body: new URLSearchParams(data).toString()
-                        });
-                        return await resp.text();
-                    }""",
-                    payload) or ""
-
-                if "succeedhandle" in login_resp or "欢迎您回来" in login_resp:
-                    logger.info("浏览器模式：账号密码登录成功")
-                    return True
-
-                # Discuz 错误回调形如 errorhandle_xxx('错误信息')，下划线后缀可能为空
-                err_match = re.search(r"errorhandle_\w*\('(.*?)'", login_resp)
-                err_text = err_match.group(1) if err_match else re.sub(r"<[^>]+>", "", login_resp)[:150]
-                logger.error(f"浏览器模式：登录失败 - {err_text}")
-
-                if "验证码" not in err_text:
-                    # 账号密码错误等，重试无意义
-                    return False
-                if attempt < max_attempts:
-                    logger.info("浏览器模式：验证码识别错误，换一个新验证码重试...")
-                    continue
-                logger.error("浏览器模式：验证码多次识别错误，请稍后重试或手动登录一次后复制Cookie")
-                return False
-            except Exception as err:
-                logger.error(f"浏览器模式：自动登录异常 - {err}")
-                return False
-        return False
-
     def __signin_by_browser(self) -> bool:
         """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
 
@@ -584,15 +462,6 @@ class CnlangSigninV2(_PluginBase):
             html = page.content() or ""
 
             user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
-            if not user_name_match and self._username and self._password:
-                # 登录态失效，尝试账号密码自动登录后重试
-                if self.__login_by_browser(page):
-                    self.__refresh_cookies_from_browser(ctx, page)
-                    page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
-                              wait_until="domcontentloaded", timeout=60000)
-                    time.sleep(2)
-                    html = page.content() or ""
-                    user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
             if not user_name_match:
                 try:
                     logger.error(f"浏览器模式：签到页标题：{page.title()}")
@@ -1018,56 +887,6 @@ class CnlangSigninV2(_PluginBase):
                                                             'placeholder': '留空使用默认UA',
                                                             'prepend-inner-icon': 'mdi-web',
                                                             'hint': 'cf_clearance与UA绑定，请填写与浏览器完全一致的UA（开发者工具-网络-请求标头中的User-Agent）'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # 账号密码卡片（自动登录）
-                    {
-                        'component': 'VCard',
-                        'props': {'title': '账号密码（自动登录，可选）', 'variant': 'outlined', 'class': 'mb-4'},
-                        'content': [
-                            {
-                                'component': 'VCardText',
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'username',
-                                                            'label': '论坛账号',
-                                                            'placeholder': '登录用户名',
-                                                            'prepend-inner-icon': 'mdi-account'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'password',
-                                                            'label': '论坛密码',
-                                                            'type': 'password',
-                                                            'placeholder': '登录密码',
-                                                            'prepend-inner-icon': 'mdi-lock',
-                                                            'hint': '配置后，登录态失效时浏览器模式自动登录获取Cookie',
-                                                            'persistent-hint': True
                                                         }
                                                     }
                                                 ]
