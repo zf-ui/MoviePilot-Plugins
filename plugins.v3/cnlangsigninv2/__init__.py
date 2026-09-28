@@ -27,7 +27,7 @@ class CnlangSigninV2(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
     # 插件版本
-    plugin_version = "3.5.0"
+    plugin_version = "3.5.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -345,6 +345,22 @@ class CnlangSigninV2(_PluginBase):
             return True
         return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
 
+    def __wait_cf_pass(self, page, rounds: int = 30) -> bool:
+        """轮询等待当前页面通过 Cloudflare 验证（有真实内容且不再是挑战页）。"""
+        for i in range(rounds):
+            try:
+                html_now = page.content() or ""
+                title_now = page.title() or ""
+            except Exception:
+                html_now, title_now = "", ""
+            no_content = len(html_now) < 500 and not title_now
+            if not no_content and not self.__is_cf_challenge_page(html_now, title_now):
+                return True
+            if i % 5 == 0:
+                logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
+            time.sleep(2)
+        return False
+
     def __signin_by_browser(self) -> bool:
         """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
 
@@ -456,9 +472,22 @@ class CnlangSigninV2(_PluginBase):
             self.__refresh_cookies_from_browser(ctx, page)
 
             # 访问签到页，解析用户名与 formhash
-            page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
-                      wait_until="domcontentloaded", timeout=60000)
-            time.sleep(2)
+            # 签到页可能单独再触发一次CF挑战，goto超时容忍+轮询等待挑战通过
+            try:
+                page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
+                          wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                logger.warning("浏览器模式：签到页加载事件超时，检查已加载内容...")
+            if not self.__wait_cf_pass(page):
+                logger.error(f"浏览器模式：签到页标题：{page.title()}")
+                try:
+                    shot_path = self.get_data_path() / "signin_page_failed.png"
+                    shot_path.write_bytes(page.screenshot())
+                    logger.error(f"浏览器模式：签到页截图已保存到 {shot_path}")
+                except Exception:
+                    pass
+                self.__notify(False, "签到页Cloudflare验证未通过，请稍后重试")
+                return True
             html = page.content() or ""
 
             user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
