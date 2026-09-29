@@ -19,10 +19,10 @@
 
 import random
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
 
@@ -33,6 +33,34 @@ from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
+
+try:  # 宿主 V3 依赖 pytz，优先使用与宿主一致的时区实现
+    import pytz
+except ImportError:  # pragma: no cover - 仅在宿主未提供 pytz 时回退到标准库
+    pytz = None  # type: ignore[assignment]
+
+
+def _resolve_timezone() -> Any:
+    """解析宿主配置的时区，无法解析时返回 None 交给调度器使用自身默认时区。
+
+    MoviePilot V3 依赖 ``pytz`` 但不保证容器内存在系统时区库，标准库 ``zoneinfo``
+    在精简镜像中会抛 ``ZoneInfoNotFoundError``。这里按 pytz -> zoneinfo -> 调度器
+    默认时区的顺序逐级降级，任何一步失败都只记录日志，绝不向上抛出。
+    """
+    tz_name = getattr(settings, "TZ", None) or "Asia/Shanghai"
+    if pytz is not None:
+        try:
+            return pytz.timezone(tz_name)
+        except Exception as err:  # noqa: BLE001 - 时区解析失败必须降级而非中断
+            logger.warning(f"pytz 无法解析时区 {tz_name}：{err}")
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(tz_name)
+    except Exception as err:  # noqa: BLE001 - 缺少 tzdata 时退回调度器默认时区
+        logger.warning(f"无法解析时区 {tz_name}：{err}，改用调度器默认时区")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # 站点地址与流程常量
@@ -220,7 +248,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.0"
+    plugin_version = "3.6.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -257,10 +285,18 @@ class CnlangSigninV2(_PluginBase):
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """读取配置并重建本次运行状态；允许被宿主重复调用。
 
+        宿主在“保存插件配置”流程里直接调用本方法，且只捕获
+        ``PluginMutationRejectedError``：这里抛出的任何异常都会变成 HTTP 500，
+        前端只能显示“未知错误”。因此除字段赋值外的副作用操作全部就地兜底，
+        失败只记日志，不向上抛出。
+
         :param config: 插件配置字典，None 表示按空配置初始化
         """
         # 先取消上一轮登记的一次性任务，保证重复初始化不会堆积待执行任务。
-        self.stop_service()
+        try:
+            self.stop_service()
+        except Exception as err:  # noqa: BLE001 - 停用失败不得阻断配置保存
+            logger.warning(f"停止上一轮签到服务时出错，已忽略：{err}")
 
         config = config or {}
         self._enabled = bool(config.get("enabled"))
@@ -279,9 +315,12 @@ class CnlangSigninV2(_PluginBase):
         # “清除历史记录”是开关式操作：执行一次后立即回写关闭，
         # 避免宿主重复初始化时反复清空用户数据。
         if config.get("clear"):
-            self.del_data(KEY_HISTORY)
-            self.del_data(KEY_LAST_RESULT)
-            logger.info("国语视界签到历史记录已清除")
+            try:
+                self.del_data(KEY_HISTORY)
+                self.del_data(KEY_LAST_RESULT)
+                logger.info("国语视界签到历史记录已清除")
+            except Exception as err:  # noqa: BLE001 - 清理失败不得阻断配置保存
+                logger.error(f"清除国语视界签到历史记录失败：{err}")
             self._save_config(clear=False)
 
         # “立即运行一次”登记为宿主调度器的一次性任务，不再自建调度器。
@@ -294,14 +333,20 @@ class CnlangSigninV2(_PluginBase):
         return self._enabled
 
     def stop_service(self) -> None:
-        """取消本插件登记的一次性任务；可被重复调用。"""
+        """取消本插件登记的一次性任务；可被重复调用。
+
+        宿主版本未提供 ``remove_plugin_once_job`` 时直接跳过，而不是抛出
+        ``AttributeError``：本方法会在 ``init_plugin()`` 开头被调用，一旦抛出
+        就会让配置保存接口返回 500。
+        """
         plugin_id = self.__class__.__name__
-        for job_id in (JOB_SIGNIN_ONCE, JOB_SIGNIN_DELAYED):
-            try:
-                scheduler_sdk.remove_plugin_once_job(plugin_id, job_id)
-            except Exception as err:
-                # 调度器未启动或宿主版本较旧时不应影响插件停用
-                logger.debug(f"取消一次性任务 {job_id} 失败：{err}")
+        remove_once_job = getattr(scheduler_sdk, "remove_plugin_once_job", None)
+        if remove_once_job is not None:
+            for job_id in (JOB_SIGNIN_ONCE, JOB_SIGNIN_DELAYED):
+                try:
+                    remove_once_job(plugin_id, job_id)
+                except Exception as err:  # noqa: BLE001 - 调度器未启动或版本较旧时忽略
+                    logger.debug(f"取消一次性任务 {job_id} 失败：{err}")
         logger.info("国语视界签到服务已停止")
 
     # ------------------------------------------------------------------
@@ -358,10 +403,8 @@ class CnlangSigninV2(_PluginBase):
         """插件启用且 cron 合法时，把定时签到注册到宿主调度器。"""
         if not self._enabled or not self._cron:
             return []
-        try:
-            trigger = CronTrigger.from_crontab(self._cron, timezone=ZoneInfo(settings.TZ))
-        except (ValueError, TypeError) as err:
-            logger.error(f"签到周期表达式无效：{self._cron}（{err}）")
+        trigger = self._build_trigger()
+        if trigger is None:
             return []
         return [
             {
@@ -372,6 +415,20 @@ class CnlangSigninV2(_PluginBase):
                 "kwargs": {},
             }
         ]
+
+    def _build_trigger(self) -> Optional[CronTrigger]:
+        """按当前 cron 配置构建触发器；表达式非法时返回 None。
+
+        统一捕获 ``Exception``：``ZoneInfoNotFoundError``、宿主缺少 ``TZ`` 等
+        都会在时区解析阶段抛出，只捕获 ``ValueError``/``TypeError`` 会漏掉它们。
+        """
+        if not self._cron:
+            return None
+        try:
+            return CronTrigger.from_crontab(self._cron, timezone=_resolve_timezone())
+        except Exception as err:  # noqa: BLE001 - 非法表达式不应阻断插件加载
+            logger.error(f"签到周期表达式无效：{self._cron}（{err}）")
+            return None
 
     # ------------------------------------------------------------------
     # 插件 API 实现
@@ -430,15 +487,9 @@ class CnlangSigninV2(_PluginBase):
             self.signin()
             return
         logger.info(f"国语视界签到将随机延迟 {delay} 秒后执行")
-        if not scheduler_sdk.add_plugin_once_job(
-            self.__class__.__name__,
-            JOB_SIGNIN_DELAYED,
-            self.signin,
-            "国语视界延迟签到",
-            delay_seconds=delay,
-        ):
-            logger.warning("宿主调度器未运行，忽略随机延迟直接执行签到")
-            self.signin()
+        if not self._add_once_job(JOB_SIGNIN_DELAYED, "国语视界延迟签到", delay):
+            logger.warning("宿主调度器不可用，改为在后台线程中延迟执行签到")
+            self._run_in_background(delay)
 
     def _execute_signin(self) -> Dict[str, Any]:
         """签到主流程：探测登录态 -> 提交签到 -> 汇总结果 -> 落库并通知。"""
@@ -612,10 +663,14 @@ class CnlangSigninV2(_PluginBase):
     # 配置与工具方法
     # ------------------------------------------------------------------
 
-    def _save_config(self, **overrides: Any) -> None:
-        """回写插件配置。
+    def _save_config(self, **overrides: Any) -> bool:
+        """回写插件配置；失败只记录日志，不向上抛出。
+
+        本方法在 ``init_plugin()`` 内被调用，而宿主把 ``init_plugin()`` 的异常
+        直接转成配置保存接口的 HTTP 500，因此这里必须自行兜底。
 
         :param overrides: 需要覆盖的字段，用于关闭“立即运行一次”“清除历史”等一次性开关
+        :return: 是否成功写入
         """
         config: Dict[str, Any] = {
             "enabled": self._enabled,
@@ -630,21 +685,77 @@ class CnlangSigninV2(_PluginBase):
             "clear": False,
         }
         config.update(overrides)
-        self.update_config(config)
+        try:
+            self.update_config(config)
+        except Exception as err:  # noqa: BLE001 - 回写失败不得阻断配置保存
+            logger.error(f"回写国语视界签到配置失败：{err}")
+            return False
+        return True
+
+    def _add_once_job(self, job_id: str, name: str, delay_seconds: float) -> bool:
+        """向宿主调度器登记一次性签到任务。
+
+        官方开发指南要求兼容尚未提供该接口的主程序，因此先用 ``getattr`` 探测
+        ``add_plugin_once_job``：缺失时返回 False 交由调用方兜底，而不是抛出
+        ``AttributeError``。
+
+        :param job_id: 插件内唯一的一次性任务 ID
+        :param name: 仪表盘显示的任务名称
+        :param delay_seconds: 延迟秒数
+        :return: 是否成功登记到宿主调度器
+        """
+        add_once_job = getattr(scheduler_sdk, "add_plugin_once_job", None)
+        if add_once_job is None:
+            logger.warning("当前主程序未提供 add_plugin_once_job，改用后台线程执行签到")
+            return False
+        try:
+            return bool(
+                add_once_job(
+                    self.__class__.__name__,
+                    job_id,
+                    self.signin,
+                    name,
+                    delay_seconds=delay_seconds,
+                )
+            )
+        except Exception as err:  # noqa: BLE001 - 登记失败按不可用处理，由调用方兜底
+            logger.warning(f"登记一次性签到任务失败：{err}")
+            return False
+
+    def _run_in_background(self, delay_seconds: float = 0) -> None:
+        """兜底执行：在守护线程中延迟运行一次签到。
+
+        宿主调度器不可用（或主程序版本较旧）时使用，避免在配置保存等
+        同步请求线程中直接发起网络请求。
+
+        :param delay_seconds: 延迟秒数
+        """
+
+        def _worker() -> None:
+            """等待指定延迟后执行一次签到。"""
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            try:
+                self.signin()
+            except Exception as err:  # noqa: BLE001 - 后台线程异常只记录日志
+                logger.error(f"后台执行国语视界签到失败：{err}")
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"{self.__class__.__name__}.Once",
+        ).start()
 
     def _run_once(self, delay_seconds: float = 0) -> None:
-        """把一次签到登记到宿主调度器；调度器不可用时同步执行兜底。"""
-        if scheduler_sdk.add_plugin_once_job(
-            self.__class__.__name__,
-            JOB_SIGNIN_ONCE,
-            self.signin,
-            "国语视界签到立即运行一次",
-            delay_seconds=delay_seconds,
-        ):
+        """把一次签到登记到宿主调度器；调度器不可用时用后台线程兜底。
+
+        :param delay_seconds: 延迟秒数
+        """
+        if self._add_once_job(JOB_SIGNIN_ONCE, "国语视界签到立即运行一次", delay_seconds):
             logger.info(f"国语视界签到已登记为宿主一次性任务，{delay_seconds} 秒后执行")
             return
-        logger.warning("宿主调度器未运行，改为立即同步执行一次签到")
-        self.signin()
+        logger.warning("宿主调度器不可用，改为在后台线程中执行一次签到")
+        self._run_in_background(delay_seconds)
 
     def _random_delay_seconds(self) -> int:
         """把 ``100-200`` 形式的随机延迟配置解析为秒数，非法配置按不延迟处理。"""
@@ -793,10 +904,12 @@ class CnlangSigninV2(_PluginBase):
         if not (self._enabled and self._cron):
             return "未设置"
         try:
-            timezone = ZoneInfo(settings.TZ)
-            trigger = CronTrigger.from_crontab(self._cron, timezone=timezone)
-            next_run = trigger.get_next_fire_time(None, datetime.now(tz=timezone))
-        except (ValueError, TypeError) as err:
+            trigger = self._build_trigger()
+            if trigger is None:
+                return "未设置"
+            now = datetime.now(tz=trigger.timezone) if trigger.timezone else datetime.now()
+            next_run = trigger.get_next_fire_time(None, now)
+        except Exception as err:  # noqa: BLE001 - 推算失败只影响展示，不影响运行
             logger.error(f"推算下次签到时间失败：{err}")
             return "未设置"
         return next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "未设置"

@@ -257,6 +257,7 @@ def host(monkeypatch):
         module=module,
         logger=logger,
         scheduler=_StubScheduler,
+        scheduler_module=scheduler_mod,
         request=_StubRequestUtils,
         event_cls=_StubEvent,
         response_cls=_StubResponse,
@@ -372,13 +373,82 @@ def test_onlyonce_registers_host_job_and_resets_flag(host):
     assert plugin.saved_config["onlyonce"] is False
 
 
-def test_onlyonce_falls_back_when_scheduler_unavailable(host):
-    """宿主调度器不可用时应同步执行一次签到兜底。"""
+def test_onlyonce_falls_back_to_background_thread(host, monkeypatch):
+    """宿主调度器不可用时应转入后台线程兜底，不阻塞配置保存请求。"""
     host.scheduler.available = False
+    fallback = []
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2,
+        "_run_in_background",
+        lambda self, delay_seconds=0: fallback.append(delay_seconds),
+    )
+
     plugin = _enabled_plugin(host, onlyonce=True)
 
-    # 未配置 Cookie，签到会以失败结果落库
-    assert plugin.get_data(host.module.KEY_LAST_RESULT)["success"] is False
+    assert fallback == [3]
+    assert plugin.saved_config["onlyonce"] is False
+
+
+def test_init_plugin_survives_missing_once_job_api(host, monkeypatch):
+    """主程序未提供 add_plugin_once_job 时不得抛出，改用后台线程兜底。
+
+    这正是“配置保存失败：未知错误”的直接成因：旧版本主程序的
+    ``app.sdk.scheduler`` 没有一次性任务接口，直接属性访问会抛出
+    ``AttributeError``；而宿主在配置保存流程中不捕获 ``init_plugin()`` 的异常，
+    只把它转成 HTTP 500，前端于是只显示“未知错误”。
+    """
+    monkeypatch.delattr(host.scheduler_module, "add_plugin_once_job", raising=False)
+    fallback = []
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2,
+        "_run_in_background",
+        lambda self, delay_seconds=0: fallback.append(delay_seconds),
+    )
+
+    plugin = _enabled_plugin(host, onlyonce=True)
+
+    assert fallback == [3]
+    assert plugin.get_state() is True
+
+
+def test_stop_service_survives_missing_remove_job_api(host, monkeypatch):
+    """主程序未提供 remove_plugin_once_job 时 stop_service 应静默跳过。"""
+    monkeypatch.delattr(host.scheduler_module, "remove_plugin_once_job", raising=False)
+    plugin = _enabled_plugin(host)
+
+    plugin.stop_service()  # 不应抛出 AttributeError
+
+
+def test_init_plugin_never_raises_when_internal_steps_fail(host, monkeypatch):
+    """init_plugin 内部的任何失败都必须就地兜底，不能冒泡成 HTTP 500。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(
+        type(plugin), "stop_service", lambda self: (_ for _ in ()).throw(RuntimeError("停用失败"))
+    )
+    monkeypatch.setattr(
+        type(plugin), "update_config", lambda self, config: (_ for _ in ()).throw(RuntimeError("回写失败"))
+    )
+    monkeypatch.setattr(
+        type(plugin), "del_data", lambda self, key, plugin_id=None: (_ for _ in ()).throw(RuntimeError("清理失败"))
+    )
+
+    plugin.init_plugin({"enabled": True, "cookie": "a=1", "clear": True, "onlyonce": True})
+
+    assert plugin.get_state() is True
+
+
+def test_resolve_timezone_degrades_instead_of_raising(host, monkeypatch):
+    """时区解析失败时返回 None，交由调度器使用自身默认时区。"""
+    module = host.module
+    monkeypatch.setattr(module, "pytz", None)
+    monkeypatch.setitem(sys.modules, "zoneinfo", None)
+
+    assert module._resolve_timezone() is None
+
+    plugin = module.CnlangSigninV2()
+    plugin._cron = "0 7 * * *"
+    # 表达式合法时仍应构建出触发器，只是不再指定时区
+    assert plugin._build_trigger() is not None
 
 
 def test_stop_service_is_idempotent(host):

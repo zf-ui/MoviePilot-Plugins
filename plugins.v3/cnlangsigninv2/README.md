@@ -62,6 +62,31 @@
 | POST | `/signin` | 立即执行一次签到，返回本次结果 |
 | POST | `/history/clear` | 清空签到历史与最近结果 |
 
+## v3.6.1 修复说明
+
+修复保存插件配置时前端提示 **「国语视界签到V3 配置保存失败：未知错误」** 的问题。
+
+**成因**：宿主在“保存插件配置”流程中直接调用 `init_plugin()`，而
+`PluginConfigCommand.update()` 只捕获 `PluginMutationRejectedError`，其余异常会被
+统一转成 HTTP 500 并抹掉细节（`app/factory.py` 的兜底处理器把 message 固定为
+“未知错误”）。原实现在 `init_plugin()` 里直接访问
+`app.sdk.scheduler.add_plugin_once_job`，在**未提供该接口的宿主版本**上会抛出
+`AttributeError`，于是配置永远保存不成功。
+
+**修复内容**：
+
+1. `init_plugin()` 内部的副作用操作（停止旧任务、清除历史、回写配置）全部就地兜底，
+   失败只记日志，不再向上抛出——插件异常不应让宿主的配置保存接口返回 500。
+2. 按官方开发指南的兼容要求，用 `getattr(scheduler_sdk, "add_plugin_once_job", None)`
+   探测宿主能力；缺失或登记失败时回退为**后台守护线程**执行签到，
+   `remove_plugin_once_job` 同理。
+3. 时区解析改为 `pytz` 优先、`zoneinfo` 兜底、最后交由调度器默认时区，逐级降级。
+   MoviePilot V3 依赖 `pytz` 但不保证容器内存在系统时区库，精简镜像下
+   `ZoneInfo` 会抛 `ZoneInfoNotFoundError`。
+4. `get_service()` / `_next_sign_time()` 统一走 `_build_trigger()`，异常捕获从
+   `(ValueError, TypeError)` 放宽到 `Exception`，避免漏掉时区类异常。
+5. 回归测试由 43 个增加到 47 个，覆盖上述兼容与兜底分支。
+
 ## v3.6.0 变更说明
 
 ### 已移除的能力
