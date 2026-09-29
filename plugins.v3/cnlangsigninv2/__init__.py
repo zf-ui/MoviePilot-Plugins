@@ -108,6 +108,14 @@ CF_CHALLENGE_TITLES = (
     "attention required",
     "loading",
 )
+# 挑战页正文里的 <title> 特征。页面内 fetch 只拿得到 HTML、没有页面标题，
+# 此时必须靠正文判断；这里刻意只匹配 <title> 前缀，避免把正文里偶然出现的
+# "loading" 之类字样误判为挑战页。
+CF_CHALLENGE_HTML_MARKERS = (
+    "<title>just a moment",
+    "<title>请稍候",
+    "<title>attention required",
+)
 # 未开启浏览器模式且被 Cloudflare 拦截时给出的可执行建议
 CF_ADVICE = (
     "站点启用了 Cloudflare 人机验证，纯 requests 无法通过。请任选其一：\n"
@@ -116,6 +124,30 @@ CF_ADVICE = (
     "并把「浏览器UA」改成与你浏览器完全一致的值——cf_clearance 与 UA 绑定，"
     "不一致会立即失效。"
 )
+# Cloudflare 自管 Cookie：与 UA / TLS 指纹 / IP 绑定。把旧值注入浏览器会让 CF 直接
+# 不信任该会话（旧 cf_clearance 对不上它自己的签发记录），因此注入时必须剔除，
+# 让浏览器自行取得一张全新的、自洽的通行证。论坛登录态（_auth 等）不受影响。
+CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfduid")
+CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
+# 单次挑战等待预算（秒）。挑战过程不可中断：中途 reload 会让 Turnstile 的进度归零，
+# 因此这里给单次尝试一个长预算，而不是「短等待 + 反复重载」。
+CF_CHALLENGE_BUDGET = 90
+CF_WARMUP_BUDGET = 60
+
+
+def _is_cloudflare_cookie(name: str) -> bool:
+    """判断一个 Cookie 名是否由 Cloudflare 自己管理。
+
+    这类 Cookie（cf_clearance / __cf_bm / cf_chl_* …）与签发时的 UA、TLS 指纹和 IP
+    强绑定。把用户浏览器里的旧值原样注入无头浏览器，会让 Cloudflare 发现
+    「通行证对不上自己的签发记录」而直接不信任会话——这恰恰是签到页持续下发
+    交互式挑战的常见原因。因此注入前必须剔除，由浏览器自行取得新的通行证。
+
+    :param name: Cookie 名
+    :return: 是否属于 Cloudflare 自管 Cookie
+    """
+    lowered = (name or "").strip().lower()
+    return lowered in CF_COOKIE_NAMES or lowered.startswith(CF_COOKIE_PREFIXES)
 
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
@@ -273,7 +305,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.2"
+    plugin_version = "3.6.3"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -644,10 +676,13 @@ class CnlangSigninV2(_PluginBase):
 
         context = None
         try:
-            launch_kwargs: Dict[str, Any] = {
-                "headless": True,
-                "user_agent": self._user_agent or DEFAULT_USER_AGENT,
-            }
+            # 只在用户显式配置了 UA 时才覆盖。把内置的 Chrome/131 硬套到
+            # cloakbrowser 实际的 Chromium 版本上，会造成 UA 与 Client Hints
+            # 不一致——这是 Cloudflare 判定「非真实浏览器」的典型特征，会让它持续
+            # 下发交互式挑战。未配置时交给浏览器使用自己的原生 UA。
+            launch_kwargs: Dict[str, Any] = {"headless": True}
+            if self._user_agent:
+                launch_kwargs["user_agent"] = self._user_agent
             proxy_url = self._browser_proxy_url()
             if proxy_url:
                 launch_kwargs["proxy"] = {"server": proxy_url}
@@ -657,86 +692,32 @@ class CnlangSigninV2(_PluginBase):
             page = context.new_page()
             page.set_default_timeout(60000)
             self._inject_cookies(context, page)
+            self._log_browser_identity(page)
 
-            # 先访问站点首页：Cloudflare 验证对全站生效，首页更容易触发并完成挑战
-            logger.info("浏览器模式：正在访问站点，等待 Cloudflare 验证...")
-            self._goto(page, f"https://{SITE_HOST}/")
-            if not self._wait_cf_pass(page, rounds=30):
-                self._save_failure_screenshot(page, "cf_challenge_failed.png")
+            # 直接访问签到页：它才是真正受 Cloudflare 保护的目标。实测站点首页返回
+            # 200 且**不签发 cf_clearance**，只有签到页路径下发托管挑战，因此先在
+            # 首页「热身」毫无收益，首页只在签到页失败后作为兜底手段使用。
+            logger.info("浏览器模式：正在访问签到页，等待 Cloudflare 验证...")
+            self._goto(page, SIGN_PAGE_URL)
+            html = ""
+            if self._solve_cloudflare(page, label="签到页"):
+                html = self._page_content(page)
+            if not html:
+                # 文档导航持续被挑战：改从首页用页面内 fetch 取签到页。同源 XHR 复用
+                # 已建立的 TLS 会话与 Cookie，往往能绕开只针对文档导航下发的托管挑战。
+                html = self._sign_page_via_fetch(context, page)
+            if not html:
+                logger.error(f"浏览器模式：无法取得签到页，标题：{self._page_title(page)}")
+                self._save_failure_screenshot(page, "signin_page_failed.png")
                 self._record_failure(
-                    "Cloudflare 验证未通过（浏览器模式等待超时），可能需要人工完成交互验证"
+                    "签到页 Cloudflare 验证未通过（浏览器模式等待超时）。"
+                    "可尝试关闭「浏览器模式」，改用含 cf_clearance 且 UA 与浏览器完全一致的 Cookie"
                 )
                 return True
 
             # 挑战通过后把浏览器新签发的 Cookie 合并回配置，供下次 requests 快速路径复用
             self._refresh_cookies_from_browser(context, page)
-
-            logger.info("浏览器模式：访问签到页")
-            self._goto(page, SIGN_PAGE_URL)
-            sign_page_ok = False
-            for attempt in range(3):
-                if self._wait_cf_pass(page, rounds=10, click_checkbox=True):
-                    sign_page_ok = True
-                    break
-                if attempt < 2:
-                    logger.info(f"浏览器模式：签到页挑战未通过，重载页面重试（第 {attempt + 2}/3 轮）")
-                    self._reload(page)
-            if not sign_page_ok:
-                self._save_failure_screenshot(page, "signin_page_failed.png")
-                self._record_failure("签到页 Cloudflare 验证未通过，请稍后重试")
-                return True
-
-            html = self._page_content(page)
-            user_name = self._search(r'title="访问我的空间">(.*?)</a>', html)
-            if not user_name:
-                self._save_failure_screenshot(page, "signin_page_failed.png")
-                self._record_failure("未获取到用户名，Cookie 可能已失效")
-                return True
-            logger.info(f"登录用户名：{user_name}")
-
-            if re.search(r"您今天已经签到过了或者签到时间还未开始", html):
-                logger.info("今日已完成签到，跳过提交")
-                self._record_already_signed(user_name)
-                return True
-
-            formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
-            if not formhash:
-                self._record_failure("未获取到 formhash，站点页面结构可能已变化")
-                return True
-
-            month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", html)
-            total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
-
-            logger.info("浏览器模式：在页面上下文内提交签到")
-            submitted = self._browser_fetch(
-                page,
-                SIGN_SUBMIT_URL,
-                data={
-                    "formhash": formhash,
-                    "qdxq": SIGN_MOOD,
-                    "qdmode": "1",
-                    "todaysay": self._build_say(),
-                    "fastreply": "0",
-                },
-            )
-            content = self._search(r'<div class="c">(.*?)</div>', submitted or "", flags=re.DOTALL)
-            if not content:
-                self._record_failure("获取签到后的响应内容失败")
-                return True
-            content = content.strip()
-            logger.info(f"签到响应：{content}")
-
-            credit_html = self._browser_fetch(page, CREDIT_URL) or ""
-            money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_html) or "未知"
-            logger.info(f"当前大洋余额：{money}")
-
-            self._record_success(
-                username=user_name,
-                total_signs=total_signs,
-                money=money,
-                content=content,
-            )
-            return True
+            return self._finish_browser_signin(page, html)
         except Exception as err:  # noqa: BLE001 - 浏览器异常不得冒泡到宿主调度器
             logger.error(f"浏览器模式执行失败：{err}")
             try:
@@ -761,26 +742,41 @@ class CnlangSigninV2(_PluginBase):
         return proxy or None
 
     def _inject_cookies(self, context: Any, page: Any) -> None:
-        """把配置 Cookie 写入浏览器会话。
+        """把配置 Cookie 写入浏览器会话，Cloudflare 自管 Cookie 一律剔除。
 
-        优先写入 Cookie 罐而不是请求头：请求头覆盖会把浏览器新拿到的
-        cf_clearance 顶回旧值。宿主不支持 ``add_cookies`` 时回退请求头方式。
+        两个要点：
+
+        1. 优先写入 Cookie 罐而不是请求头：请求头覆盖会把浏览器新拿到的
+           cf_clearance 顶回旧值。宿主不支持 ``add_cookies`` 时回退请求头方式。
+        2. **剔除 cf_clearance / __cf_bm / cf_chl_* 等 Cloudflare 自管 Cookie**。
+           这些值绑定签发时的 UA、TLS 指纹与 IP，原样注入会让 CF 判定「通行证
+           与自己的签发记录不符」而持续下发交互式挑战。论坛登录态（``_auth`` 等）
+           仍然保留，因此不会影响登录。
+
+        :param context: 浏览器上下文
+        :param page: 浏览器页面
         """
         if not self._cookie:
             return
         jar = []
+        kept_pairs = []
+        dropped = []
         for pair in self._cookie.split(";"):
             if "=" not in pair:
                 continue
             name, value = pair.split("=", 1)
-            jar.append(
-                {
-                    "name": name.strip(),
-                    "value": value.strip(),
-                    "domain": f".{SITE_HOST}",
-                    "path": "/",
-                }
+            name, value = name.strip(), value.strip()
+            if _is_cloudflare_cookie(name):
+                dropped.append(name)
+                continue
+            jar.append({"name": name, "value": value, "domain": f".{SITE_HOST}", "path": "/"})
+            kept_pairs.append(f"{name}={value}")
+        if dropped:
+            logger.info(
+                f"浏览器模式：跳过 {len(dropped)} 个 Cloudflare 自管 Cookie"
+                f"（{', '.join(dropped)}），交由浏览器重新获取"
             )
+
         add_cookies = getattr(context, "add_cookies", None)
         if add_cookies and jar:
             try:
@@ -790,7 +786,7 @@ class CnlangSigninV2(_PluginBase):
             except Exception as err:  # noqa: BLE001 - 回退到请求头方式
                 logger.warning(f"浏览器模式：Cookie 写入浏览器失败（{err}），改用请求头方式")
         try:
-            page.set_extra_http_headers({"cookie": self._cookie})
+            page.set_extra_http_headers({"cookie": "; ".join(kept_pairs)})
         except Exception as err:  # noqa: BLE001 - 写入失败由外层兜底
             logger.warning(f"浏览器模式：Cookie 写入请求头失败（{err}）")
 
@@ -830,18 +826,44 @@ class CnlangSigninV2(_PluginBase):
         self._save_config()
         logger.info(f"浏览器模式：已合并浏览器 {len(cookies)} 个 Cookie 并写回配置")
 
-    def _wait_cf_pass(self, page: Any, rounds: int = 30, click_checkbox: bool = False) -> bool:
-        """轮询等待当前页面通过 Cloudflare 验证。
+    def _solve_cloudflare(
+        self,
+        page: Any,
+        *,
+        label: str = "",
+        budget_seconds: int = CF_CHALLENGE_BUDGET,
+        click_checkbox: bool = True,
+        max_rounds: Optional[int] = None,
+    ) -> bool:
+        """在同一个页面上持续等待 Cloudflare 挑战通过。
 
         通过标准是「页面已有真实内容且不再是挑战页」：cf_clearance 未过期时
         Cloudflare 不会重新签发，因此不能以「出现新 Cookie」为通过标准。
 
+        与旧实现的关键区别：**等待期间不重载页面**。Turnstile 的挑战进度保存在
+        当前文档里，中途 reload 会让进度归零；旧实现「每轮只等 20 秒 + 重载重试」
+        等于每次都从零开始，签到页因此永远等不到通过。这里给单次尝试一个长预算。
+
         :param page: 浏览器页面
-        :param rounds: 最多轮询次数，每轮间隔 2 秒
-        :param click_checkbox: 等待过程中是否周期性尝试点击 Turnstile 复选框
+        :param label: 日志用的场景名（如「签到页」）
+        :param budget_seconds: 单次等待预算（秒）
+        :param click_checkbox: 是否周期性尝试点击 Turnstile 复选框
+        :param max_rounds: 轮询次数上限，默认按预算推算（每轮 2 秒）
         :return: 是否已通过验证
         """
-        for index in range(rounds):
+        if max_rounds is None:
+            max_rounds = max(int(budget_seconds / 2), 1)
+        started = time.time()
+        deadline = started + budget_seconds
+        blank_rounds = 0
+        clicks = 0
+        # 给 Turnstile 留出自动通过的时间；点击过多、过快反而会被判为机器人行为，
+        # 因此整轮最多补 3 次点击，且首次点击前先静待约 14 秒。
+        max_clicks = 3
+
+        for index in range(max_rounds):
+            if time.time() >= deadline:
+                break
             html, title = "", ""
             try:
                 html = page.content() or ""
@@ -850,34 +872,164 @@ class CnlangSigninV2(_PluginBase):
                 pass
             no_content = len(html) < 500 and not title
             if not no_content and not self._is_cf_challenge_page(html, title):
+                logger.info(
+                    f"浏览器模式：{label}验证已通过（耗时约 {int(time.time() - started)} 秒）"
+                )
                 return True
-            if click_checkbox and not no_content and index % 3 == 1:
-                self._try_click_cf_checkbox(page)
+            if no_content:
+                blank_rounds += 1
+                if blank_rounds == 5:
+                    # 连接被挂起时页面会一直停在空白页，重载一次争取拿到响应
+                    logger.warning(f"浏览器模式：{label}页面长时间空白，重载页面重试")
+                    self._reload(page)
+            else:
+                blank_rounds = 0
+                if click_checkbox and clicks < max_clicks and index % 8 == 7:
+                    if self._try_click_cf_checkbox(page):
+                        clicks += 1
             if index % 5 == 0:
-                logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title}")
+                logger.info(f"浏览器模式：等待验证中... {label}当前页面标题：{title}")
             time.sleep(2)
         return False
 
+    def _sign_page_via_fetch(self, context: Any, page: Any) -> str:
+        """文档导航持续被挑战时的兜底：改从首页用页面内 fetch 取签到页。
+
+        同源 XHR 复用浏览器已建立的 TLS 会话与全部 Cookie，且不触发只针对文档
+        导航下发的托管挑战，因此常常能拿到真实页面。取到后，后续的签到提交与
+        积分查询本来就走页面内 fetch，整条链路保持一致。
+
+        :param context: 浏览器上下文
+        :param page: 浏览器页面
+        :return: 签到页 HTML；仍被挑战或取不到时返回空串
+        """
+        logger.info("浏览器模式：签到页文档导航被挑战，改从站点首页用页面内 fetch 获取")
+        self._goto(page, f"https://{SITE_HOST}/")
+        if not self._solve_cloudflare(page, label="首页", budget_seconds=CF_WARMUP_BUDGET):
+            logger.warning("浏览器模式：首页未能加载出真实内容")
+            return ""
+        # 首页若签发了新 Cookie（含 cf_clearance）立即写回，再发起同源 fetch
+        self._refresh_cookies_from_browser(context, page)
+        html = self._browser_fetch(page, SIGN_PAGE_URL) or ""
+        if not html:
+            return ""
+        if self._is_cf_challenge_page(html, ""):
+            logger.warning("浏览器模式：页面内 fetch 仍返回 Cloudflare 挑战页")
+            return ""
+        logger.info(f"浏览器模式：页面内 fetch 已取得签到页（{len(html)} 字节）")
+        return html
+
+    def _finish_browser_signin(self, page: Any, html: str) -> bool:
+        """在浏览器页面上下文内完成解析、提交签到与积分查询。
+
+        :param page: 浏览器页面
+        :param html: 签到页 HTML（来自文档导航或页面内 fetch）
+        :return: 恒为 True——结果已由 ``_record_*`` 落库并通知
+        """
+        user_name = self._search(r'title="访问我的空间">(.*?)</a>', html)
+        if not user_name:
+            self._save_failure_screenshot(page, "signin_page_failed.png")
+            self._record_failure("未获取到用户名，Cookie 可能已失效")
+            return True
+        logger.info(f"登录用户名：{user_name}")
+
+        if re.search(r"您今天已经签到过了或者签到时间还未开始", html):
+            logger.info("今日已完成签到，跳过提交")
+            self._record_already_signed(user_name)
+            return True
+
+        formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
+        if not formhash:
+            self._record_failure("未获取到 formhash，站点页面结构可能已变化")
+            return True
+
+        month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", html)
+        total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
+
+        logger.info("浏览器模式：在页面上下文内提交签到")
+        submitted = self._browser_fetch(
+            page,
+            SIGN_SUBMIT_URL,
+            data={
+                "formhash": formhash,
+                "qdxq": SIGN_MOOD,
+                "qdmode": "1",
+                "todaysay": self._build_say(),
+                "fastreply": "0",
+            },
+        )
+        if submitted and self._is_cf_challenge_page(submitted, ""):
+            self._record_failure("签到提交被 Cloudflare 人机验证拦截")
+            return True
+        content = self._search(r'<div class="c">(.*?)</div>', submitted or "", flags=re.DOTALL)
+        if not content:
+            self._record_failure("获取签到后的响应内容失败")
+            return True
+        content = content.strip()
+        logger.info(f"签到响应：{content}")
+
+        credit_html = self._browser_fetch(page, CREDIT_URL) or ""
+        money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_html) or "未知"
+        logger.info(f"当前大洋余额：{money}")
+
+        self._record_success(
+            username=user_name,
+            total_signs=total_signs,
+            money=money,
+            content=content,
+        )
+        return True
+
+    @staticmethod
+    def _page_title(page: Any) -> str:
+        """安全读取页面标题，失败返回空串。"""
+        try:
+            return (page.title() or "").strip()
+        except Exception:  # noqa: BLE001 - 页面跳转中读取失败属正常
+            return ""
+
+    @staticmethod
+    def _log_browser_identity(page: Any) -> None:
+        """记录浏览器实际 UA，便于诊断 UA 与 Cloudflare 通行证是否自洽。"""
+        try:
+            ua = page.evaluate("navigator.userAgent")
+        except Exception as err:  # noqa: BLE001 - 取不到不影响主流程
+            logger.debug(f"浏览器模式：读取浏览器 UA 失败：{err}")
+            return
+        if ua:
+            logger.info(f"浏览器模式：浏览器实际 UA：{ua}")
+
     @staticmethod
     def _is_cf_challenge_page(html: str, title: str) -> bool:
-        """判断页面是否为 Cloudflare 挑战页。"""
+        """判断页面（或响应正文）是否为 Cloudflare 挑战页。
+
+        :param html: 页面或响应正文
+        :param title: 页面标题；页面内 fetch 只有正文时传空串
+        :return: 是否为挑战页
+        """
         lowered_title = (title or "").strip().lower()
         if any(marker in lowered_title for marker in CF_CHALLENGE_TITLES):
             return True
         lowered_html = (html or "").lower()
+        # 页面内 fetch 拿不到页面标题，只能看正文里的 <title>
+        if any(marker in lowered_html for marker in CF_CHALLENGE_HTML_MARKERS):
+            return True
         return "challenges.cloudflare.com" in lowered_html and "cf-chl" in lowered_html
 
     @staticmethod
-    def _try_click_cf_checkbox(page: Any) -> None:
+    def _try_click_cf_checkbox(page: Any) -> bool:
         """尽力点击 Cloudflare Turnstile 复选框。
 
         交互式挑战不会自动通过，点击只是提高通过率；失败静默处理，不影响主流程。
+
+        :param page: 浏览器页面
+        :return: 是否真的发出了点击
         """
         try:
             frames = getattr(page, "frames", None) or []
             mouse = getattr(page, "mouse", None)
             if not mouse:
-                return
+                return False
             for frame in frames:
                 try:
                     if "challenges.cloudflare.com" not in (frame.url or ""):
@@ -887,11 +1039,12 @@ class CnlangSigninV2(_PluginBase):
                     if box:
                         mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
                         logger.info("浏览器模式：检测到交互式验证，已尝试点击人机验证框")
-                        return
+                        return True
                 except Exception:  # noqa: BLE001 - 单个 frame 失败继续尝试下一个
                     continue
         except Exception as err:  # noqa: BLE001 - 点击失败不影响主流程
             logger.debug(f"浏览器模式：尝试点击人机验证框失败：{err}")
+        return False
 
     @staticmethod
     def _browser_fetch(

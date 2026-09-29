@@ -887,7 +887,7 @@ def test_execute_signin_reports_http_status_in_failure(host):
 
 
 class _FakePage:
-    """可编程的假页面：按需返回 HTML / 标题 / UA，并记录请求头写入。"""
+    """可编程的假页面：按需返回 HTML / 标题 / UA，并记录页面内请求。"""
 
     def __init__(self, html="", title="", user_agent="", fail_content=False):
         self._html = html
@@ -896,7 +896,10 @@ class _FakePage:
         self._fail_content = fail_content
         self.headers = {}
         self.goto_calls = []
+        self.reload_calls = []
         self.evaluate_calls = []
+        # 页面内 fetch 的返回值：{url: 响应正文}
+        self.fetch_map = {}
 
     def content(self):
         if self._fail_content:
@@ -906,10 +909,24 @@ class _FakePage:
     def title(self):
         return self._title
 
+    def goto(self, url, *args, **kwargs):
+        self.goto_calls.append(url)
+        return None
+
+    def reload(self, *args, **kwargs):
+        self.reload_calls.append(True)
+        return None
+
+    def screenshot(self, *args, **kwargs):
+        return b""
+
     def evaluate(self, expression, *args):
         self.evaluate_calls.append(expression)
         if "navigator.userAgent" in expression:
             return self._user_agent
+        if "fetch" in expression:
+            target = args[0][0] if args and args[0] else None
+            return self.fetch_map.get(target, "")
         return ""
 
     def set_extra_http_headers(self, headers):
@@ -940,6 +957,42 @@ class _FakeContext:
         self.jar.extend(jar)
 
 
+class _FakeBrowserContext:
+    """假浏览器上下文，按脚本弹出页面并记录 Cookie / 关闭动作。"""
+
+    def __init__(self, pages=None, cookies=None):
+        self._pages = list(pages or [])
+        self._cookies = cookies or []
+        self.jar = []
+        self.closed = False
+
+    def new_page(self):
+        return self._pages.pop(0) if self._pages else _FakePage()
+
+    def cookies(self):
+        return self._cookies
+
+    def add_cookies(self, jar):
+        self.jar.extend(jar)
+
+    def close(self):
+        self.closed = True
+
+
+def _install_browser_stub(monkeypatch, context):
+    """把 ``app.sdk.browser`` 装成桩模块，返回记录启动参数的列表。"""
+    calls = []
+    module = types.ModuleType("app.sdk.browser")
+
+    def launch_browser_context(**kwargs):
+        calls.append(kwargs)
+        return context
+
+    module.launch_browser_context = launch_browser_context
+    monkeypatch.setitem(sys.modules, "app.sdk.browser", module)
+    return calls
+
+
 def test_is_cf_challenge_page_covers_title_and_body(host):
     """挑战页识别应同时覆盖标题特征与正文特征，普通页面不得误判。"""
     cls = host.module.CnlangSigninV2
@@ -957,22 +1010,22 @@ def test_is_cf_challenge_page_covers_title_and_body(host):
     assert cls._is_cf_challenge_page("<html><body>hello</body></html>", "国语视界") is False
 
 
-def test_wait_cf_pass_returns_true_when_page_has_real_content(host, monkeypatch):
+def test_solve_cloudflare_returns_true_when_page_has_real_content(host, monkeypatch):
     """页面已有真实内容且不再是挑战页时应立即判定通过。"""
     plugin = _enabled_plugin(host)
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="国语视界")
 
-    assert plugin._wait_cf_pass(page, rounds=3) is True
+    assert plugin._solve_cloudflare(page, budget_seconds=6, max_rounds=3) is True
 
 
-def test_wait_cf_pass_returns_false_on_persistent_challenge(host, monkeypatch):
+def test_solve_cloudflare_returns_false_on_persistent_challenge(host, monkeypatch):
     """持续停留在挑战页时应耗尽轮询并返回 False。"""
     plugin = _enabled_plugin(host)
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="Just a moment...")
 
-    assert plugin._wait_cf_pass(page, rounds=3) is False
+    assert plugin._solve_cloudflare(page, budget_seconds=6, max_rounds=3) is False
 
 
 def test_inject_cookies_prefers_browser_cookie_jar(host):
@@ -1072,6 +1125,243 @@ def test_browser_proxy_url_supports_dict_form(host, monkeypatch):
     plugin = _enabled_plugin(host, use_proxy=True)
 
     assert plugin._browser_proxy_url() == "https://p:2"
+
+
+# --- Cloudflare 自管 Cookie 的剔除 -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("cf_clearance", True),
+        ("CF_CLEARANCE", True),
+        ("__cf_bm", True),
+        ("__cfduid", True),
+        ("cf_chl_2", True),
+        ("cf_chl_opt", True),
+        # 论坛登录态与普通 Cookie 不得被误剔
+        ("_auth", False),
+        ("saltkey", False),
+        ("3rir_2132_sid", False),
+        ("cfx", False),
+        ("", False),
+    ],
+)
+def test_is_cloudflare_cookie(host, name, expected):
+    """只识别 Cloudflare 自管 Cookie，不能误伤论坛登录态。"""
+    assert host.module._is_cloudflare_cookie(name) is expected
+
+
+def test_inject_cookies_drops_cloudflare_cookies(host):
+    """cf_clearance 等 CF 自管 Cookie 必须剔除，论坛登录态必须保留。
+
+    旧值绑定签发时的 UA / TLS 指纹 / IP，注入浏览器会让 CF 判定「通行证与自己的
+    签发记录不符」而持续下发交互式挑战。
+    """
+    plugin = _enabled_plugin(
+        host, cookie="_auth=abc; cf_clearance=stale; __cf_bm=x; saltkey=sk"
+    )
+    context = _FakeContext(add_cookies=True)
+
+    plugin._inject_cookies(context, _FakePage())
+
+    assert [c["name"] for c in context.jar] == ["_auth", "saltkey"]
+
+
+def test_inject_cookies_header_fallback_also_drops_cloudflare(host):
+    """回退到请求头方式时同样要剔除 CF 自管 Cookie。"""
+    plugin = _enabled_plugin(host, cookie="_auth=abc; cf_clearance=stale")
+    page = _FakePage()
+
+    plugin._inject_cookies(_FakeContext(add_cookies=None), page)
+
+    assert page.headers == {"cookie": "_auth=abc"}
+
+
+# --- 挑战等待策略 ------------------------------------------------------------
+
+
+def test_solve_cloudflare_does_not_reload_challenge_page(host, monkeypatch):
+    """挑战页不应被反复重载——重载会让 Turnstile 的进度归零。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="Just a moment...")
+
+    assert plugin._solve_cloudflare(page, budget_seconds=10, max_rounds=5) is False
+    assert page.reload_calls == []
+
+
+def test_solve_cloudflare_reloads_when_page_stays_blank(host, monkeypatch):
+    """页面长时间空白（连接被挂起）时应重载一次争取拿到响应。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    page = _FakePage(html="", title="")
+
+    assert plugin._solve_cloudflare(page, budget_seconds=30, max_rounds=8) is False
+    assert page.reload_calls == [True]
+
+
+def test_solve_cloudflare_limits_checkbox_clicks(host, monkeypatch):
+    """补点人机验证框的次数要有上限，高频点击反而会被判为机器人。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    clicks = []
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_try_click_cf_checkbox", staticmethod(lambda page: clicks.append(1) or True)
+    )
+    page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="Just a moment...")
+
+    plugin._solve_cloudflare(page, budget_seconds=200, max_rounds=100)
+
+    assert len(clicks) == 3
+
+
+# --- 浏览器启动参数 ----------------------------------------------------------
+
+
+def test_browser_mode_does_not_override_user_agent_by_default(host, monkeypatch):
+    """未配置 UA 时不应把内置 Chrome/131 强加给浏览器。
+
+    UA 与 Client Hints 不一致会被 Cloudflare 判为「非真实浏览器」，从而持续下发
+    交互式挑战——这正是签到页卡住的原因之一。
+    """
+    plugin = _enabled_plugin(host, user_agent="", browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    plugin._signin_by_browser()
+
+    assert calls and calls[0]["headless"] is True
+    assert "user_agent" not in calls[0]
+
+
+def test_browser_mode_passes_explicitly_configured_user_agent(host, monkeypatch):
+    """用户显式配置了 UA 时必须原样传给浏览器。"""
+    plugin = _enabled_plugin(host, user_agent="MyUA/1.0", browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    plugin._signin_by_browser()
+
+    assert calls[0]["user_agent"] == "MyUA/1.0"
+
+
+# --- 页面内 fetch 兜底 -------------------------------------------------------
+
+
+def test_sign_page_via_fetch_rejects_challenge_response(host, monkeypatch):
+    """页面内 fetch 若仍返回挑战页，应判定失败，而不是把挑战页当业务页解析。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    page = _FakePage()
+    page.fetch_map = {module.SIGN_PAGE_URL: CF_CHALLENGE_BODY}
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+    )
+
+    assert plugin._sign_page_via_fetch(_FakeBrowserContext(pages=[page]), page) == ""
+
+
+def test_browser_mode_falls_back_to_in_page_fetch(host, monkeypatch):
+    """签到页文档导航被挑战时应改走页面内 fetch，并在页面上下文内完成签到。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(user_agent="RealUA")
+    page.fetch_map = {
+        module.SIGN_PAGE_URL: (
+            '<input name="formhash" value="ff00" />'
+            '<a title="访问我的空间">tester</a>'
+        ),
+        module.SIGN_SUBMIT_URL: '<div class="c">恭喜，签到成功</div>',
+        module.CREDIT_URL: '<span id="hcredit_2">777</span>',
+    }
+    _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    # 文档导航（签到页）始终被挑战，但首页正常
+    monkeypatch.setattr(
+        module.CnlangSigninV2,
+        "_solve_cloudflare",
+        lambda self, page, **kwargs: kwargs.get("label") == "首页",
+    )
+
+    result = plugin._signin_by_browser()
+
+    assert result is True
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is True
+    assert last["username"] == "tester"
+    assert last["money"] == "777"
+    # 浏览器实际 UA 应被记录，供后续 requests 快速路径复用
+    assert plugin.saved_config["user_agent"] == "RealUA"
+
+
+def test_browser_mode_reports_failure_when_both_paths_challenged(host, monkeypatch):
+    """文档导航与页面内 fetch 都被挑战时应给出明确失败原因。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+
+    assert plugin._signin_by_browser() is True
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is False
+    assert "Cloudflare" in last["content"]
+
+
+def test_finish_browser_signin_reports_challenged_submit(host):
+    """签到提交返回挑战页时应给出明确原因，而不是「未获取到响应内容」。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    page = _FakePage()
+    page.fetch_map = {module.SIGN_SUBMIT_URL: CF_CHALLENGE_BODY}
+    html = '<input name="formhash" value="ff00" /><a title="访问我的空间">tester</a>'
+
+    plugin._finish_browser_signin(page, html)
+
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is False
+    assert "Cloudflare" in last["content"]
+
+
+def test_finish_browser_signin_records_success(host):
+    """页面上下文内取到响应内容时应正常落库成功结果。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    page = _FakePage()
+    page.fetch_map = {
+        module.SIGN_SUBMIT_URL: '<div class="c">恭喜，签到成功</div>',
+        module.CREDIT_URL: '<span id="hcredit_2">321</span>',
+    }
+    html = (
+        '<input name="formhash" value="ff00" />'
+        '<a title="访问我的空间">tester</a>'
+        "<p>您本月已累计签到:<b>4</b>"
+    )
+
+    plugin._finish_browser_signin(page, html)
+
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is True
+    assert last["money"] == "321"
+    assert last["total_signs"] == 5
 
 
 def test_execute_signin_without_cookie_records_failure(host):
