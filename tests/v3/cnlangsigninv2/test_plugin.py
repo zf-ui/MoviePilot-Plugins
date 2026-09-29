@@ -1079,6 +1079,7 @@ def test_refresh_cookies_records_browser_user_agent(host):
 
     否则写回的 Cookie 配上一个不同的 UA 会立即失效，requests 快速路径永远走不通。
     """
+    module = host.module
     plugin = _enabled_plugin(host, cookie="sid=abc", user_agent="ConfiguredUA")
     context = _FakeContext(
         cookies=[{"name": "cf_clearance", "value": "fresh"}, {"name": "sid", "value": "abc"}]
@@ -1088,8 +1089,25 @@ def test_refresh_cookies_records_browser_user_agent(host):
     plugin._refresh_cookies_from_browser(context, page)
 
     assert plugin._user_agent == "BrowserRealUA"
-    assert "cf_clearance=fresh" in plugin._cookie
     assert plugin.saved_config["user_agent"] == "BrowserRealUA"
+    # Cloudflare 通行证单独缓存，不污染用户配置的 Cookie 字段
+    assert plugin._cf_cookies == "cf_clearance=fresh"
+    assert plugin.store[module.KEY_CF_COOKIES] == "cf_clearance=fresh"
+    assert "cf_clearance" not in (plugin._cookie or "")
+    assert "sid=abc" in plugin._cookie
+
+
+def test_refresh_cookies_keeps_configured_cookie_when_browser_has_none(host):
+    """浏览器没给出任何非 CF Cookie 时，用户配置的 Cookie 不能被清空。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc; saltkey=xyz", user_agent="ConfiguredUA")
+
+    plugin._refresh_cookies_from_browser(
+        _FakeContext(cookies=[{"name": "cf_clearance", "value": "fresh"}]), _FakePage()
+    )
+
+    assert "sid=abc" in plugin._cookie
+    assert "saltkey=xyz" in plugin._cookie
+    assert "cf_clearance" not in plugin._cookie
 
 
 def test_refresh_cookies_survives_broken_browser_api(host):
@@ -1310,20 +1328,213 @@ def test_browser_mode_falls_back_to_in_page_fetch(host, monkeypatch):
 
 
 def test_browser_mode_reports_failure_when_both_paths_challenged(host, monkeypatch):
-    """文档导航与页面内 fetch 都被挑战时应给出明确失败原因。"""
+    """文档导航与页面内 fetch 都被挑战时应给出明确失败原因，并已尝试有头模式。"""
     module = host.module
     plugin = _enabled_plugin(host, browser_mode=True)
     page = _FakePage(html="", title="Just a moment...")
-    _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page, _FakePage()]))
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     assert plugin._signin_by_browser() is True
     last = plugin.get_data(module.KEY_LAST_RESULT)
     assert last["success"] is False
     assert "Cloudflare" in last["content"]
+    # 无头失败后必须升级到有头模式再试一次
+    assert [call["headless"] for call in calls] == [True, False]
+
+
+# --- 浏览器拟人化与启动参数 ---------------------------------------------------
+
+
+def test_browser_launch_passes_host_humanize_settings(host, monkeypatch):
+    """必须跟随宿主配置开启拟人化——这是浏览器能否通过托管挑战的关键。
+
+    宿主自身启动浏览器时固定传 ``humanize`` / ``human_preset``；插件若省略，
+    cloakbrowser 会以脚本化的固定行为运行，被 Cloudflare 判为机器人。
+    """
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="<html>ok</html>", title="国语视界")
+    calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.settings, "CLOAKBROWSER_HUMANIZE", True, raising=False)
+    monkeypatch.setattr(host.module.settings, "CLOAKBROWSER_HUMAN_PRESET", "careful", raising=False)
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+    )
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+    )
+
+    plugin._signin_by_browser()
+
+    assert calls[0]["humanize"] is True
+    assert calls[0]["human_preset"] == "careful"
+
+
+def test_browser_launch_kwargs_follow_host_humanize_off(host, monkeypatch):
+    """宿主关闭拟人化时不得擅自开启，避免与宿主行为不一致。"""
+    plugin = _enabled_plugin(host, browser_mode=True)
+    monkeypatch.setattr(host.module.settings, "CLOAKBROWSER_HUMANIZE", False, raising=False)
+
+    assert plugin._browser_launch_kwargs(headless=True, humanize=False) == {"headless": True}
+
+
+def test_browser_launch_kwargs_normalizes_string_humanize(host):
+    """宿主配置可能是字符串形式的布尔值，需要归一化后再决定是否传参。"""
+    plugin = _enabled_plugin(host)
+
+    assert plugin._as_bool("false", True) is False
+    assert plugin._as_bool("0", True) is False
+    assert plugin._as_bool("true", False) is True
+    assert plugin._as_bool(None, True) is True
+
+
+def test_browser_launch_downgrades_when_humanize_unsupported(host, monkeypatch):
+    """旧版浏览器实现不认拟人化参数时应自动降级重试，而不是直接失败。"""
+    plugin = _enabled_plugin(host, browser_mode=True)
+    seen = []
+
+    def launcher(**kwargs):
+        seen.append(kwargs)
+        if "humanize" in kwargs:
+            raise TypeError("launch_context() got an unexpected keyword argument 'humanize'")
+        return _FakeBrowserContext()
+
+    context = plugin._launch_browser_context(launcher, {"headless": True, "humanize": True})
+
+    assert isinstance(context, _FakeBrowserContext)
+    assert seen[0]["humanize"] is True
+    assert seen[1] == {"headless": True}
+
+
+def test_browser_launch_propagates_unrelated_type_error(host):
+    """与拟人化无关的 TypeError 不应被吞掉，必须原样抛出。"""
+    plugin = _enabled_plugin(host, browser_mode=True)
+
+    def launcher(**kwargs):
+        raise TypeError("launch_context() missing 1 required positional argument")
+
+    with pytest.raises(TypeError):
+        plugin._launch_browser_context(launcher, {"headless": True})
+
+
+def test_browser_attempt_plan_escalates_headless_then_headed(host):
+    """尝试顺序应为「无头拟人化 → 有头拟人化」，且预算逐级收敛。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+
+    assert plugin._browser_attempt_plan() == [
+        (True, True, module.CF_CHALLENGE_BUDGET),
+        (False, True, module.CF_HEADED_BUDGET),
+    ]
+
+
+def test_browser_mode_retries_headed_after_headless_challenge(host, monkeypatch):
+    """无头模式被挑战、有头模式通过时应正常签到成功。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    headless_page = _FakePage(html="", title="Just a moment...")
+    headed_page = _FakePage(
+        html=(
+            '<input name="formhash" value="ff00" />'
+            '<a title="访问我的空间">tester</a>'
+            "<p>您本月已累计签到:<b>3</b>"
+        ),
+        title="国语视界",
+        user_agent="HeadedUA",
+    )
+    headed_page.fetch_map = {
+        module.SIGN_SUBMIT_URL: '<div class="c">恭喜，签到成功</div>',
+        module.CREDIT_URL: '<span id="hcredit_2">888</span>',
+    }
+    context = _FakeBrowserContext(pages=[headless_page, headed_page])
+    calls = _install_browser_stub(monkeypatch, context)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    # 只让无头那次卡住：有头页面视为已通过
+    monkeypatch.setattr(
+        module.CnlangSigninV2,
+        "_solve_cloudflare",
+        lambda self, page, **kwargs: page is headed_page,
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    assert plugin._signin_by_browser() is True
+
+    assert [call["headless"] for call in calls] == [True, False]
+    assert calls[0]["humanize"] is True
+    assert calls[1]["humanize"] is True
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is True
+    assert last["money"] == "888"
+
+
+def test_browser_mode_survives_headed_launch_failure(host, monkeypatch):
+    """有头模式启动失败（如宿主无虚拟显示资源）不得吞掉无头模式的失败结论。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    module_stub = types.ModuleType("app.sdk.browser")
+    calls = []
+
+    def launcher(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("headless") is False:
+            raise RuntimeError("host.display unavailable")
+        return _FakeBrowserContext(pages=[page])
+
+    module_stub.launch_browser_context = launcher
+    monkeypatch.setitem(sys.modules, "app.sdk.browser", module_stub)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    assert plugin._signin_by_browser() is True
+
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is False
+    assert "Cloudflare" in last["content"]
+    assert "host.display unavailable" in last["content"]
+    assert [call["headless"] for call in calls] == [True, False]
+
+
+def test_inject_cookies_reuses_cached_cloudflare_cookies(host):
+    """上一轮由本浏览器签发的通行证应被注入，配置里的旧值仍须剔除。"""
+    module = host.module
+    plugin = _enabled_plugin(
+        host, cookie="sid=abc; cf_clearance=stale", browser_mode=True
+    )
+    plugin.store[module.KEY_CF_COOKIES] = "cf_clearance=fresh; __cf_bm=bm1"
+    context = _FakeContext(add_cookies=True)
+    page = _FakePage()
+
+    plugin._inject_cookies(context, page)
+
+    names = {item["name"]: item["value"] for item in context.jar}
+    assert names["sid"] == "abc"
+    assert names["cf_clearance"] == "fresh"
+    assert names["__cf_bm"] == "bm1"
+
+
+def test_inject_cookies_without_cache_drops_all_cloudflare_values(host):
+    """没有缓存时，配置里的 cf_clearance 必须被剔除，交由浏览器自行获取。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc; cf_clearance=stale", browser_mode=True)
+    context = _FakeContext(add_cookies=True)
+    page = _FakePage()
+
+    plugin._inject_cookies(context, page)
+
+    assert [item["name"] for item in context.jar] == ["sid"]
 
 
 def test_finish_browser_signin_reports_challenged_submit(host):

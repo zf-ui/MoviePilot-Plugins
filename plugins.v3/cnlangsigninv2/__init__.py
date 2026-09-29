@@ -133,6 +133,9 @@ CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
 # 因此这里给单次尝试一个长预算，而不是「短等待 + 反复重载」。
 CF_CHALLENGE_BUDGET = 90
 CF_WARMUP_BUDGET = 60
+# 升级到有头模式重试时的等待预算。有头浏览器本身更可信，通常很快就能过，
+# 不需要和无头模式一样长的预算，也避免整轮签到耗时失控。
+CF_HEADED_BUDGET = 45
 
 
 def _is_cloudflare_cookie(name: str) -> bool:
@@ -155,6 +158,10 @@ ACTION_SIGNIN = "cnlang_signin"
 # 插件结构化数据键
 KEY_HISTORY = "history"
 KEY_LAST_RESULT = "last_result"
+# 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie。存放进插件数据而非配置，
+# 是因为配置在「保存插件配置」时会被前端表单整体覆盖，未在表单里声明的内部字段
+# 会被静默清空。
+KEY_CF_COOKIES = "cf_cookies"
 
 # 宿主调度器中的一次性任务 ID：同 ID 重复登记只保留最后一次
 JOB_SIGNIN_ONCE = "signin_once"
@@ -305,7 +312,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.3"
+    plugin_version = "3.6.4"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -338,6 +345,8 @@ class CnlangSigninV2(_PluginBase):
     _user_agent: Optional[str] = None
     # 被 Cloudflare 拦截时是否自动切换浏览器模式完成签到
     _browser_mode: bool = True
+    # 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie 串（懒加载，见 _stored_cf_cookies）
+    _cf_cookies: Optional[str] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -665,8 +674,17 @@ class CnlangSigninV2(_PluginBase):
         cf_clearance 与 TLS 指纹、User-Agent 绑定，requests 无法复用浏览器拿到的
         通行证，因此通过验证后的签到提交也必须在浏览器页面上下文内完成。
 
+        站点对签到页下发的是**交互式**托管挑战，能否通过几乎完全取决于浏览器自身的
+        可信度。因此这里按可信度从高到低依次尝试多种启动参数，任一尝试拿到签到页即
+        立即停止：
+
+        1. 无头 + 拟人化：宿主默认配置，与宿主自身启动浏览器的方式完全一致；
+        2. 有头 + 拟人化：无头 Chromium 是 Cloudflare 下发交互式挑战的常见诱因，
+           有头模式依赖宿主提供的虚拟显示资源（``host.display``），资源缺失时该次
+           尝试会直接失败并保留第 1 次的结论。
+
         :return: True 表示已完整处理（结果已由 ``_record_*`` 落库并通知）；
-                 False 表示浏览器不可用，调用方需要自行给出失败结论
+                 False 表示宿主未提供浏览器能力，调用方需要自行给出失败结论
         """
         try:
             from app.sdk.browser import launch_browser_context
@@ -674,21 +692,146 @@ class CnlangSigninV2(_PluginBase):
             logger.error("当前宿主未提供 app.sdk.browser，无法使用浏览器模式")
             return False
 
-        context = None
-        try:
-            # 只在用户显式配置了 UA 时才覆盖。把内置的 Chrome/131 硬套到
-            # cloakbrowser 实际的 Chromium 版本上，会造成 UA 与 Client Hints
-            # 不一致——这是 Cloudflare 判定「非真实浏览器」的典型特征，会让它持续
-            # 下发交互式挑战。未配置时交给浏览器使用自己的原生 UA。
-            launch_kwargs: Dict[str, Any] = {"headless": True}
-            if self._user_agent:
-                launch_kwargs["user_agent"] = self._user_agent
-            proxy_url = self._browser_proxy_url()
-            if proxy_url:
-                launch_kwargs["proxy"] = {"server": proxy_url}
-                logger.info(f"浏览器模式：使用代理 {proxy_url}")
+        plan = self._browser_attempt_plan()
+        reasons: List[str] = []
+        for index, (headless, humanize, budget) in enumerate(plan, start=1):
+            mode = self._describe_browser_mode(headless=headless, humanize=humanize)
+            logger.info(f"浏览器模式：第 {index}/{len(plan)} 次尝试（{mode}）")
+            try:
+                done = self._browser_attempt(
+                    launch_browser_context,
+                    headless=headless,
+                    humanize=humanize,
+                    budget=budget,
+                    reasons=reasons,
+                )
+            except Exception as err:  # noqa: BLE001 - 单次尝试异常不应中断后续尝试
+                detail = f"{mode}启动失败（{err.__class__.__name__}: {err}）"
+                logger.warning(f"浏览器模式：{detail}")
+                reasons.append(detail)
+                continue
+            if done:
+                return True
+        self._record_failure(
+            "浏览器模式未通过 Cloudflare 人机验证，未能完成签到：" + "；".join(reasons)
+        )
+        return True
 
-            context = launch_browser_context(**launch_kwargs)
+    def _browser_attempt_plan(self) -> List[Tuple[bool, bool, int]]:
+        """返回浏览器启动参数的尝试顺序。
+
+        宿主把「是否拟人化」做成系统配置（``CLOAKBROWSER_HUMANIZE``，默认开启），
+        并固定传给浏览器实现。插件必须跟随该配置，否则会以脚本化的固定行为启动，
+        被 Cloudflare 判为机器人。
+
+        :return: ``(是否无头, 是否拟人化, 等待预算秒数)`` 的尝试列表
+        """
+        humanize = self._as_bool(getattr(settings, "CLOAKBROWSER_HUMANIZE", None), True)
+        return [
+            (True, humanize, CF_CHALLENGE_BUDGET),
+            (False, humanize, CF_HEADED_BUDGET),
+        ]
+
+    @staticmethod
+    def _describe_browser_mode(*, headless: bool, humanize: bool) -> str:
+        """生成用于日志的启动模式描述。"""
+        return f"{'无头模式' if headless else '有头模式'} + {'拟人化' if humanize else '非拟人化'}"
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool) -> bool:
+        """把宿主配置里的布尔值（可能是 bool，也可能是 "true"/"0" 之类的字符串）归一化。"""
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "0", "false", "no", "off")
+        return bool(value)
+
+    def _browser_launch_kwargs(self, *, headless: bool, humanize: bool) -> Dict[str, Any]:
+        """构造浏览器启动参数。
+
+        必须把宿主的拟人化配置一并传入：宿主自身启动浏览器时会固定传
+        ``humanize`` / ``human_preset``（见 ``app/adapters/network/browser.py``）。
+        插件若省略这两个参数，cloakbrowser 会退回到脚本化的固定行为——鼠标瞬移、
+        输入零延迟，Cloudflare 的托管挑战会把这类会话判为机器人并持续下发无法自动
+        完成的交互式验证，签到页因此永远停在 ``Just a moment...``。
+
+        :param headless: 是否使用无头模式
+        :param humanize: 是否启用拟人化输入
+        :return: 传给 ``launch_browser_context`` 的关键字参数
+        """
+        kwargs: Dict[str, Any] = {"headless": headless}
+        if self._user_agent:
+            # 只在用户显式配置了 UA 时才覆盖。把内置的 Chrome/131 硬套到浏览器实际的
+            # Chromium 版本上，会造成 UA 与 Client Hints 不一致——这是 Cloudflare 判定
+            # 「非真实浏览器」的典型特征。未配置时交给浏览器使用自己的原生 UA。
+            kwargs["user_agent"] = self._user_agent
+        proxy_url = self._browser_proxy_url()
+        if proxy_url:
+            kwargs["proxy"] = {"server": proxy_url}
+            logger.info(f"浏览器模式：使用代理 {proxy_url}")
+        if humanize:
+            kwargs["humanize"] = True
+            preset = getattr(settings, "CLOAKBROWSER_HUMAN_PRESET", None)
+            if preset:
+                kwargs["human_preset"] = preset
+        return kwargs
+
+    def _launch_browser_context(self, launcher: Any, kwargs: Dict[str, Any]) -> Any:
+        """启动浏览器上下文；浏览器实现不认拟人化参数时自动降级重试。
+
+        :param launcher: ``app.sdk.browser.launch_browser_context``
+        :param kwargs: 启动参数
+        :return: 浏览器上下文
+        """
+        try:
+            return launcher(**kwargs)
+        except TypeError as err:
+            optional = [key for key in ("humanize", "human_preset") if key in kwargs]
+            if not optional:
+                raise
+            logger.warning(f"浏览器模式：当前浏览器实现不支持拟人化参数（{err}），降级后重试")
+            for key in optional:
+                kwargs.pop(key, None)
+            return launcher(**kwargs)
+
+    def _browser_attempt(
+        self,
+        launcher: Any,
+        *,
+        headless: bool,
+        humanize: bool,
+        budget: int,
+        reasons: List[str],
+    ) -> bool:
+        """执行一次完整的浏览器签到尝试。
+
+        :param launcher: ``app.sdk.browser.launch_browser_context``
+        :param headless: 是否无头
+        :param humanize: 是否拟人化
+        :param budget: 等待 Cloudflare 的秒数预算
+        :param reasons: 失败原因收集列表，供最终失败信息汇总
+        :return: True 表示已产生签到结果（无需再试）；False 表示本次未取得签到页
+        """
+        kwargs = self._browser_launch_kwargs(headless=headless, humanize=humanize)
+        # 启动失败（依赖缺失 / 无虚拟显示资源）向上抛出，由调用方决定是否继续尝试
+        context = self._launch_browser_context(launcher, kwargs)
+        try:
+            return self._run_browser_flow(context, budget=budget, reasons=reasons)
+        finally:
+            try:
+                context.close()
+            except Exception as err:  # noqa: BLE001 - 关闭失败只记录
+                logger.debug(f"关闭浏览器上下文失败：{err}")
+
+    def _run_browser_flow(self, context: Any, *, budget: int, reasons: List[str]) -> bool:
+        """在已启动的浏览器上下文内完成签到流程。
+
+        :param context: 浏览器上下文
+        :param budget: 等待 Cloudflare 的秒数预算
+        :param reasons: 失败原因收集列表
+        :return: True 表示已产生签到结果；False 表示未取得签到页，可换参数重试
+        """
+        try:
             page = context.new_page()
             page.set_default_timeout(60000)
             self._inject_cookies(context, page)
@@ -700,37 +843,26 @@ class CnlangSigninV2(_PluginBase):
             logger.info("浏览器模式：正在访问签到页，等待 Cloudflare 验证...")
             self._goto(page, SIGN_PAGE_URL)
             html = ""
-            if self._solve_cloudflare(page, label="签到页"):
+            if self._solve_cloudflare(page, label="签到页", budget_seconds=budget):
                 html = self._page_content(page)
             if not html:
                 # 文档导航持续被挑战：改从首页用页面内 fetch 取签到页。同源 XHR 复用
                 # 已建立的 TLS 会话与 Cookie，往往能绕开只针对文档导航下发的托管挑战。
                 html = self._sign_page_via_fetch(context, page)
             if not html:
-                logger.error(f"浏览器模式：无法取得签到页，标题：{self._page_title(page)}")
+                title = self._page_title(page)
+                logger.error(f"浏览器模式：无法取得签到页，标题：{title}")
                 self._save_failure_screenshot(page, "signin_page_failed.png")
-                self._record_failure(
-                    "签到页 Cloudflare 验证未通过（浏览器模式等待超时）。"
-                    "可尝试关闭「浏览器模式」，改用含 cf_clearance 且 UA 与浏览器完全一致的 Cookie"
-                )
-                return True
+                reasons.append(f"未取得签到页（标题：{title or '空'}）")
+                return False
 
-            # 挑战通过后把浏览器新签发的 Cookie 合并回配置，供下次 requests 快速路径复用
+            # 挑战通过后把浏览器新签发的 Cookie 写回，供下次执行复用
             self._refresh_cookies_from_browser(context, page)
             return self._finish_browser_signin(page, html)
         except Exception as err:  # noqa: BLE001 - 浏览器异常不得冒泡到宿主调度器
             logger.error(f"浏览器模式执行失败：{err}")
-            try:
-                self._record_failure(f"浏览器模式执行失败：{err}")
-            except Exception as inner:  # noqa: BLE001 - 记录失败结果时出错只记日志
-                logger.error(f"记录浏览器模式失败结果时出错：{inner}")
-            return True
-        finally:
-            if context is not None:
-                try:
-                    context.close()
-                except Exception as err:  # noqa: BLE001 - 关闭失败只记录
-                    logger.debug(f"关闭浏览器上下文失败：{err}")
+            reasons.append(f"执行异常（{err.__class__.__name__}: {err}）")
+            return False
 
     def _browser_proxy_url(self) -> Optional[str]:
         """返回浏览器模式使用的代理地址；未开启代理或宿主未配置时返回 None。"""
@@ -741,27 +873,45 @@ class CnlangSigninV2(_PluginBase):
             return proxy.get("https") or proxy.get("http") or None
         return proxy or None
 
-    def _inject_cookies(self, context: Any, page: Any) -> None:
-        """把配置 Cookie 写入浏览器会话，Cloudflare 自管 Cookie 一律剔除。
+    def _stored_cf_cookies(self) -> str:
+        """读取上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie 串。
 
-        两个要点：
+        :return: Cookie 串；无缓存或读取失败时返回空串
+        """
+        if self._cf_cookies:
+            return self._cf_cookies
+        try:
+            value = self.get_data(KEY_CF_COOKIES)
+        except Exception as err:  # noqa: BLE001 - 读取失败按无缓存处理
+            logger.debug(f"浏览器模式：读取 Cloudflare Cookie 缓存失败：{err}")
+            return ""
+        if isinstance(value, str):
+            self._cf_cookies = value
+            return value
+        return ""
+
+    def _inject_cookies(self, context: Any, page: Any) -> None:
+        """把配置 Cookie 与缓存的 Cloudflare 通行证写入浏览器会话。
+
+        三个要点：
 
         1. 优先写入 Cookie 罐而不是请求头：请求头覆盖会把浏览器新拿到的
            cf_clearance 顶回旧值。宿主不支持 ``add_cookies`` 时回退请求头方式。
-        2. **剔除 cf_clearance / __cf_bm / cf_chl_* 等 Cloudflare 自管 Cookie**。
-           这些值绑定签发时的 UA、TLS 指纹与 IP，原样注入会让 CF 判定「通行证
-           与自己的签发记录不符」而持续下发交互式挑战。论坛登录态（``_auth`` 等）
-           仍然保留，因此不会影响登录。
+        2. **配置字段里的** cf_clearance / __cf_bm / cf_chl_* 一律剔除。这些值来自
+           用户自己的浏览器或历史文本，与本次无头浏览器的 UA、TLS 指纹对不上，注入
+           会让 Cloudflare 判定「通行证与签发记录不符」而持续下发交互式挑战。论坛
+           登录态（``_auth`` 等）不受影响。
+        3. 但插件上一轮**由本浏览器自己签发**的通行证（缓存在 ``KEY_CF_COOKIES``）
+           身份自洽，注入回去可以让浏览器直接以已通过验证的状态开始，省掉一整轮
+           交互式挑战——这是让签到从第二次起变快的关键。
 
         :param context: 浏览器上下文
         :param page: 浏览器页面
         """
-        if not self._cookie:
-            return
-        jar = []
-        kept_pairs = []
-        dropped = []
-        for pair in self._cookie.split(";"):
+        jar: List[Dict[str, str]] = []
+        kept_pairs: List[str] = []
+        dropped: List[str] = []
+        for pair in (self._cookie or "").split(";"):
             if "=" not in pair:
                 continue
             name, value = pair.split("=", 1)
@@ -773,12 +923,31 @@ class CnlangSigninV2(_PluginBase):
             kept_pairs.append(f"{name}={value}")
         if dropped:
             logger.info(
-                f"浏览器模式：跳过 {len(dropped)} 个 Cloudflare 自管 Cookie"
-                f"（{', '.join(dropped)}），交由浏览器重新获取"
+                f"浏览器模式：跳过 {len(dropped)} 个配置里的 Cloudflare 自管 Cookie"
+                f"（{', '.join(dropped)}），交由浏览器自行获取"
             )
 
+        cached_names: List[str] = []
+        for pair in self._stored_cf_cookies().split(";"):
+            if "=" not in pair:
+                continue
+            name, value = pair.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            jar.append({"name": name, "value": value, "domain": f".{SITE_HOST}", "path": "/"})
+            kept_pairs.append(f"{name}={value}")
+            cached_names.append(name)
+        if cached_names:
+            logger.info(
+                f"浏览器模式：复用上一轮缓存的 {len(cached_names)} 个 Cloudflare Cookie"
+                f"（{', '.join(cached_names)}）"
+            )
+
+        if not jar:
+            return
         add_cookies = getattr(context, "add_cookies", None)
-        if add_cookies and jar:
+        if add_cookies:
             try:
                 add_cookies(jar)
                 logger.info(f"浏览器模式：{len(jar)} 个 Cookie 字段已写入浏览器会话")
@@ -791,30 +960,59 @@ class CnlangSigninV2(_PluginBase):
             logger.warning(f"浏览器模式：Cookie 写入请求头失败（{err}）")
 
     def _refresh_cookies_from_browser(self, context: Any, page: Any) -> None:
-        """把浏览器新签发的 Cookie 合并回配置并持久化。
+        """把浏览器新签发的 Cookie 分流写回：CF 通行证单独缓存，其余合并进配置。
 
-        Cloudflare 的 cf_clearance 会随验证刷新，写回配置后 requests 快速路径
-        在下一次执行时更可能直接命中。
+        Cloudflare 的 cf_clearance 只在签发它的那套浏览器身份下有效，因此**不写进
+        用户配置的 Cookie 字段**（该字段同时供 requests 快速路径使用，混入一批无效值
+        只会让人困惑，也会把用户的登录 Cookie 淹没）；而是单独存进插件数据
+        （``KEY_CF_COOKIES``），下次启动浏览器时再注入回去。
 
-        注意：cf_clearance 与 User-Agent 绑定，因此这里同时记录**浏览器实际使用的
-        UA**。否则写回的 Cookie 配上一个不同的 UA 会立即失效，requests 快速路径
-        永远走不通。
+        其余 Cookie（``_auth``、``saltkey`` 等论坛登录态）合并回配置字段，保持快速
+        路径与浏览器会话一致。
+
+        另外必须记录**浏览器实际使用的 UA**：cf_clearance 与 UA 绑定，写回的 Cookie
+        配上一个不同的 UA 会立即失效。
+
+        :param context: 浏览器上下文
+        :param page: 浏览器页面
         """
-        merged: Dict[str, str] = {}
-        for pair in (self._cookie or "").split(";"):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                merged[key.strip()] = value.strip()
         try:
             cookies = context.cookies() or []
         except Exception as err:  # noqa: BLE001 - 取不到 Cookie 时保留原值
             logger.debug(f"浏览器模式：读取浏览器 Cookie 失败：{err}")
             cookies = []
+
+        merged: Dict[str, str] = {}
+        for pair in (self._cookie or "").split(";"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                merged[key.strip()] = value.strip()
+        cf_pairs: List[str] = []
         for item in cookies:
             name = item.get("name")
-            if name:
-                merged[name] = item.get("value", "")
-        self._cookie = "; ".join(f"{key}={value}" for key, value in merged.items())
+            if not name:
+                continue
+            value = item.get("value", "")
+            if _is_cloudflare_cookie(name):
+                cf_pairs.append(f"{name}={value}")
+                merged.pop(name, None)
+                continue
+            merged[name] = value
+        if merged:
+            self._cookie = "; ".join(f"{key}={value}" for key, value in merged.items())
+
+        if cf_pairs:
+            self._cf_cookies = "; ".join(cf_pairs)
+            try:
+                self.save_data(KEY_CF_COOKIES, self._cf_cookies)
+                logger.info(
+                    f"浏览器模式：已缓存 {len(cf_pairs)} 个 Cloudflare 通行证 Cookie"
+                    f"（{', '.join(pair.split('=', 1)[0] for pair in cf_pairs)}），"
+                    "下次执行可直接复用"
+                )
+            except Exception as err:  # noqa: BLE001 - 缓存失败不影响本次签到结果
+                logger.debug(f"浏览器模式：缓存 Cloudflare Cookie 失败：{err}")
+
         try:
             browser_ua = page.evaluate("navigator.userAgent")
         except Exception as err:  # noqa: BLE001 - 取不到 UA 时保留配置值
