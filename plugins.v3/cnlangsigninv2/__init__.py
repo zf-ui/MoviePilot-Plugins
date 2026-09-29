@@ -68,6 +68,8 @@ def _resolve_timezone() -> Any:
 
 # 国语视界站点域名（Discuz 论坛）
 SITE_HOST = "cnlang.org"
+# 站点首页：浏览器模式下**必须先访问这里**换取域级 cf_clearance，再访问签到页
+SITE_HOME_URL = f"https://{SITE_HOST}/"
 # 签到页面：同时用于探测登录态、提取 formhash 与本月累计签到
 SIGN_PAGE_URL = f"https://{SITE_HOST}/dsu_paulsign-sign.html?mobile=no"
 # 签到提交接口
@@ -120,10 +122,13 @@ CF_CHALLENGE_HTML_MARKERS = (
 CF_ADVICE = (
     "站点启用了 Cloudflare 人机验证，纯 requests 无法通过。请任选其一：\n"
     "1）开启「浏览器模式」，由宿主内置浏览器完成验证后自动签到"
-    "（会先试无头、失败再自动升级到有头）；\n"
-    "2）从浏览器开发者工具复制完整 Cookie（必须包含 cf_clearance），"
-    "并把「浏览器UA」改成与你浏览器完全一致的值——cf_clearance 与 UA 绑定，"
-    "不一致会立即失效。"
+    "（先访问首页换取通行证，再访问签到页；无头失败会自动升级到有头重试）；\n"
+    "2）【最稳】关闭「浏览器模式」，改用你自己的浏览器 Cookie：\n"
+    "   · 用 Chrome/Edge 登录站点，F12 → 网络 → 刷新 → 复制任一请求的完整 Cookie "
+    "（必须包含 cf_clearance）；\n"
+    "   · 在同一页执行 navigator.userAgent，把「浏览器UA」填成这个值——"
+    "cf_clearance 与 UA 绑定，不一致会立即失效；\n"
+    "   · cf_clearance 有效期通常只有几十分钟，失效后重新复制即可。"
 )
 # Cloudflare 自管 Cookie：与 UA / TLS 指纹 / IP 绑定。**来自用户自己浏览器的**旧值注入
 # 会让 CF 直接不信任该会话（通行证对不上它自己的签发记录），因此注入时必须剔除，让
@@ -134,8 +139,9 @@ CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfduid")
 CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
 # 单次挑战等待预算（秒）。挑战过程不可中断：中途 reload 会让 Turnstile 的进度归零，
 # 因此这里给单次尝试一个长预算，而不是「短等待 + 反复重载」。
-CF_CHALLENGE_BUDGET = 90
-CF_WARMUP_BUDGET = 60
+CF_CHALLENGE_BUDGET = 60
+# 首页热身预算：首页的挑战通常能自动通过，预算不必和签到页一样长
+CF_WARMUP_BUDGET = 45
 # 升级到有头模式重试时的等待预算。有头浏览器本身更可信，通常很快就能过，
 # 不需要和无头模式一样长的预算，也避免整轮签到耗时失控。
 CF_HEADED_BUDGET = 45
@@ -315,7 +321,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.4"
+    plugin_version = "3.6.5"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -348,8 +354,8 @@ class CnlangSigninV2(_PluginBase):
     _user_agent: Optional[str] = None
     # 被 Cloudflare 拦截时是否自动切换浏览器模式完成签到
     _browser_mode: bool = True
-    # 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie 串（懒加载，见 _stored_cf_cookies）
-    _cf_cookies: Optional[str] = None
+    # 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie（懒加载，见 _stored_cf_cookies）
+    _cf_cookies: Optional[List[Dict[str, str]]] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -829,8 +835,16 @@ class CnlangSigninV2(_PluginBase):
     def _run_browser_flow(self, context: Any, *, budget: int, reasons: List[str]) -> bool:
         """在已启动的浏览器上下文内完成签到流程。
 
+        **顺序至关重要**：先访问站点首页拿到 Cloudflare 通行证，再访问签到页。
+
+        ``cf_clearance`` 是**域级**通行证：一旦在首页通过挑战，后续访问同域下受保护的
+        路径（签到页）时 Cloudflare 会直接放行。反过来「一上来就访问签到页」等于在
+        完全没有通行证的状态下撞上最严的那条规则——签到页会下发交互式挑战，而自动化
+        浏览器恰恰过不了它。这就是 v3.6.2 ~ v3.6.4 一直卡在 ``Just a moment...`` 的
+        结构性原因（v3.5.2 是「首页优先」，所以当时能跑通）。
+
         :param context: 浏览器上下文
-        :param budget: 等待 Cloudflare 的秒数预算
+        :param budget: 签到页等待 Cloudflare 的秒数预算
         :param reasons: 失败原因收集列表
         :return: True 表示已产生签到结果；False 表示未取得签到页，可换参数重试
         """
@@ -840,17 +854,27 @@ class CnlangSigninV2(_PluginBase):
             self._inject_cookies(context, page)
             self._log_browser_identity(page)
 
-            # 直接访问签到页：它才是真正受 Cloudflare 保护的目标。实测站点首页返回
-            # 200 且**不签发 cf_clearance**，只有签到页路径下发托管挑战，因此先在
-            # 首页「热身」毫无收益，首页只在签到页失败后作为兜底手段使用。
+            # 第一步：在首页完成挑战，换取域级 cf_clearance。
+            logger.info("浏览器模式：先访问站点首页，获取 Cloudflare 通行证...")
+            self._goto(page, SITE_HOME_URL)
+            if self._solve_cloudflare(
+                page, label="站点首页", budget_seconds=CF_WARMUP_BUDGET
+            ):
+                # 立刻写回：这一步拿到的 cf_clearance 正是下一步访问签到页的关键，
+                # 同时也是下一次执行的「热启动」素材。
+                self._refresh_cookies_from_browser(context, page)
+            else:
+                logger.warning("浏览器模式：站点首页未加载出真实内容，仍继续尝试签到页")
+
+            # 第二步：带着通行证访问签到页（文档导航）。
             logger.info("浏览器模式：正在访问签到页，等待 Cloudflare 验证...")
             self._goto(page, SIGN_PAGE_URL)
             html = ""
             if self._solve_cloudflare(page, label="签到页", budget_seconds=budget):
                 html = self._page_content(page)
             if not html:
-                # 文档导航持续被挑战：改从首页用页面内 fetch 取签到页。同源 XHR 复用
-                # 已建立的 TLS 会话与 Cookie，往往能绕开只针对文档导航下发的托管挑战。
+                # 文档导航仍被挑战：改从首页用页面内 fetch 取签到页。同源请求复用已
+                # 建立的 TLS 会话与 Cookie，作为最后一道兜底。
                 html = self._sign_page_via_fetch(context, page)
             if not html:
                 title = self._page_title(page)
@@ -876,62 +900,73 @@ class CnlangSigninV2(_PluginBase):
             return proxy.get("https") or proxy.get("http") or None
         return proxy or None
 
-    def _stored_cf_cookies(self) -> str:
-        """读取上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie 串。
+    def _stored_cf_cookies(self) -> List[Dict[str, str]]:
+        """读取上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie。
 
-        :return: Cookie 串；无缓存或读取失败时返回空串
+        以「Cookie 字典列表」形式缓存而不是拼成 ``k=v; k=v`` 字符串：同一个名字可能
+        同时存在多条（不同 domain / path 的 ``cf_clearance``），拼成字符串会把它们
+        压成一条，注入时丢失作用域。实测日志里就出现过 ``cf_clearance`` 重复两条。
+
+        :return: Cookie 字典列表；无缓存或读取失败时返回空列表
         """
-        if self._cf_cookies:
+        if self._cf_cookies is not None:
             return self._cf_cookies
         try:
             value = self.get_data(KEY_CF_COOKIES)
         except Exception as err:  # noqa: BLE001 - 读取失败按无缓存处理
             logger.debug(f"浏览器模式：读取 Cloudflare Cookie 缓存失败：{err}")
-            return ""
-        if isinstance(value, str):
-            self._cf_cookies = value
-            return value
-        return ""
+            return []
+        items: List[Dict[str, str]] = []
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and item.get("name"):
+                    items.append(
+                        {
+                            "name": str(item.get("name")),
+                            "value": str(item.get("value", "")),
+                            "domain": str(item.get("domain") or f".{SITE_HOST}"),
+                            "path": str(item.get("path") or "/"),
+                        }
+                    )
+        elif isinstance(value, str):  # 兼容早期版本的字符串缓存
+            for pair in value.split(";"):
+                if "=" not in pair:
+                    continue
+                name, _, val = pair.partition("=")
+                if name.strip():
+                    items.append(
+                        {
+                            "name": name.strip(),
+                            "value": val.strip(),
+                            "domain": f".{SITE_HOST}",
+                            "path": "/",
+                        }
+                    )
+        self._cf_cookies = items
+        return items
 
     def _inject_cookies(self, context: Any, page: Any) -> None:
         """把配置 Cookie 与缓存的 Cloudflare 通行证写入浏览器会话。
 
-        三个要点：
+        两个要点：
 
         1. 优先写入 Cookie 罐而不是请求头：请求头覆盖会把浏览器新拿到的
            cf_clearance 顶回旧值。宿主不支持 ``add_cookies`` 时回退请求头方式。
-        2. **配置字段里的** cf_clearance / __cf_bm / cf_chl_* 一律剔除。这些值来自
-           用户自己的浏览器或历史文本，与本次无头浏览器的 UA、TLS 指纹对不上，注入
-           会让 Cloudflare 判定「通行证与签发记录不符」而持续下发交互式挑战。论坛
-           登录态（``_auth`` 等）不受影响。
-        3. 但插件上一轮**由本浏览器自己签发**的通行证（缓存在 ``KEY_CF_COOKIES``）
-           身份自洽，注入回去可以让浏览器直接以已通过验证的状态开始，省掉一整轮
-           交互式挑战——这是让签到从第二次起变快的关键。
+        2. **配置里的 Cloudflare Cookie 一律照常注入，不再剔除。** 早期版本出于
+           「旧通行证与签发记录不符会让 CF 不信任会话」的猜测把它们丢掉了，但
+           ``cf_clearance`` 是**域级**的：只要它还在有效期内，注入后首页与签到页
+           都能直接放行，是成本最低的热启动路径；即便已经失效，Cloudflare 也只是
+           重新下发一次挑战，并不会因此「永久不信任」该会话。剔除反而让每一次执行
+           都必须从零开始过一次挑战——这正是 v3.6.3 / v3.6.4 仍然失败的原因之一。
+        3. 插件上一轮由本浏览器自己签发的通行证（``KEY_CF_COOKIES``）带完整
+           domain / path，最后注入以确保覆盖配置里的旧值。
 
         :param context: 浏览器上下文
         :param page: 浏览器页面
         """
         jar: List[Dict[str, str]] = []
         kept_pairs: List[str] = []
-        dropped: List[str] = []
         for pair in (self._cookie or "").split(";"):
-            if "=" not in pair:
-                continue
-            name, value = pair.split("=", 1)
-            name, value = name.strip(), value.strip()
-            if _is_cloudflare_cookie(name):
-                dropped.append(name)
-                continue
-            jar.append({"name": name, "value": value, "domain": f".{SITE_HOST}", "path": "/"})
-            kept_pairs.append(f"{name}={value}")
-        if dropped:
-            logger.info(
-                f"浏览器模式：跳过 {len(dropped)} 个配置里的 Cloudflare 自管 Cookie"
-                f"（{', '.join(dropped)}），交由浏览器自行获取"
-            )
-
-        cached_names: List[str] = []
-        for pair in self._stored_cf_cookies().split(";"):
             if "=" not in pair:
                 continue
             name, value = pair.split("=", 1)
@@ -940,11 +975,14 @@ class CnlangSigninV2(_PluginBase):
                 continue
             jar.append({"name": name, "value": value, "domain": f".{SITE_HOST}", "path": "/"})
             kept_pairs.append(f"{name}={value}")
-            cached_names.append(name)
-        if cached_names:
+
+        cached = self._stored_cf_cookies()
+        if cached:
+            jar.extend(cached)
+            kept_pairs.extend(f"{item['name']}={item['value']}" for item in cached)
             logger.info(
-                f"浏览器模式：复用上一轮缓存的 {len(cached_names)} 个 Cloudflare Cookie"
-                f"（{', '.join(cached_names)}）"
+                f"浏览器模式：复用上一轮缓存的 {len(cached)} 个 Cloudflare Cookie"
+                f"（{', '.join(item['name'] for item in cached)}）"
             )
 
         if not jar:
@@ -968,7 +1006,11 @@ class CnlangSigninV2(_PluginBase):
         Cloudflare 的 cf_clearance 只在签发它的那套浏览器身份下有效，因此**不写进
         用户配置的 Cookie 字段**（该字段同时供 requests 快速路径使用，混入一批无效值
         只会让人困惑，也会把用户的登录 Cookie 淹没）；而是单独存进插件数据
-        （``KEY_CF_COOKIES``），下次启动浏览器时再注入回去。
+        （``KEY_CF_COOKIES``），下次启动浏览器时**原样注入回去**（含 domain / path）。
+
+        注意这里只是「不写进配置字段」，注入时仍然照常注入——见 ``_inject_cookies``。
+        让浏览器带着上一轮的通行证启动，可以直接跳过首页与签到页的挑战，是最有效的
+        提速手段。
 
         其余 Cookie（``_auth``、``saltkey`` 等论坛登录态）合并回配置字段，保持快速
         路径与浏览器会话一致。
@@ -990,27 +1032,36 @@ class CnlangSigninV2(_PluginBase):
             if "=" in pair:
                 key, value = pair.split("=", 1)
                 merged[key.strip()] = value.strip()
-        cf_pairs: List[str] = []
+        cf_items: List[Dict[str, str]] = []
         for item in cookies:
             name = item.get("name")
             if not name:
                 continue
             value = item.get("value", "")
             if _is_cloudflare_cookie(name):
-                cf_pairs.append(f"{name}={value}")
+                # 连 domain / path 一起存：同名 Cookie 可能有多条（不同作用域），
+                # 只留 name=value 会把它们压成一条，注入时丢失作用域。
+                cf_items.append(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": item.get("domain") or f".{SITE_HOST}",
+                        "path": item.get("path") or "/",
+                    }
+                )
                 merged.pop(name, None)
                 continue
             merged[name] = value
         if merged:
             self._cookie = "; ".join(f"{key}={value}" for key, value in merged.items())
 
-        if cf_pairs:
-            self._cf_cookies = "; ".join(cf_pairs)
+        if cf_items:
+            self._cf_cookies = cf_items
             try:
-                self.save_data(KEY_CF_COOKIES, self._cf_cookies)
+                self.save_data(KEY_CF_COOKIES, cf_items)
                 logger.info(
-                    f"浏览器模式：已缓存 {len(cf_pairs)} 个 Cloudflare 通行证 Cookie"
-                    f"（{', '.join(pair.split('=', 1)[0] for pair in cf_pairs)}），"
+                    f"浏览器模式：已缓存 {len(cf_items)} 条 Cloudflare 通行证 Cookie"
+                    f"（{', '.join(item['name'] for item in cf_items)}），"
                     "下次执行可直接复用"
                 )
             except Exception as err:  # noqa: BLE001 - 缓存失败不影响本次签到结果
@@ -1105,8 +1156,8 @@ class CnlangSigninV2(_PluginBase):
         :return: 签到页 HTML；仍被挑战或取不到时返回空串
         """
         logger.info("浏览器模式：签到页文档导航被挑战，改从站点首页用页面内 fetch 获取")
-        self._goto(page, f"https://{SITE_HOST}/")
-        if not self._solve_cloudflare(page, label="首页", budget_seconds=CF_WARMUP_BUDGET):
+        self._goto(page, SITE_HOME_URL)
+        if not self._solve_cloudflare(page, label="站点首页", budget_seconds=CF_WARMUP_BUDGET):
             logger.warning("浏览器模式：首页未能加载出真实内容")
             return ""
         # 首页若签发了新 Cookie（含 cf_clearance）立即写回，再发起同源 fetch
@@ -1268,8 +1319,13 @@ class CnlangSigninV2(_PluginBase):
             return None
 
     @staticmethod
-    def _goto(page: Any, url: str, timeout: int = 45000) -> bool:
-        """导航到目标地址；加载事件超时不视为致命（页面可能已部分加载）。"""
+    def _goto(page: Any, url: str, timeout: int = 20000) -> bool:
+        """导航到目标地址；加载事件超时不视为致命（页面可能已部分加载）。
+
+        超时给得比较短：Cloudflare 挑战页的脚本会长时间占住 DOMContentLoaded，等它
+        白等 45 秒没有意义。真正的等待交给 ``_solve_cloudflare`` 轮询页面内容，
+        它同时能容忍挑战通过后的自动跳转。
+        """
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             return True

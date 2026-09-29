@@ -1090,9 +1090,10 @@ def test_refresh_cookies_records_browser_user_agent(host):
 
     assert plugin._user_agent == "BrowserRealUA"
     assert plugin.saved_config["user_agent"] == "BrowserRealUA"
-    # Cloudflare 通行证单独缓存，不污染用户配置的 Cookie 字段
-    assert plugin._cf_cookies == "cf_clearance=fresh"
-    assert plugin.store[module.KEY_CF_COOKIES] == "cf_clearance=fresh"
+    # Cloudflare 通行证单独缓存（带 domain/path），不污染用户配置的 Cookie 字段
+    assert [item["name"] for item in plugin._cf_cookies] == ["cf_clearance"]
+    assert plugin._cf_cookies[0]["value"] == "fresh"
+    assert plugin.store[module.KEY_CF_COOKIES] == plugin._cf_cookies
     assert "cf_clearance" not in (plugin._cookie or "")
     assert "sid=abc" in plugin._cookie
 
@@ -1170,11 +1171,11 @@ def test_is_cloudflare_cookie(host, name, expected):
     assert host.module._is_cloudflare_cookie(name) is expected
 
 
-def test_inject_cookies_drops_cloudflare_cookies(host):
-    """cf_clearance 等 CF 自管 Cookie 必须剔除，论坛登录态必须保留。
+def test_inject_cookies_keeps_configured_cloudflare_cookies(host):
+    """配置里的 cf_clearance 必须照常注入，不能剔除。
 
-    旧值绑定签发时的 UA / TLS 指纹 / IP，注入浏览器会让 CF 判定「通行证与自己的
-    签发记录不符」而持续下发交互式挑战。
+    cf_clearance 是域级通行证：只要还在有效期内，注入后首页与签到页都会直接放行，
+    是成本最低的热启动路径。剔除它等于每次执行都从零过一次挑战。
     """
     plugin = _enabled_plugin(
         host, cookie="_auth=abc; cf_clearance=stale; __cf_bm=x; saltkey=sk"
@@ -1183,17 +1184,61 @@ def test_inject_cookies_drops_cloudflare_cookies(host):
 
     plugin._inject_cookies(context, _FakePage())
 
-    assert [c["name"] for c in context.jar] == ["_auth", "saltkey"]
+    assert [c["name"] for c in context.jar] == [
+        "_auth",
+        "cf_clearance",
+        "__cf_bm",
+        "saltkey",
+    ]
 
 
-def test_inject_cookies_header_fallback_also_drops_cloudflare(host):
-    """回退到请求头方式时同样要剔除 CF 自管 Cookie。"""
+def test_inject_cookies_header_fallback_keeps_cloudflare_cookies(host):
+    """回退到请求头方式时同样保留全部 Cookie。"""
     plugin = _enabled_plugin(host, cookie="_auth=abc; cf_clearance=stale")
     page = _FakePage()
 
     plugin._inject_cookies(_FakeContext(add_cookies=None), page)
 
-    assert page.headers == {"cookie": "_auth=abc"}
+    assert page.headers == {"cookie": "_auth=abc; cf_clearance=stale"}
+
+
+def test_inject_cookies_appends_cached_cloudflare_cookies_last(host):
+    """缓存的通行证带完整作用域，且必须在配置之后注入以覆盖旧值。"""
+    module = host.module
+    plugin = _enabled_plugin(host, cookie="_auth=abc", browser_mode=True)
+    plugin.store[module.KEY_CF_COOKIES] = [
+        {
+            "name": "cf_clearance",
+            "value": "fresh",
+            "domain": ".cnlang.org",
+            "path": "/",
+        },
+        {
+            "name": "cf_clearance",
+            "value": "scoped",
+            "domain": "cnlang.org",
+            "path": "/dsu_paulsign-sign.html",
+        },
+    ]
+    context = _FakeContext(add_cookies=True)
+
+    plugin._inject_cookies(context, _FakePage())
+
+    assert [c["name"] for c in context.jar] == ["_auth", "cf_clearance", "cf_clearance"]
+    assert context.jar[1]["value"] == "fresh"
+    assert context.jar[2]["path"] == "/dsu_paulsign-sign.html"
+
+
+def test_stored_cf_cookies_reads_legacy_string_cache(host):
+    """兼容早期版本写入的字符串缓存。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    plugin.store[module.KEY_CF_COOKIES] = "cf_clearance=legacy; __cf_bm=bm"
+
+    items = plugin._stored_cf_cookies()
+
+    assert [item["name"] for item in items] == ["cf_clearance", "__cf_bm"]
+    assert all(item["domain"] == ".cnlang.org" for item in items)
 
 
 # --- 挑战等待策略 ------------------------------------------------------------
@@ -1313,7 +1358,7 @@ def test_browser_mode_falls_back_to_in_page_fetch(host, monkeypatch):
     monkeypatch.setattr(
         module.CnlangSigninV2,
         "_solve_cloudflare",
-        lambda self, page, **kwargs: kwargs.get("label") == "首页",
+        lambda self, page, **kwargs: "首页" in (kwargs.get("label") or ""),
     )
 
     result = plugin._signin_by_browser()
@@ -1434,6 +1479,71 @@ def test_browser_attempt_plan_escalates_headless_then_headed(host):
     ]
 
 
+def test_browser_flow_warms_up_homepage_before_sign_page(host, monkeypatch):
+    """必须先访问站点首页拿到域级 cf_clearance，再访问签到页。
+
+    直接访问签到页等于在没有任何通行证的状态下撞上最严的那条规则，签到页会下发
+    自动化浏览器过不了的交互式挑战——这是 v3.6.2~v3.6.4 一直失败的真正结构原因。
+    """
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="<html>ok</html>", title="国语视界")
+    _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+    )
+
+    plugin._signin_by_browser()
+
+    assert page.goto_calls == [module.SITE_HOME_URL, module.SIGN_PAGE_URL]
+
+
+def test_browser_flow_persists_cf_cookies_right_after_homepage(host, monkeypatch):
+    """首页通过后必须立刻写回 Cookie，签到页与下次执行都依赖它。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="<html>ok</html>", title="国语视界")
+    context = _FakeBrowserContext(
+        pages=[page],
+        cookies=[{"name": "cf_clearance", "value": "home", "domain": ".cnlang.org", "path": "/"}],
+    )
+    _install_browser_stub(monkeypatch, context)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+    )
+
+    plugin._signin_by_browser()
+
+    assert plugin.store[module.KEY_CF_COOKIES][0]["value"] == "home"
+
+
+def test_browser_flow_continues_when_homepage_warmup_fails(host, monkeypatch):
+    """首页热身失败不应直接放弃，仍要尝试签到页。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    plugin._signin_by_browser()
+
+    assert page.goto_calls == [module.SITE_HOME_URL, module.SIGN_PAGE_URL]
+
+
 def test_browser_mode_retries_headed_after_headless_challenge(host, monkeypatch):
     """无头模式被挑战、有头模式通过时应正常签到成功。"""
     module = host.module
@@ -1526,15 +1636,29 @@ def test_inject_cookies_reuses_cached_cloudflare_cookies(host):
     assert names["__cf_bm"] == "bm1"
 
 
-def test_inject_cookies_without_cache_drops_all_cloudflare_values(host):
-    """没有缓存时，配置里的 cf_clearance 必须被剔除，交由浏览器自行获取。"""
-    plugin = _enabled_plugin(host, cookie="sid=abc; cf_clearance=stale", browser_mode=True)
-    context = _FakeContext(add_cookies=True)
-    page = _FakePage()
+def test_refresh_cookies_caches_duplicate_cloudflare_names_separately(host):
+    """同名不同作用域的 CF Cookie 必须各存一条，不能压成一条。"""
+    module = host.module
+    plugin = _enabled_plugin(host, cookie="sid=abc", browser_mode=True)
+    context = _FakeContext(
+        cookies=[
+            {"name": "cf_clearance", "value": "root", "domain": ".cnlang.org", "path": "/"},
+            {
+                "name": "cf_clearance",
+                "value": "scoped",
+                "domain": "cnlang.org",
+                "path": "/dsu_paulsign-sign.html",
+            },
+            {"name": "cf_chl_rc_ni", "value": "1", "domain": ".cnlang.org", "path": "/"},
+        ]
+    )
 
-    plugin._inject_cookies(context, page)
+    plugin._refresh_cookies_from_browser(context, _FakePage())
 
-    assert [item["name"] for item in context.jar] == ["sid"]
+    cached = plugin.store[module.KEY_CF_COOKIES]
+    assert len(cached) == 3
+    assert [item["value"] for item in cached[:2]] == ["root", "scoped"]
+    assert cached[1]["path"] == "/dsu_paulsign-sign.html"
 
 
 def test_finish_browser_signin_reports_challenged_submit(host):
