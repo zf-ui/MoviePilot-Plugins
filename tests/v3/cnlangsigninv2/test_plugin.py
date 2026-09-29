@@ -140,9 +140,10 @@ class _StubSettings:
 class _StubResponse:
     """模拟 HTTP 响应对象。"""
 
-    def __init__(self, status_code=200, text=""):
+    def __init__(self, status_code=200, text="", headers=None):
         self.status_code = status_code
         self.text = text
+        self.headers = {} if headers is None else dict(headers)
 
 
 class _StubRequestUtils:
@@ -150,6 +151,7 @@ class _StubRequestUtils:
 
     routes = {}
     calls = []
+    proxy_calls = []
 
     def __init__(self, headers=None, proxies=None, **kwargs):
         self.headers = headers or {}
@@ -157,10 +159,12 @@ class _StubRequestUtils:
 
     def get_res(self, url, **kwargs):
         self.calls.append(("GET", url, self.headers))
+        self.proxy_calls.append(("GET", url, self.proxies))
         return self.routes.get(url)
 
     def post_res(self, url, data=None, **kwargs):
         self.calls.append(("POST", url, self.headers))
+        self.proxy_calls.append(("POST", url, self.proxies))
         return self.routes.get(url)
 
 
@@ -171,12 +175,30 @@ class _StubEvent:
         self.event_data = event_data
 
 
+class _BareResponse:
+    """刻意不提供 headers 属性，用于验证检测逻辑的降级能力。"""
+
+    def __init__(self, status_code=403, text="Forbidden"):
+        self.status_code = status_code
+        self.text = text
+
+
+# Cloudflare 托管挑战的真实响应特征（取自 cnlang.org 实测响应）
+CF_CHALLENGE_HEADERS = {"Cf-Mitigated": "challenge", "Server": "cloudflare"}
+CF_CHALLENGE_BODY = (
+    "<html><head><title>Just a moment...</title></head><body>"
+    '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+    "</body></html>"
+)
+
+
 @pytest.fixture
 def host(monkeypatch):
     """安装宿主桩模块，返回便于断言的可控对象集合。"""
     _StubScheduler.reset()
     _StubRequestUtils.routes = {}
     _StubRequestUtils.calls = []
+    _StubRequestUtils.proxy_calls = []
     logger = _StubLogger()
 
     class _EventType(Enum):
@@ -335,6 +357,30 @@ def test_init_plugin_tolerates_bad_history_days(host):
     plugin = _enabled_plugin(host, history_days="abc")
 
     assert plugin._history_days == 30
+
+
+def test_init_plugin_reads_anti_bot_config(host):
+    """反爬相关配置（浏览器模式、自定义 UA）应被正确读入。"""
+    plugin = _enabled_plugin(host, user_agent="  UA-X  ", browser_mode=False)
+
+    assert plugin._user_agent == "UA-X"
+    assert plugin._browser_mode is False
+
+
+def test_browser_mode_defaults_to_enabled(host):
+    """未显式配置时浏览器模式默认开启：站点常态启用 Cloudflare。"""
+    plugin = _enabled_plugin(host)
+
+    assert plugin._browser_mode is True
+    assert plugin._user_agent is None
+
+
+def test_save_config_persists_anti_bot_fields(host):
+    """回写配置必须保留 UA 与浏览器模式，否则保存一次就会丢失。"""
+    plugin = _enabled_plugin(host, user_agent="UA-Y", browser_mode=True, onlyonce=True)
+
+    assert plugin.saved_config["user_agent"] == "UA-Y"
+    assert plugin.saved_config["browser_mode"] is True
 
 
 def test_init_plugin_is_repeatable(host):
@@ -646,6 +692,388 @@ def test_fetch_returns_none_on_exception(host, monkeypatch):
     assert plugin._fetch(url) is None
 
 
+# --- Cloudflare 拦截识别 ---------------------------------------------------
+
+
+def test_is_cf_challenge_detects_official_marker(host):
+    """Cloudflare 官方标记 Cf-Mitigated: challenge 应立即判定为挑战页。"""
+    response = host.response_cls(403, "", headers={"Cf-Mitigated": "challenge"})
+
+    assert host.module.CnlangSigninV2._is_cf_challenge(response) is True
+
+
+def test_is_cf_challenge_falls_back_to_body_heuristic(host):
+    """无官方标记时，仅当 Server 为 cloudflare 且正文含挑战特征才判定拦截。"""
+    cls = host.module.CnlangSigninV2
+
+    assert (
+        cls._is_cf_challenge(
+            host.response_cls(403, CF_CHALLENGE_BODY, headers={"Server": "cloudflare"})
+        )
+        is True
+    )
+    # 非 Cloudflare 站点即使正文含同名字样也不误判
+    assert (
+        cls._is_cf_challenge(
+            host.response_cls(403, CF_CHALLENGE_BODY, headers={"Server": "nginx"})
+        )
+        is False
+    )
+    # Cloudflare 返回的普通 403 不应被误判为挑战页
+    assert (
+        cls._is_cf_challenge(
+            host.response_cls(403, "Forbidden", headers={"Server": "cloudflare"})
+        )
+        is False
+    )
+
+
+def test_is_cf_challenge_tolerates_missing_headers(host):
+    """响应对象没有 headers 属性时不得抛异常，按未拦截处理。"""
+    assert host.module.CnlangSigninV2._is_cf_challenge(_BareResponse()) is False
+
+
+def test_request_flags_cloudflare_challenge_with_status(host):
+    """被拦截时 _request 返回 (None, 状态码, True)，供上层切换浏览器模式。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    text, status, cf_blocked = plugin._request(
+        module.SIGN_PAGE_URL, headers=plugin._build_headers()
+    )
+
+    assert text is None
+    assert status == 403
+    assert cf_blocked is True
+
+
+def test_request_falls_back_to_direct_when_proxy_unreachable(host, monkeypatch):
+    """代理无响应时应自动回退直连重试一轮，避免代理失效导致整轮签到报废。"""
+    module = host.module
+    plugin = _enabled_plugin(host, use_proxy=True)
+    monkeypatch.setattr(module.settings, "PROXY", "http://proxy.invalid:8080")
+
+    responses = [None, host.response_cls(200, "ok")]
+    seen_proxies = []
+
+    def _get_res(self, url, **kwargs):
+        seen_proxies.append(self.proxies)
+        return responses.pop(0)
+
+    monkeypatch.setattr(host.request, "get_res", _get_res)
+
+    text, status, cf_blocked = plugin._request("https://example.invalid/z")
+
+    assert (text, status, cf_blocked) == ("ok", 200, False)
+    assert seen_proxies[0] == "http://proxy.invalid:8080"
+    assert seen_proxies[1] == module.DIRECT_PROXIES
+
+
+# --- 请求头 UA --------------------------------------------------------------
+
+
+def test_build_headers_sends_configured_user_agent(host):
+    """自定义 UA 必须原样发送：cf_clearance 与 UA 绑定，不一致会立即失效。"""
+    plugin = _enabled_plugin(host, user_agent="Mozilla/5.0 CustomUA")
+
+    assert plugin._build_headers()["User-Agent"] == "Mozilla/5.0 CustomUA"
+
+
+def test_build_headers_defaults_to_chrome_user_agent(host):
+    """未配置 UA 时使用内置 Chrome UA，避免被 python-requests 标识识别为爬虫。"""
+    plugin = _enabled_plugin(host, user_agent="")
+
+    assert plugin._build_headers()["User-Agent"] == host.module.DEFAULT_USER_AGENT
+    assert "Chrome/" in host.module.DEFAULT_USER_AGENT
+
+
+# --- Cloudflare 拦截后的分支 -------------------------------------------------
+
+
+def test_execute_signin_switches_to_browser_mode_on_cloudflare(host, monkeypatch):
+    """requests 被 Cloudflare 拦截时应自动切换到浏览器模式完成签到。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+    called = []
+
+    def _fake_browser(self):
+        called.append(True)
+        self.save_data(
+            module.KEY_LAST_RESULT,
+            {
+                "time": "2026-09-29 20:00:00",
+                "success": True,
+                "username": "tester",
+                "money": "520",
+                "content": "签到成功（浏览器模式）",
+                "total_signs": 3,
+            },
+        )
+        return True
+
+    monkeypatch.setattr(module.CnlangSigninV2, "_signin_by_browser", _fake_browser)
+
+    result = plugin.signin()
+
+    assert called == [True]
+    assert result["success"] is True
+    assert result["money"] == "520"
+
+
+def test_execute_signin_advises_enabling_browser_mode(host):
+    """关闭浏览器模式时，Cloudflare 拦截应给出可执行建议而非“未知错误”。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=False, notify=True)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert result["content"] == module.CF_ADVICE
+    assert "浏览器模式" in result["content"]
+    assert "cf_clearance" in result["content"]
+
+
+def test_cloudflare_block_reports_browser_unavailable(host):
+    """浏览器模式开启但宿主未提供 app.sdk.browser 时，应给出明确的依赖提示。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert "浏览器模式不可用" in result["content"]
+
+
+def test_signin_by_browser_without_host_support_returns_false(host):
+    """宿主未提供 app.sdk.browser 时 _signin_by_browser 返回 False 而非抛异常。"""
+    plugin = _enabled_plugin(host, browser_mode=True)
+
+    assert plugin._signin_by_browser() is False
+
+
+def test_execute_signin_reports_http_status_in_failure(host):
+    """普通失败应把状态码写进原因，避免只报“失败”而无法定位。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {module.SIGN_PAGE_URL: host.response_cls(500, "server error")}
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert "500" in result["content"]
+
+
+# --- 浏览器模式内部机制 -------------------------------------------------------
+
+
+class _FakePage:
+    """可编程的假页面：按需返回 HTML / 标题 / UA，并记录请求头写入。"""
+
+    def __init__(self, html="", title="", user_agent="", fail_content=False):
+        self._html = html
+        self._title = title
+        self._user_agent = user_agent
+        self._fail_content = fail_content
+        self.headers = {}
+        self.goto_calls = []
+        self.evaluate_calls = []
+
+    def content(self):
+        if self._fail_content:
+            raise RuntimeError("page is navigating")
+        return self._html
+
+    def title(self):
+        return self._title
+
+    def evaluate(self, expression, *args):
+        self.evaluate_calls.append(expression)
+        if "navigator.userAgent" in expression:
+            return self._user_agent
+        return ""
+
+    def set_extra_http_headers(self, headers):
+        self.headers.update(headers)
+
+    def set_default_timeout(self, timeout):
+        self.headers["__timeout"] = timeout
+
+
+class _FakeContext:
+    """可编程的假浏览器上下文。"""
+
+    def __init__(self, cookies=None, add_cookies=None):
+        self._cookies = cookies or []
+        self._add_cookies = add_cookies
+        self.jar = []
+
+    def cookies(self):
+        if isinstance(self._cookies, Exception):
+            raise self._cookies
+        return self._cookies
+
+    def add_cookies(self, jar):
+        if isinstance(self._add_cookies, Exception):
+            raise self._add_cookies
+        if self._add_cookies is None:
+            raise AttributeError("add_cookies")
+        self.jar.extend(jar)
+
+
+def test_is_cf_challenge_page_covers_title_and_body(host):
+    """挑战页识别应同时覆盖标题特征与正文特征，普通页面不得误判。"""
+    cls = host.module.CnlangSigninV2
+
+    assert cls._is_cf_challenge_page("<html></html>", "Just a moment...") is True
+    assert cls._is_cf_challenge_page("<html></html>", "请稍候...") is True
+    assert (
+        cls._is_cf_challenge_page(
+            '<script src="https://challenges.cloudflare.com/turnstile"></script>'
+            '<div id="cf-chl-widget-abc">',
+            "国语视界",
+        )
+        is True
+    )
+    assert cls._is_cf_challenge_page("<html><body>hello</body></html>", "国语视界") is False
+
+
+def test_wait_cf_pass_returns_true_when_page_has_real_content(host, monkeypatch):
+    """页面已有真实内容且不再是挑战页时应立即判定通过。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="国语视界")
+
+    assert plugin._wait_cf_pass(page, rounds=3) is True
+
+
+def test_wait_cf_pass_returns_false_on_persistent_challenge(host, monkeypatch):
+    """持续停留在挑战页时应耗尽轮询并返回 False。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="Just a moment...")
+
+    assert plugin._wait_cf_pass(page, rounds=3) is False
+
+
+def test_inject_cookies_prefers_browser_cookie_jar(host):
+    """上下文支持 add_cookies 时应写入 Cookie 罐，而不是覆盖请求头。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc")
+    context = _FakeContext(add_cookies=True)
+    page = _FakePage()
+
+    plugin._inject_cookies(context, page)
+
+    assert context.jar[0]["name"] == "sid"
+    assert context.jar[0]["value"] == "abc"
+    assert context.jar[0]["domain"] == f".{host.module.SITE_HOST}"
+    assert page.headers == {}
+
+
+def test_inject_cookies_falls_back_to_request_header(host):
+    """上下文不提供 add_cookies 时应回退到请求头方式。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc; t=1")
+    page = _FakePage()
+
+    plugin._inject_cookies(_FakeContext(add_cookies=None), page)
+
+    assert page.headers == {"cookie": "sid=abc; t=1"}
+
+
+def test_inject_cookies_falls_back_when_jar_write_fails(host):
+    """写入 Cookie 罐失败时应回退到请求头方式，不抛异常。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc")
+    page = _FakePage()
+
+    plugin._inject_cookies(_FakeContext(add_cookies=RuntimeError("boom")), page)
+
+    assert page.headers == {"cookie": "sid=abc"}
+
+
+def test_inject_cookies_skips_when_no_cookie(host):
+    """未配置 Cookie 时不应写入任何内容。"""
+    plugin = _enabled_plugin(host, cookie="")
+    context = _FakeContext(add_cookies=True)
+    page = _FakePage()
+
+    plugin._inject_cookies(context, page)
+
+    assert context.jar == []
+    assert page.headers == {}
+
+
+def test_refresh_cookies_records_browser_user_agent(host):
+    """写回 Cookie 时必须同时记录浏览器实际 UA——cf_clearance 与 UA 绑定。
+
+    否则写回的 Cookie 配上一个不同的 UA 会立即失效，requests 快速路径永远走不通。
+    """
+    plugin = _enabled_plugin(host, cookie="sid=abc", user_agent="ConfiguredUA")
+    context = _FakeContext(
+        cookies=[{"name": "cf_clearance", "value": "fresh"}, {"name": "sid", "value": "abc"}]
+    )
+    page = _FakePage(user_agent="BrowserRealUA")
+
+    plugin._refresh_cookies_from_browser(context, page)
+
+    assert plugin._user_agent == "BrowserRealUA"
+    assert "cf_clearance=fresh" in plugin._cookie
+    assert plugin.saved_config["user_agent"] == "BrowserRealUA"
+
+
+def test_refresh_cookies_survives_broken_browser_api(host):
+    """浏览器 Cookie / UA 读取失败时保留原配置，不得抛异常。"""
+    plugin = _enabled_plugin(host, cookie="sid=abc", user_agent="ConfiguredUA")
+
+    plugin._refresh_cookies_from_browser(
+        _FakeContext(cookies=RuntimeError("no cookies api")), _FakePage()
+    )
+
+    assert plugin._cookie == "sid=abc"
+    assert plugin._user_agent == "ConfiguredUA"
+
+
+def test_browser_proxy_url_respects_use_proxy_flag(host, monkeypatch):
+    """未开启代理时返回 None；开启时从宿主配置取出代理地址。"""
+    monkeypatch.setattr(host.module.settings, "PROXY", "http://proxy.invalid:8080")
+
+    plugin = _enabled_plugin(host, use_proxy=False)
+    assert plugin._browser_proxy_url() is None
+
+    plugin = _enabled_plugin(host, use_proxy=True)
+    assert plugin._browser_proxy_url() == "http://proxy.invalid:8080"
+
+
+def test_browser_proxy_url_supports_dict_form(host, monkeypatch):
+    """宿主以字典形式提供代理时应取出 https/http 之一。"""
+    monkeypatch.setattr(
+        host.module.settings,
+        "PROXY",
+        {"http": "http://p:1", "https": "https://p:2"},
+    )
+    plugin = _enabled_plugin(host, use_proxy=True)
+
+    assert plugin._browser_proxy_url() == "https://p:2"
+
+
 def test_execute_signin_without_cookie_records_failure(host):
     """未配置 Cookie 时应直接记录失败结果，不发起任何请求。"""
     plugin = _enabled_plugin(host, cookie="", notify=True)
@@ -866,6 +1294,18 @@ def test_get_form_returns_defaults(host):
     assert defaults["cron"] == "0 7 * * *"
     assert defaults["notify_style"] == "style1"
     assert defaults["enabled"] is False
+
+
+def test_get_form_exposes_anti_bot_settings(host):
+    """配置页应包含浏览器模式开关与 UA 输入框，并带出可用的默认值。"""
+    plugin = _enabled_plugin(host)
+    form, defaults = plugin.get_form()
+
+    serialized = json.dumps(form, ensure_ascii=False)
+    assert "browser_mode" in serialized
+    assert "user_agent" in serialized
+    assert defaults["browser_mode"] is True
+    assert defaults["user_agent"] == ""
 
 
 def test_get_command_registers_remote_action(host):

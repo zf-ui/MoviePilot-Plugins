@@ -92,6 +92,31 @@ SAY_FALLBACK = "一别之后，两地相思，只道是三四月，又谁知五�
 # 签到心情固定使用“开心”
 SIGN_MOOD = "kx"
 
+# 默认 User-Agent。Cloudflare 签发的 cf_clearance 与 UA 绑定，站点也会按 UA 判断
+# 浏览器新旧，因此这里取一个较新的稳定版本；用户可在配置中覆盖为与自己浏览器
+# 完全一致的 UA（见配置项「浏览器UA」）。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+# 显式直连代理：requests 传空代理字典表示绕过环境代理
+DIRECT_PROXIES: Dict[str, Any] = {"http": None, "https": None}
+# Cloudflare 挑战页的标题特征（小写比较）
+CF_CHALLENGE_TITLES = (
+    "just a moment",
+    "请稍候",
+    "attention required",
+    "loading",
+)
+# 未开启浏览器模式且被 Cloudflare 拦截时给出的可执行建议
+CF_ADVICE = (
+    "站点启用了 Cloudflare 人机验证，纯 requests 无法通过。请任选其一：\n"
+    "1）开启「浏览器模式」，由宿主内置无头浏览器完成验证后自动签到；\n"
+    "2）从浏览器开发者工具复制完整 Cookie（必须包含 cf_clearance），"
+    "并把「浏览器UA」改成与你浏览器完全一致的值——cf_clearance 与 UA 绑定，"
+    "不一致会立即失效。"
+)
+
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
 
@@ -248,7 +273,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.1"
+    plugin_version = "3.6.2"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -277,6 +302,10 @@ class CnlangSigninV2(_PluginBase):
     _notify_style: str = "style1"
     # 是否使用宿主系统代理
     _use_proxy: bool = False
+    # 自定义 User-Agent，None 表示使用 DEFAULT_USER_AGENT
+    _user_agent: Optional[str] = None
+    # 被 Cloudflare 拦截时是否自动切换浏览器模式完成签到
+    _browser_mode: bool = True
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -306,6 +335,9 @@ class CnlangSigninV2(_PluginBase):
         self._notify_style = config.get("notify_style") or "style1"
         self._random_delay = config.get("random_delay")
         self._use_proxy = bool(config.get("use_proxy", False))
+        self._user_agent = (config.get("user_agent") or "").strip() or None
+        # 默认开启：站点常态启用 Cloudflare，关闭后 requests 被拦截时会直接失败
+        self._browser_mode = bool(config.get("browser_mode", True))
         try:
             self._history_days = max(int(config.get("history_days") or 30), 1)
         except (TypeError, ValueError):
@@ -492,7 +524,11 @@ class CnlangSigninV2(_PluginBase):
             self._run_in_background(delay)
 
     def _execute_signin(self) -> Dict[str, Any]:
-        """签到主流程：探测登录态 -> 提交签到 -> 汇总结果 -> 落库并通知。"""
+        """签到主流程：探测登录态 -> 提交签到 -> 汇总结果 -> 落库并通知。
+
+        先走纯 requests 快速路径；一旦被 Cloudflare 人机验证拦截，按配置切换到
+        浏览器模式完成整轮签到（验证与提交都在浏览器页面上下文内进行）。
+        """
         if not self._cookie:
             return self._record_failure("未配置Cookie")
 
@@ -501,9 +537,16 @@ class CnlangSigninV2(_PluginBase):
 
         # 步骤 1：读取签到页面，确认登录态并提取 formhash
         logger.info(f"步骤1：获取签到页面信息{proxy_hint}")
-        page = self._fetch(SIGN_PAGE_URL, headers=headers)
+        page, status, cf_blocked = self._request(SIGN_PAGE_URL, headers=headers)
+        if cf_blocked:
+            return self._handle_cloudflare_block()
         if page is None:
-            return self._record_failure("获取签到页面失败，请检查网络或代理设置")
+            detail = (
+                f"获取签到页面失败，状态码：{status}"
+                if status is not None
+                else "获取签到页面失败，请检查网络或代理设置"
+            )
+            return self._record_failure(detail)
 
         user_name = self._search(r'title="访问我的空间">(.*?)</a>', page)
         if not user_name:
@@ -525,7 +568,7 @@ class CnlangSigninV2(_PluginBase):
 
         # 步骤 2：提交签到
         logger.info(f"步骤2：提交签到请求{proxy_hint}")
-        response = self._fetch(
+        response, status, cf_blocked = self._request(
             SIGN_SUBMIT_URL,
             headers=headers,
             data={
@@ -536,8 +579,15 @@ class CnlangSigninV2(_PluginBase):
                 "fastreply": "0",
             },
         )
+        if cf_blocked:
+            return self._handle_cloudflare_block()
         if response is None:
-            return self._record_failure("提交签到请求失败，请检查网络或代理设置")
+            detail = (
+                f"提交签到请求失败，状态码：{status}"
+                if status is not None
+                else "提交签到请求失败，请检查网络或代理设置"
+            )
+            return self._record_failure(detail)
 
         content = self._search(r'<div class="c">(.*?)</div>', response, flags=re.DOTALL)
         if not content:
@@ -557,6 +607,357 @@ class CnlangSigninV2(_PluginBase):
             money=money,
             content=content,
         )
+
+    # ------------------------------------------------------------------
+    # Cloudflare 拦截与浏览器模式
+    # ------------------------------------------------------------------
+
+    def _handle_cloudflare_block(self) -> Dict[str, Any]:
+        """处理 Cloudflare 人机验证拦截：按配置切浏览器模式，否则给出可执行建议。"""
+        if not self._browser_mode:
+            logger.error("未开启浏览器模式，无法通过 Cloudflare 人机验证")
+            return self._record_failure(CF_ADVICE)
+        logger.warning("检测到 Cloudflare 人机验证，切换到浏览器模式执行签到")
+        if not self._signin_by_browser():
+            return self._record_failure(
+                "浏览器模式不可用，请确认宿主机已安装浏览器依赖（cloakbrowser / playwright）"
+            )
+        result = self.get_data(KEY_LAST_RESULT) or {}
+        if not result:
+            return self._record_failure("浏览器模式未产生签到结果")
+        return result
+
+    def _signin_by_browser(self) -> bool:
+        """在真实浏览器中完成整轮签到。
+
+        cf_clearance 与 TLS 指纹、User-Agent 绑定，requests 无法复用浏览器拿到的
+        通行证，因此通过验证后的签到提交也必须在浏览器页面上下文内完成。
+
+        :return: True 表示已完整处理（结果已由 ``_record_*`` 落库并通知）；
+                 False 表示浏览器不可用，调用方需要自行给出失败结论
+        """
+        try:
+            from app.sdk.browser import launch_browser_context
+        except ImportError:
+            logger.error("当前宿主未提供 app.sdk.browser，无法使用浏览器模式")
+            return False
+
+        context = None
+        try:
+            launch_kwargs: Dict[str, Any] = {
+                "headless": True,
+                "user_agent": self._user_agent or DEFAULT_USER_AGENT,
+            }
+            proxy_url = self._browser_proxy_url()
+            if proxy_url:
+                launch_kwargs["proxy"] = {"server": proxy_url}
+                logger.info(f"浏览器模式：使用代理 {proxy_url}")
+
+            context = launch_browser_context(**launch_kwargs)
+            page = context.new_page()
+            page.set_default_timeout(60000)
+            self._inject_cookies(context, page)
+
+            # 先访问站点首页：Cloudflare 验证对全站生效，首页更容易触发并完成挑战
+            logger.info("浏览器模式：正在访问站点，等待 Cloudflare 验证...")
+            self._goto(page, f"https://{SITE_HOST}/")
+            if not self._wait_cf_pass(page, rounds=30):
+                self._save_failure_screenshot(page, "cf_challenge_failed.png")
+                self._record_failure(
+                    "Cloudflare 验证未通过（浏览器模式等待超时），可能需要人工完成交互验证"
+                )
+                return True
+
+            # 挑战通过后把浏览器新签发的 Cookie 合并回配置，供下次 requests 快速路径复用
+            self._refresh_cookies_from_browser(context, page)
+
+            logger.info("浏览器模式：访问签到页")
+            self._goto(page, SIGN_PAGE_URL)
+            sign_page_ok = False
+            for attempt in range(3):
+                if self._wait_cf_pass(page, rounds=10, click_checkbox=True):
+                    sign_page_ok = True
+                    break
+                if attempt < 2:
+                    logger.info(f"浏览器模式：签到页挑战未通过，重载页面重试（第 {attempt + 2}/3 轮）")
+                    self._reload(page)
+            if not sign_page_ok:
+                self._save_failure_screenshot(page, "signin_page_failed.png")
+                self._record_failure("签到页 Cloudflare 验证未通过，请稍后重试")
+                return True
+
+            html = self._page_content(page)
+            user_name = self._search(r'title="访问我的空间">(.*?)</a>', html)
+            if not user_name:
+                self._save_failure_screenshot(page, "signin_page_failed.png")
+                self._record_failure("未获取到用户名，Cookie 可能已失效")
+                return True
+            logger.info(f"登录用户名：{user_name}")
+
+            if re.search(r"您今天已经签到过了或者签到时间还未开始", html):
+                logger.info("今日已完成签到，跳过提交")
+                self._record_already_signed(user_name)
+                return True
+
+            formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
+            if not formhash:
+                self._record_failure("未获取到 formhash，站点页面结构可能已变化")
+                return True
+
+            month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", html)
+            total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
+
+            logger.info("浏览器模式：在页面上下文内提交签到")
+            submitted = self._browser_fetch(
+                page,
+                SIGN_SUBMIT_URL,
+                data={
+                    "formhash": formhash,
+                    "qdxq": SIGN_MOOD,
+                    "qdmode": "1",
+                    "todaysay": self._build_say(),
+                    "fastreply": "0",
+                },
+            )
+            content = self._search(r'<div class="c">(.*?)</div>', submitted or "", flags=re.DOTALL)
+            if not content:
+                self._record_failure("获取签到后的响应内容失败")
+                return True
+            content = content.strip()
+            logger.info(f"签到响应：{content}")
+
+            credit_html = self._browser_fetch(page, CREDIT_URL) or ""
+            money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_html) or "未知"
+            logger.info(f"当前大洋余额：{money}")
+
+            self._record_success(
+                username=user_name,
+                total_signs=total_signs,
+                money=money,
+                content=content,
+            )
+            return True
+        except Exception as err:  # noqa: BLE001 - 浏览器异常不得冒泡到宿主调度器
+            logger.error(f"浏览器模式执行失败：{err}")
+            try:
+                self._record_failure(f"浏览器模式执行失败：{err}")
+            except Exception as inner:  # noqa: BLE001 - 记录失败结果时出错只记日志
+                logger.error(f"记录浏览器模式失败结果时出错：{inner}")
+            return True
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception as err:  # noqa: BLE001 - 关闭失败只记录
+                    logger.debug(f"关闭浏览器上下文失败：{err}")
+
+    def _browser_proxy_url(self) -> Optional[str]:
+        """返回浏览器模式使用的代理地址；未开启代理或宿主未配置时返回 None。"""
+        if not self._use_proxy:
+            return None
+        proxy = getattr(settings, "PROXY", None)
+        if isinstance(proxy, dict):
+            return proxy.get("https") or proxy.get("http") or None
+        return proxy or None
+
+    def _inject_cookies(self, context: Any, page: Any) -> None:
+        """把配置 Cookie 写入浏览器会话。
+
+        优先写入 Cookie 罐而不是请求头：请求头覆盖会把浏览器新拿到的
+        cf_clearance 顶回旧值。宿主不支持 ``add_cookies`` 时回退请求头方式。
+        """
+        if not self._cookie:
+            return
+        jar = []
+        for pair in self._cookie.split(";"):
+            if "=" not in pair:
+                continue
+            name, value = pair.split("=", 1)
+            jar.append(
+                {
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": f".{SITE_HOST}",
+                    "path": "/",
+                }
+            )
+        add_cookies = getattr(context, "add_cookies", None)
+        if add_cookies and jar:
+            try:
+                add_cookies(jar)
+                logger.info(f"浏览器模式：{len(jar)} 个 Cookie 字段已写入浏览器会话")
+                return
+            except Exception as err:  # noqa: BLE001 - 回退到请求头方式
+                logger.warning(f"浏览器模式：Cookie 写入浏览器失败（{err}），改用请求头方式")
+        try:
+            page.set_extra_http_headers({"cookie": self._cookie})
+        except Exception as err:  # noqa: BLE001 - 写入失败由外层兜底
+            logger.warning(f"浏览器模式：Cookie 写入请求头失败（{err}）")
+
+    def _refresh_cookies_from_browser(self, context: Any, page: Any) -> None:
+        """把浏览器新签发的 Cookie 合并回配置并持久化。
+
+        Cloudflare 的 cf_clearance 会随验证刷新，写回配置后 requests 快速路径
+        在下一次执行时更可能直接命中。
+
+        注意：cf_clearance 与 User-Agent 绑定，因此这里同时记录**浏览器实际使用的
+        UA**。否则写回的 Cookie 配上一个不同的 UA 会立即失效，requests 快速路径
+        永远走不通。
+        """
+        merged: Dict[str, str] = {}
+        for pair in (self._cookie or "").split(";"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                merged[key.strip()] = value.strip()
+        try:
+            cookies = context.cookies() or []
+        except Exception as err:  # noqa: BLE001 - 取不到 Cookie 时保留原值
+            logger.debug(f"浏览器模式：读取浏览器 Cookie 失败：{err}")
+            cookies = []
+        for item in cookies:
+            name = item.get("name")
+            if name:
+                merged[name] = item.get("value", "")
+        self._cookie = "; ".join(f"{key}={value}" for key, value in merged.items())
+        try:
+            browser_ua = page.evaluate("navigator.userAgent")
+        except Exception as err:  # noqa: BLE001 - 取不到 UA 时保留配置值
+            logger.debug(f"浏览器模式：读取浏览器 UA 失败：{err}")
+            browser_ua = None
+        if browser_ua:
+            self._user_agent = browser_ua
+            logger.info(f"浏览器模式：已记录浏览器实际 UA：{browser_ua}")
+        self._save_config()
+        logger.info(f"浏览器模式：已合并浏览器 {len(cookies)} 个 Cookie 并写回配置")
+
+    def _wait_cf_pass(self, page: Any, rounds: int = 30, click_checkbox: bool = False) -> bool:
+        """轮询等待当前页面通过 Cloudflare 验证。
+
+        通过标准是「页面已有真实内容且不再是挑战页」：cf_clearance 未过期时
+        Cloudflare 不会重新签发，因此不能以「出现新 Cookie」为通过标准。
+
+        :param page: 浏览器页面
+        :param rounds: 最多轮询次数，每轮间隔 2 秒
+        :param click_checkbox: 等待过程中是否周期性尝试点击 Turnstile 复选框
+        :return: 是否已通过验证
+        """
+        for index in range(rounds):
+            html, title = "", ""
+            try:
+                html = page.content() or ""
+                title = page.title() or ""
+            except Exception:  # noqa: BLE001 - 页面跳转中读取失败属正常
+                pass
+            no_content = len(html) < 500 and not title
+            if not no_content and not self._is_cf_challenge_page(html, title):
+                return True
+            if click_checkbox and not no_content and index % 3 == 1:
+                self._try_click_cf_checkbox(page)
+            if index % 5 == 0:
+                logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title}")
+            time.sleep(2)
+        return False
+
+    @staticmethod
+    def _is_cf_challenge_page(html: str, title: str) -> bool:
+        """判断页面是否为 Cloudflare 挑战页。"""
+        lowered_title = (title or "").strip().lower()
+        if any(marker in lowered_title for marker in CF_CHALLENGE_TITLES):
+            return True
+        lowered_html = (html or "").lower()
+        return "challenges.cloudflare.com" in lowered_html and "cf-chl" in lowered_html
+
+    @staticmethod
+    def _try_click_cf_checkbox(page: Any) -> None:
+        """尽力点击 Cloudflare Turnstile 复选框。
+
+        交互式挑战不会自动通过，点击只是提高通过率；失败静默处理，不影响主流程。
+        """
+        try:
+            frames = getattr(page, "frames", None) or []
+            mouse = getattr(page, "mouse", None)
+            if not mouse:
+                return
+            for frame in frames:
+                try:
+                    if "challenges.cloudflare.com" not in (frame.url or ""):
+                        continue
+                    element = frame.frame_element()
+                    box = element.bounding_box() if element else None
+                    if box:
+                        mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                        logger.info("浏览器模式：检测到交互式验证，已尝试点击人机验证框")
+                        return
+                except Exception:  # noqa: BLE001 - 单个 frame 失败继续尝试下一个
+                    continue
+        except Exception as err:  # noqa: BLE001 - 点击失败不影响主流程
+            logger.debug(f"浏览器模式：尝试点击人机验证框失败：{err}")
+
+    @staticmethod
+    def _browser_fetch(
+        page: Any, url: str, data: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """在浏览器页面上下文内发起请求，复用浏览器的 Cookie 与 TLS 指纹。"""
+        script = """async ([target, body]) => {
+            const options = { method: body ? 'POST' : 'GET', credentials: 'include' };
+            if (body) {
+                options.headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'};
+                options.body = new URLSearchParams(body).toString();
+            }
+            const resp = await fetch(target, options);
+            return await resp.text();
+        }"""
+        try:
+            return page.evaluate(script, [url, data or None])
+        except Exception as err:  # noqa: BLE001 - 浏览器内请求失败按无响应处理
+            logger.error(f"浏览器模式：页面内请求 {url} 失败：{err}")
+            return None
+
+    @staticmethod
+    def _goto(page: Any, url: str, timeout: int = 45000) -> bool:
+        """导航到目标地址；加载事件超时不视为致命（页面可能已部分加载）。"""
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return True
+        except Exception as err:  # noqa: BLE001 - 交给外层轮询判断实际内容
+            logger.warning(f"浏览器模式：{url} 加载事件超时（{err.__class__.__name__}），检查已加载内容")
+            return False
+
+    @staticmethod
+    def _reload(page: Any, timeout: int = 45000) -> None:
+        """重载当前页面；宿主浏览器未提供 reload 时忽略。"""
+        reload_page = getattr(page, "reload", None)
+        if reload_page is None:
+            return
+        try:
+            reload_page(wait_until="domcontentloaded", timeout=timeout)
+        except Exception as err:  # noqa: BLE001 - 重载失败由外层轮询兜底
+            logger.debug(f"浏览器模式：页面重载失败（{err}）")
+
+    @staticmethod
+    def _page_content(page: Any) -> str:
+        """读取页面 HTML；页面跳转过程中 content() 可能失败，重试若干次。"""
+        for _ in range(5):
+            try:
+                html = page.content()
+                if html:
+                    return html
+            except Exception:  # noqa: BLE001 - 跳转中读取失败属正常
+                pass
+            time.sleep(1)
+        return ""
+
+    def _save_failure_screenshot(self, page: Any, filename: str) -> None:
+        """把失败页面截图保存到插件数据目录，便于排查挑战卡在哪一步。"""
+        try:
+            shot = page.screenshot()
+            if not shot:
+                return
+            path = self.get_data_path() / filename
+            path.write_bytes(shot)
+            logger.error(f"浏览器模式：失败页面截图已保存到 {path}")
+        except Exception as err:  # noqa: BLE001 - 截图仅用于诊断
+            logger.debug(f"浏览器模式：保存失败页面截图失败：{err}")
 
     # ------------------------------------------------------------------
     # 结果记录与通知
@@ -681,6 +1082,8 @@ class CnlangSigninV2(_PluginBase):
             "random_delay": self._random_delay,
             "history_days": self._history_days,
             "use_proxy": self._use_proxy,
+            "user_agent": self._user_agent or "",
+            "browser_mode": self._browser_mode,
             "onlyonce": False,
             "clear": False,
         }
@@ -801,10 +1204,8 @@ class CnlangSigninV2(_PluginBase):
             "Upgrade-Insecure-Requests": "1",
             "Host": SITE_HOST,
             "Cookie": self._cookie or "",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62"
-            ),
+            # Cloudflare 签发的 cf_clearance 与 UA 绑定，配置了自定义 UA 时必须原样发送
+            "User-Agent": self._user_agent or DEFAULT_USER_AGENT,
         }
 
     def _get_proxies(self) -> Optional[Dict[str, str]]:
@@ -818,6 +1219,81 @@ class CnlangSigninV2(_PluginBase):
         logger.info(f"使用系统代理：{proxy}")
         return proxy
 
+    def _request(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[str], Optional[int], bool]:
+        """发起一次请求并返回 ``(正文, 状态码, 是否被 Cloudflare 拦截)``。
+
+        正文仅在状态码为 200 时返回；请求异常时状态码为 None。
+        被 Cloudflare 拦截时单独标记，调用方据此决定是否切换浏览器模式。
+
+        :param url: 目标地址
+        :param headers: 请求头，None 时使用 RequestUtils 默认头
+        :param data: 非空时使用 POST，否则使用 GET
+        :return: 三元组，见上文
+        """
+        proxies = self._get_proxies()
+        try:
+            client = RequestUtils(headers=headers, proxies=proxies)
+            if data is not None:
+                response = client.post_res(url, data=data)
+            else:
+                response = client.get_res(url)
+        except Exception as err:
+            logger.error(f"请求 {url} 异常：{err}")
+            return None, None, False
+
+        if response is None and proxies:
+            # 代理不可用时回退直连重试一轮，避免代理失效导致整轮签到报废
+            logger.warning("代理请求无响应，自动回退直连重试...")
+            try:
+                client = RequestUtils(headers=headers, proxies=DIRECT_PROXIES)
+                if data is not None:
+                    response = client.post_res(url, data=data)
+                else:
+                    response = client.get_res(url)
+            except Exception as err:
+                logger.error(f"直连重试 {url} 异常：{err}")
+                return None, None, False
+
+        if response is None:
+            logger.error(f"请求 {url} 失败，无响应")
+            return None, None, False
+        if self._is_cf_challenge(response):
+            logger.error(f"请求 {url} 被 Cloudflare 人机验证拦截，状态码：{response.status_code}")
+            return None, response.status_code, True
+        if response.status_code != 200:
+            logger.error(f"请求 {url} 失败，状态码：{response.status_code}")
+            return None, response.status_code, False
+        return response.text, response.status_code, False
+
+    @staticmethod
+    def _is_cf_challenge(response: Any) -> bool:
+        """判断响应是否为 Cloudflare 人机验证页。
+
+        依据 ``Cf-Mitigated: challenge`` 响应头（Cloudflare 官方标记），并在
+        Server 为 cloudflare 时回退检查挑战页正文特征。
+        """
+        headers = getattr(response, "headers", None) or {}
+        try:
+            mitigated = str(headers.get("Cf-Mitigated", "") or "").strip().lower()
+        except Exception:  # noqa: BLE001 - 非映射型 headers 直接跳过
+            mitigated = ""
+        if mitigated == "challenge":
+            return True
+        try:
+            server = str(headers.get("Server", "") or "").strip().lower()
+        except Exception:  # noqa: BLE001 - 非映射型 headers 直接跳过
+            server = ""
+        if server != "cloudflare":
+            return False
+        body = (getattr(response, "text", "") or "")[:4000].lower()
+        return "just a moment" in body or "challenges.cloudflare.com" in body
+
     def _fetch(
         self,
         url: str,
@@ -830,22 +1306,10 @@ class CnlangSigninV2(_PluginBase):
         :param url: 目标地址
         :param headers: 请求头，None 时使用 RequestUtils 默认头
         :param data: 非空时使用 POST，否则使用 GET
-        :return: 响应正文；请求异常或状态码非 200 时返回 None
+        :return: 响应正文；请求异常、被 Cloudflare 拦截或状态码非 200 时返回 None
         """
-        try:
-            client = RequestUtils(headers=headers, proxies=self._get_proxies())
-            if data is not None:
-                response = client.post_res(url, data=data)
-            else:
-                response = client.get_res(url)
-        except Exception as err:
-            logger.error(f"请求 {url} 异常：{err}")
-            return None
-        if response is None or response.status_code != 200:
-            status = response.status_code if response is not None else "无响应"
-            logger.error(f"请求 {url} 失败，状态码：{status}")
-            return None
-        return response.text
+        text, _status, _cf_blocked = self._request(url, headers=headers, data=data)
+        return text
 
     @staticmethod
     def _search(pattern: str, text: str, flags: int = 0) -> Optional[str]:
@@ -1329,7 +1793,86 @@ class CnlangSigninV2(_PluginBase):
                                                             'rows': 5,
                                                             'placeholder': '请填写您的Cookie信息',
                                                             'prepend-inner-icon': 'mdi-cookie',
-                                                            'hint': '从浏览器中获取的Cookie信息'
+                                                            'hint': '从浏览器开发者工具复制完整Cookie；站点启用 Cloudflare 时必须包含 cf_clearance'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    # 反爬设置卡片
+                    {
+                        'component': 'VCard',
+                        'props': {
+                            'title': '反爬设置',
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
+                        'content': [
+                            {
+                                'component': 'VCardText',
+                                'content': [
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'browser_mode',
+                                                            'label': '浏览器模式',
+                                                            'color': 'warning',
+                                                            'prepend-icon': 'mdi-web'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 8
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'user_agent',
+                                                            'label': '浏览器UA（User-Agent）',
+                                                            'placeholder': '留空使用内置默认 UA',
+                                                            'prepend-inner-icon': 'mdi-account-search',
+                                                            'hint': 'cf_clearance 与 UA 绑定：请填写与浏览器完全一致的 UA，否则 Cloudflare 会重新发起验证'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VAlert',
+                                                        'props': {
+                                                            'type': 'info',
+                                                            'variant': 'tonal',
+                                                            'text': '站点启用了 Cloudflare 人机验证，纯 requests 会被 403 拦截。开启「浏览器模式」后，插件会自动改用宿主内置的无头浏览器完成验证并在浏览器内提交签到。'
                                                         }
                                                     }
                                                 ]
@@ -1656,7 +2199,9 @@ class CnlangSigninV2(_PluginBase):
             "history_days": 30,
             "cron": "0 7 * * *",
             "notify_style": "style1",
-            "use_proxy": False
+            "use_proxy": False,
+            "browser_mode": True,
+            "user_agent": ""
         }
 
     # ------------------------------------------------------------------
