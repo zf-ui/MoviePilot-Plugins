@@ -119,14 +119,17 @@ CF_CHALLENGE_HTML_MARKERS = (
 # 未开启浏览器模式且被 Cloudflare 拦截时给出的可执行建议
 CF_ADVICE = (
     "站点启用了 Cloudflare 人机验证，纯 requests 无法通过。请任选其一：\n"
-    "1）开启「浏览器模式」，由宿主内置无头浏览器完成验证后自动签到；\n"
+    "1）开启「浏览器模式」，由宿主内置浏览器完成验证后自动签到"
+    "（会先试无头、失败再自动升级到有头）；\n"
     "2）从浏览器开发者工具复制完整 Cookie（必须包含 cf_clearance），"
     "并把「浏览器UA」改成与你浏览器完全一致的值——cf_clearance 与 UA 绑定，"
     "不一致会立即失效。"
 )
-# Cloudflare 自管 Cookie：与 UA / TLS 指纹 / IP 绑定。把旧值注入浏览器会让 CF 直接
-# 不信任该会话（旧 cf_clearance 对不上它自己的签发记录），因此注入时必须剔除，
-# 让浏览器自行取得一张全新的、自洽的通行证。论坛登录态（_auth 等）不受影响。
+# Cloudflare 自管 Cookie：与 UA / TLS 指纹 / IP 绑定。**来自用户自己浏览器的**旧值注入
+# 会让 CF 直接不信任该会话（通行证对不上它自己的签发记录），因此注入时必须剔除，让
+# 浏览器自行取得一张全新的、自洽的通行证。论坛登录态（_auth 等）不受影响。
+# 反过来，插件上一轮**由本浏览器自己签发**的通行证身份自洽，会缓存起来复用
+# （见 KEY_CF_COOKIES），这是让签到从第二次起变快的关键。
 CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfduid")
 CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
 # 单次挑战等待预算（秒）。挑战过程不可中断：中途 reload 会让 Turnstile 的进度归零，
