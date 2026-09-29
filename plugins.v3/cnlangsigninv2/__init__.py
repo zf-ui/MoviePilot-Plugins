@@ -1,33 +1,226 @@
+"""国语视界（cnlang.org）自动签到插件 —— 按 MoviePilot V3 插件开发规范重写。
+
+主类 ``CnlangSigninV2`` 与插件 ID 一致，插件目录 ``cnlangsigninv2`` 为类名的小写形式，
+主类定义在本文件（``plugins.v3/cnlangsigninv2/__init__.py``）。
+
+相对旧版 V2 实现，本次重写遵守的 V3 约定：
+
+1. 只依赖稳定 SDK（``app.plugins``、``app.schemas``、``app.sdk.*``），不再使用
+   ``app.core.*``、``app.utils.*``、``app.log`` 等兼容桥接路径。
+2. 不再自建 ``BackgroundScheduler``。周期签到由 ``get_service()`` 注册到宿主调度器，
+   “立即运行一次”与“随机延迟若干秒后执行”交给
+   ``app.sdk.scheduler.add_plugin_once_job()``。
+3. 模块导入期与类定义期不发起网络请求、不访问数据库、不创建线程。
+4. 配置、结构化数据、历史记录全部经基类接口读写；插件 ID 统一使用
+   ``self.__class__.__name__``，插件可被安全地创建虚拟分身。
+5. ``init_plugin()`` 可重复调用，``stop_service()`` 可重复且安全地释放资源。
+6. ``get_api()`` 返回真实的后端 API 声明，不再返回 ``None``。
+"""
+
 import random
 import re
-import threading
 import time
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
 
 from app.plugins import _PluginBase
-from app.schemas import NotificationType
-from app.schemas.types import EventType
+from app.schemas.types import EventType, MessageType
+from app.sdk import scheduler as scheduler_sdk
 from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
 
+# ---------------------------------------------------------------------------
+# 站点地址与流程常量
+# ---------------------------------------------------------------------------
+
+# 国语视界站点域名（Discuz 论坛）
+SITE_HOST = "cnlang.org"
+# 签到页面：同时用于探测登录态、提取 formhash 与本月累计签到
+SIGN_PAGE_URL = f"https://{SITE_HOST}/dsu_paulsign-sign.html?mobile=no"
+# 签到提交接口
+SIGN_SUBMIT_URL = (
+    f"https://{SITE_HOST}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1"
+)
+# 积分（大洋）接口
+CREDIT_URL = (
+    f"https://{SITE_HOST}/home.php?mod=spacecp&ac=credit"
+    "&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu"
+)
+# 用户组接口
+USERGROUP_URL = f"https://{SITE_HOST}/home.php?mod=spacecp&ac=usergroup"
+# 签到寄语来源（一言）
+HITOKOTO_URL = "https://v1.hitokoto.cn/?encode=text"
+
+# 站点对“想说的话”的长度要求为 6~50 字
+SAY_MIN_LEN = 6
+SAY_MAX_LEN = 50
+SAY_MAX_ATTEMPTS = 10
+SAY_FALLBACK = "一别之后，两地相思，只道是三四月，又谁知五六年。"
+# 签到心情固定使用“开心”
+SIGN_MOOD = "kx"
+
+# 远程命令动作标识
+ACTION_SIGNIN = "cnlang_signin"
+
+# 插件结构化数据键
+KEY_HISTORY = "history"
+KEY_LAST_RESULT = "last_result"
+
+# 宿主调度器中的一次性任务 ID：同 ID 重复登记只保留最后一次
+JOB_SIGNIN_ONCE = "signin_once"
+JOB_SIGNIN_DELAYED = "signin_delayed"
+
+# 合法通知样式标识，非法值回落到 style1
+NOTIFY_STYLES = ("style1", "style2", "style3", "style4", "style5")
+
+# 通知样式模板。占位符：{detail} 结果详情、{time} 执行时间、
+# {headline} 失败标题、{advice} Cookie 失效时的处理建议。
+NOTIFY_TEMPLATES: Dict[str, Dict[str, str]] = {
+    "style1": {
+        "title": "🎬 国语视界签到",
+        "success": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ 签到成功\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📝 详细信息：\n"
+            "{detail}\n"
+            "⏰ 执行时间：{time}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "failure": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ {headline}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📝 失败原因：{detail}\n"
+            "⏰ 执行时间：{time}\n"
+            "{advice}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "headline": "签到失败",
+        "cookie_headline": "Cookie已失效",
+        "advice": "🔑 请更新Cookie后重试",
+    },
+    "style2": {
+        "title": "🌸 国语视界签到",
+        "success": (
+            "┏━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃ ✅ 签到成功\n"
+            "┃ 📝 {detail}\n"
+            "┃ ⏰ {time}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛"
+        ),
+        "failure": (
+            "┏━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃ ❌ {headline}\n"
+            "┃ 📝 {detail}\n"
+            "┃ ⏰ {time}\n"
+            "{advice}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛"
+        ),
+        "headline": "签到失败",
+        "cookie_headline": "Cookie已失效",
+        "advice": "┃ 🔑 请更新Cookie后重试",
+    },
+    "style3": {
+        "title": "🚀 国语视界签到",
+        "success": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ 任务执行成功\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔍 详细信息：\n"
+            "{detail}\n"
+            "⏱️ 执行时间：{time}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "failure": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ {headline}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔍 错误信息：{detail}\n"
+            "⏱️ 执行时间：{time}\n"
+            "{advice}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "headline": "任务执行失败",
+        "cookie_headline": "Cookie验证失败",
+        "advice": "🔑 请更新Cookie后重试",
+    },
+    "style4": {
+        "title": "📊 国语视界签到",
+        "success": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 签到状态：成功\n"
+            "📋 详细信息：\n"
+            "{detail}\n"
+            "🕒 执行时间：{time}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "failure": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 签到状态：{headline}\n"
+            "📋 错误详情：{detail}\n"
+            "🕒 执行时间：{time}\n"
+            "{advice}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "headline": "失败",
+        "cookie_headline": "Cookie已失效",
+        "advice": "🔑 操作建议：请更新Cookie后重试",
+    },
+    "style5": {
+        "title": "✨ 国语视界签到",
+        "success": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💫 签到任务执行成功\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 详细信息：\n"
+            "{detail}\n"
+            "🕰️ 执行时间：{time}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "failure": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💫 {headline}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 失败原因：{detail}\n"
+            "🕰️ 执行时间：{time}\n"
+            "{advice}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        "headline": "签到任务执行失败",
+        "cookie_headline": "Cookie验证失败",
+        "advice": "🔑 请更新Cookie后重试",
+    },
+}
+
 
 class CnlangSigninV2(_PluginBase):
-    """国语视界（cnlang.org）站点自动签到插件，MoviePilot V3 规范实现。"""
+    """国语视界自动签到插件。
+
+    职责：按配置的 cron 定时登录国语视界完成签到，按配置的样式发送通知，并把签到
+    结果写入插件历史数据，供详情页统计展示。插件本身不持有任何后台线程或调度器，
+    全部后台能力都交由宿主调度器承担。
+    """
 
     # 插件名称
     plugin_name = "国语视界签到V3"
     # 插件描述
-    plugin_desc = "美观实用的站点签到助手"
+    plugin_desc = (
+        "国语视界（cnlang.org）自动签到助手：支持定时签到、随机延迟、系统代理、"
+        "多种通知样式与签到历史统计。"
+    )
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png"
-    # 插件版本
-    plugin_version = "3.5.2"
+    plugin_icon = (
+        "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins"
+        "/refs/heads/main/icons/cnlang.png"
+    )
+    # 插件版本，必须与 package.v3.json 中的 version 保持一致
+    plugin_version = "3.6.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -39,702 +232,742 @@ class CnlangSigninV2(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
-    # 私有属性
-    _enabled = False
-    _cron = "0 7 * * *"
-    _cookie = None
-    _onlyonce = False
-    _notify = False
-    _history_days = 30
-    _random_delay = None
-    _clear = False
-    _notify_style = "style1"
-    _use_proxy = False
-    _user_agent = None
-    _use_browser = False
+    # ---- 运行状态：全部在 init_plugin() 中按配置重建 ----
+    # 是否启用插件
+    _enabled: bool = False
+    # 签到周期 cron 表达式
+    _cron: Optional[str] = None
+    # 站点 Cookie
+    _cookie: Optional[str] = None
+    # 是否发送通知
+    _notify: bool = False
+    # 历史记录保留天数
+    _history_days: int = 30
+    # 随机延迟区间，形如 "100-200"（秒）
+    _random_delay: Optional[str] = None
+    # 通知样式
+    _notify_style: str = "style1"
+    # 是否使用宿主系统代理
+    _use_proxy: bool = False
 
-    # 站点基础地址
-    _base_url = "https://cnlang.org"
-    # 显式直连：requests 默认会读取 HTTP(S)_PROXY 环境变量，传 None 值字典可强制绕过
-    _DIRECT_PROXIES = {"http": None, "https": None}
-    # 默认 UA；Cloudflare 的 cf_clearance 与 UA 绑定，建议配置为与浏览器一致
-    _default_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    # 签到心情默认文案（一言接口不可用时的兜底）
-    _default_todaysay = "一别之后，两地相思，只道是三四月，又谁知五六年。"
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
 
-    # 通知样式模板：title 标题、top/bottom 上下边框、prefix 每行前缀
-    _NOTIFY_STYLES = {
-        "style1": {"title": "🎬 国语视界签到", "top": "━━━━━━━━━━━━━━━━━━━━━━", "bottom": "━━━━━━━━━━━━━━━━━━━━━━", "prefix": ""},
-        "style2": {"title": "🌸 国语视界签到", "top": "┏━━━━━━━━━━━━━━━━━━━━┓", "bottom": "┗━━━━━━━━━━━━━━━━━━━━┛", "prefix": "┃ "},
-        "style3": {"title": "🚀 国语视界签到", "top": "━━━━━━━━━━━━━━━━━━━━━━", "bottom": "━━━━━━━━━━━━━━━━━━━━━━", "prefix": ""},
-        "style4": {"title": "📊 国语视界签到", "top": "━━━━━━━━━━━━━━━━━━━━━━", "bottom": "━━━━━━━━━━━━━━━━━━━━━━", "prefix": ""},
-        "style5": {"title": "✨ 国语视界签到", "top": "━━━━━━━━━━━━━━━━━━━━━━", "bottom": "━━━━━━━━━━━━━━━━━━━━━━", "prefix": ""},
-    }
+    def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
+        """读取配置并重建本次运行状态；允许被宿主重复调用。
 
-    def init_plugin(self, config: dict = None):
-        """读取配置并建立本次运行状态；可重复调用，定时任务由 get_service() 托管给宿主调度器。"""
+        :param config: 插件配置字典，None 表示按空配置初始化
+        """
+        # 先取消上一轮登记的一次性任务，保证重复初始化不会堆积待执行任务。
+        self.stop_service()
+
         config = config or {}
         self._enabled = bool(config.get("enabled"))
-        self._cron = config.get("cron") or "0 7 * * *"
-        self._cookie = config.get("cookie")
+        self._cron = (config.get("cron") or "").strip() or None
+        self._cookie = (config.get("cookie") or "").strip() or None
         self._notify = bool(config.get("notify"))
-        self._onlyonce = bool(config.get("onlyonce"))
-        self._random_delay = config.get("random_delay")
-        self._clear = bool(config.get("clear"))
         self._notify_style = config.get("notify_style") or "style1"
-        self._use_proxy = bool(config.get("use_proxy"))
-        self._user_agent = config.get("user_agent")
-        self._use_browser = bool(config.get("use_browser"))
+        self._random_delay = config.get("random_delay")
+        self._use_proxy = bool(config.get("use_proxy", False))
         try:
-            self._history_days = int(config.get("history_days") or 30)
+            self._history_days = max(int(config.get("history_days") or 30), 1)
         except (TypeError, ValueError):
+            logger.warning(f"历史保留天数配置无效：{config.get('history_days')}，按 30 天处理")
             self._history_days = 30
 
-        # 清除历史记录（一次性开关，执行后回写配置关闭）
-        if self._clear:
-            self.del_data("history")
-            self._clear = False
-            self.__update_config()
-            logger.info("签到历史记录已清除")
+        # “清除历史记录”是开关式操作：执行一次后立即回写关闭，
+        # 避免宿主重复初始化时反复清空用户数据。
+        if config.get("clear"):
+            self.del_data(KEY_HISTORY)
+            self.del_data(KEY_LAST_RESULT)
+            logger.info("国语视界签到历史记录已清除")
+            self._save_config(clear=False)
 
-        # 立即运行一次：放入守护线程，避免阻塞插件初始化
-        if self._onlyonce:
-            self._onlyonce = False
-            self.__update_config()
-            logger.info("收到立即运行指令，后台执行签到...")
-            threading.Thread(target=self.signin, daemon=True,
-                             name="CnlangSigninV2.Once").start()
+        # “立即运行一次”登记为宿主调度器的一次性任务，不再自建调度器。
+        if config.get("onlyonce"):
+            self._save_config(onlyonce=False)
+            self._run_once(delay_seconds=3)
 
-    def __update_config(self):
-        """把当前内存中的配置回写到宿主配置存储。"""
-        self.update_config({
+    def get_state(self) -> bool:
+        """返回插件是否启用。"""
+        return self._enabled
+
+    def stop_service(self) -> None:
+        """取消本插件登记的一次性任务；可被重复调用。"""
+        plugin_id = self.__class__.__name__
+        for job_id in (JOB_SIGNIN_ONCE, JOB_SIGNIN_DELAYED):
+            try:
+                scheduler_sdk.remove_plugin_once_job(plugin_id, job_id)
+            except Exception as err:
+                # 调度器未启动或宿主版本较旧时不应影响插件停用
+                logger.debug(f"取消一次性任务 {job_id} 失败：{err}")
+        logger.info("国语视界签到服务已停止")
+
+    # ------------------------------------------------------------------
+    # 扩展点注册
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """注册远程控制命令。"""
+        return [
+            {
+                "cmd": "/cnlang_signin",
+                "event": EventType.PluginAction,
+                "desc": "国语视界签到",
+                "category": "站点",
+                "data": {"action": ACTION_SIGNIN},
+            }
+        ]
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        """注册插件后端 API，最终路径为 ``/api/v1/plugin/<PluginID>/<path>``。"""
+        return [
+            {
+                "path": "/status",
+                "endpoint": self.api_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查询国语视界账号与签到状态",
+            },
+            {
+                "path": "/history",
+                "endpoint": self.api_history,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查询签到历史与统计",
+            },
+            {
+                "path": "/signin",
+                "endpoint": self.api_signin,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即执行一次签到",
+            },
+            {
+                "path": "/history/clear",
+                "endpoint": self.api_clear_history,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "清空签到历史",
+            },
+        ]
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """插件启用且 cron 合法时，把定时签到注册到宿主调度器。"""
+        if not self._enabled or not self._cron:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron, timezone=ZoneInfo(settings.TZ))
+        except (ValueError, TypeError) as err:
+            logger.error(f"签到周期表达式无效：{self._cron}（{err}）")
+            return []
+        return [
+            {
+                "id": f"{self.__class__.__name__}.Signin",
+                "name": "国语视界定时签到",
+                "trigger": trigger,
+                "func": self._scheduled_signin,
+                "kwargs": {},
+            }
+        ]
+
+    # ------------------------------------------------------------------
+    # 插件 API 实现
+    # ------------------------------------------------------------------
+
+    def api_status(self) -> Dict[str, Any]:
+        """API：返回账号与签到状态摘要（含一次实时站点探测）。"""
+        return self.get_status_summary()
+
+    def api_history(self) -> Dict[str, Any]:
+        """API：返回签到历史明细与统计结果。"""
+        history = self.get_data(KEY_HISTORY) or []
+        return {
+            "history": sorted(
+                history, key=lambda item: item.get("date", ""), reverse=True
+            ),
+            "stats": self._analyze_history(history),
+            "last_result": self.get_data(KEY_LAST_RESULT) or {},
+        }
+
+    def api_signin(self) -> Dict[str, Any]:
+        """API：立即执行一次签到并返回本次结果。"""
+        return self.signin() or {}
+
+    def api_clear_history(self) -> Dict[str, Any]:
+        """API：清空签到历史与最近一次结果。"""
+        self.del_data(KEY_HISTORY)
+        self.del_data(KEY_LAST_RESULT)
+        return {"success": True, "message": "签到历史已清空"}
+
+    # ------------------------------------------------------------------
+    # 签到主流程
+    # ------------------------------------------------------------------
+
+    @eventmanager.register(EventType.PluginAction)
+    def signin(self, event: Optional[Event] = None) -> Dict[str, Any]:
+        """执行一次签到。
+
+        同时承担两个角色：``/cnlang_signin`` 远程命令的事件处理器（``event`` 非空），
+        以及宿主调度器与插件 API 直接调用的入口（``event`` 为空）。
+
+        :param event: 事件对象，仅在响应远程命令时传入
+        :return: 本次签到结果字典
+        """
+        if event is not None:
+            event_data = event.event_data or {}
+            if event_data.get("action") != ACTION_SIGNIN:
+                return {}
+            logger.info("收到远程命令，开始执行国语视界签到")
+        return self._execute_signin()
+
+    def _scheduled_signin(self) -> None:
+        """定时入口：按随机延迟配置把签到转成宿主调度器的一次性任务。"""
+        delay = self._random_delay_seconds()
+        if delay <= 0:
+            self.signin()
+            return
+        logger.info(f"国语视界签到将随机延迟 {delay} 秒后执行")
+        if not scheduler_sdk.add_plugin_once_job(
+            self.__class__.__name__,
+            JOB_SIGNIN_DELAYED,
+            self.signin,
+            "国语视界延迟签到",
+            delay_seconds=delay,
+        ):
+            logger.warning("宿主调度器未运行，忽略随机延迟直接执行签到")
+            self.signin()
+
+    def _execute_signin(self) -> Dict[str, Any]:
+        """签到主流程：探测登录态 -> 提交签到 -> 汇总结果 -> 落库并通知。"""
+        if not self._cookie:
+            return self._record_failure("未配置Cookie")
+
+        headers = self._build_headers()
+        proxy_hint = "（使用代理）" if self._use_proxy else ""
+
+        # 步骤 1：读取签到页面，确认登录态并提取 formhash
+        logger.info(f"步骤1：获取签到页面信息{proxy_hint}")
+        page = self._fetch(SIGN_PAGE_URL, headers=headers)
+        if page is None:
+            return self._record_failure("获取签到页面失败，请检查网络或代理设置")
+
+        user_name = self._search(r'title="访问我的空间">(.*?)</a>', page)
+        if not user_name:
+            return self._record_failure("未获取到用户名，Cookie 可能已失效")
+        logger.info(f"登录用户名：{user_name}")
+
+        if re.search(r"您今天已经签到过了或者签到时间还未开始", page):
+            logger.info("今日已完成签到，跳过提交")
+            return self._record_already_signed(user_name)
+
+        formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', page)
+        if not formhash:
+            return self._record_failure("未获取到 formhash，站点页面结构可能已变化")
+        logger.info(f"formhash：{formhash}")
+
+        month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", page)
+        total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
+        logger.info(f"本月累计签到（含本次）：{total_signs}")
+
+        # 步骤 2：提交签到
+        logger.info(f"步骤2：提交签到请求{proxy_hint}")
+        response = self._fetch(
+            SIGN_SUBMIT_URL,
+            headers=headers,
+            data={
+                "formhash": formhash,
+                "qdxq": SIGN_MOOD,
+                "qdmode": "1",
+                "todaysay": self._build_say(),
+                "fastreply": "0",
+            },
+        )
+        if response is None:
+            return self._record_failure("提交签到请求失败，请检查网络或代理设置")
+
+        content = self._search(r'<div class="c">(.*?)</div>', response, flags=re.DOTALL)
+        if not content:
+            return self._record_failure("未获取到签到响应内容，签到结果未知")
+        content = content.strip()
+        logger.info(f"签到响应：{content}")
+
+        # 步骤 3：读取积分（大洋）余额
+        logger.info(f"步骤3：获取积分信息{proxy_hint}")
+        credit_page = self._fetch(CREDIT_URL, headers=headers) or ""
+        money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_page) or "未知"
+        logger.info(f"当前大洋余额：{money}")
+
+        return self._record_success(
+            username=user_name,
+            total_signs=total_signs,
+            money=money,
+            content=content,
+        )
+
+    # ------------------------------------------------------------------
+    # 结果记录与通知
+    # ------------------------------------------------------------------
+
+    def _record_success(
+        self, *, username: str, total_signs: int, money: str, content: str
+    ) -> Dict[str, Any]:
+        """记录一次成功签到：发送通知、追加历史、保存最近结果。"""
+        sign_time = self._now()
+        detail = (
+            f"签到账号：{username}\n"
+            f"本月累计签到：{total_signs} 天\n"
+            f"当前大洋：{money}\n"
+            f"签到时间：{sign_time}\n"
+            f"{content}"
+        )
+        self._notify_result(success=True, detail=detail)
+
+        history = self.get_data(KEY_HISTORY) or []
+        history.append(
+            {
+                "date": sign_time,
+                "username": username,
+                "totalContinuousCheckIn": total_signs,
+                "money": money,
+                "content": content,
+                "success": True,
+            }
+        )
+        self.save_data(KEY_HISTORY, self._prune_history(history))
+
+        result = {
+            "time": sign_time,
+            "success": True,
+            "username": username,
+            "money": money,
+            "content": content,
+            "total_signs": total_signs,
+            "message": detail,
+        }
+        self.save_data(KEY_LAST_RESULT, result)
+        return result
+
+    def _record_already_signed(self, username: str) -> Dict[str, Any]:
+        """记录“今日已签到”：发送通知但不重复追加历史，避免统计虚高。"""
+        sign_time = self._now()
+        detail = f"签到账号：{username}\n今日已完成签到，无需重复提交\n检查时间：{sign_time}"
+        self._notify_result(success=True, detail=detail)
+        result = {
+            "time": sign_time,
+            "success": True,
+            "username": username,
+            "money": self._last_known_money(),
+            "content": "您今天已经签到过了或者签到时间还未开始",
+            "total_signs": 0,
+            "message": detail,
+        }
+        self.save_data(KEY_LAST_RESULT, result)
+        return result
+
+    def _record_failure(self, reason: str) -> Dict[str, Any]:
+        """记录一次失败：发送失败通知并保存最近结果。"""
+        sign_time = self._now()
+        self._notify_result(success=False, detail=reason)
+        result = {
+            "time": sign_time,
+            "success": False,
+            "username": "",
+            "money": self._last_known_money(),
+            "content": reason,
+            "total_signs": 0,
+            "message": reason,
+        }
+        self.save_data(KEY_LAST_RESULT, result)
+        return result
+
+    def _notify_result(self, *, success: bool, detail: str) -> None:
+        """按配置的通知样式发送签到结果通知。"""
+        logger.info(detail)
+        if not self._notify:
+            return
+
+        style = self._notify_style if self._notify_style in NOTIFY_STYLES else "style1"
+        template = NOTIFY_TEMPLATES[style]
+        expired = self._looks_like_cookie_expired(detail)
+        advice = template["advice"] if (expired and not success) else ""
+        text = (template["success"] if success else template["failure"]).format(
+            detail=detail,
+            time=self._now(),
+            headline=template["cookie_headline"] if expired else template["headline"],
+            advice=advice,
+        )
+        # 未命中 Cookie 失效分支时会残留空行，这里统一清理
+        text = "\n".join(line for line in text.split("\n") if line.strip())
+        self.post_message(mtype=MessageType.Plugin, title=template["title"], text=text)
+
+    @staticmethod
+    def _looks_like_cookie_expired(detail: str) -> bool:
+        """判断失败原因是否属于 Cookie 失效，用于选择更明确的通知文案。"""
+        return "cookie" in detail.lower() or "未获取到用户名" in detail
+
+    # ------------------------------------------------------------------
+    # 配置与工具方法
+    # ------------------------------------------------------------------
+
+    def _save_config(self, **overrides: Any) -> None:
+        """回写插件配置。
+
+        :param overrides: 需要覆盖的字段，用于关闭“立即运行一次”“清除历史”等一次性开关
+        """
+        config: Dict[str, Any] = {
             "enabled": self._enabled,
             "cron": self._cron,
             "cookie": self._cookie,
             "notify": self._notify,
-            "onlyonce": self._onlyonce,
-            "history_days": self._history_days,
-            "random_delay": self._random_delay,
-            "clear": self._clear,
             "notify_style": self._notify_style,
+            "random_delay": self._random_delay,
+            "history_days": self._history_days,
             "use_proxy": self._use_proxy,
-            "user_agent": self._user_agent,
-            "use_browser": self._use_browser,
-        })
+            "onlyonce": False,
+            "clear": False,
+        }
+        config.update(overrides)
+        self.update_config(config)
 
-    def get_state(self) -> bool:
-        """返回插件当前是否启用。"""
-        return self._enabled
+    def _run_once(self, delay_seconds: float = 0) -> None:
+        """把一次签到登记到宿主调度器；调度器不可用时同步执行兜底。"""
+        if scheduler_sdk.add_plugin_once_job(
+            self.__class__.__name__,
+            JOB_SIGNIN_ONCE,
+            self.signin,
+            "国语视界签到立即运行一次",
+            delay_seconds=delay_seconds,
+        ):
+            logger.info(f"国语视界签到已登记为宿主一次性任务，{delay_seconds} 秒后执行")
+            return
+        logger.warning("宿主调度器未运行，改为立即同步执行一次签到")
+        self.signin()
 
-    @staticmethod
-    def get_command() -> list[dict[str, Any]]:
-        """注册远程命令 /cnlang_qiandao，通过 PluginAction 事件路由到本插件。
-
-        Telegram BotCommand 仅允许 a-z、0-9、下划线且不超过32字符，命令不能含中文；
-        中文说明放在 desc 中展示。
-        """
-        return [{
-            "cmd": "/cnlang_qiandao",
-            "event": EventType.PluginAction,
-            "desc": "新的一天打卡签到（国语视界）",
-            "category": "站点",
-            "data": {
-                "action": "cnlang_signin"
-            }
-        }]
-
-    def get_api(self) -> list[dict[str, Any]]:
-        """本插件不注册后端 API。"""
-        return []
-
-    def get_service(self) -> list[dict]:
-        """启用且配置了 cron 时，向宿主调度器注册定时签到服务；停用即自动摘除。"""
-        if not self.get_state() or not self._cron:
-            return []
+    def _random_delay_seconds(self) -> int:
+        """把 ``100-200`` 形式的随机延迟配置解析为秒数，非法配置按不延迟处理。"""
+        raw = str(self._random_delay or "").strip()
+        if not raw:
+            return 0
         try:
-            trigger = CronTrigger.from_crontab(self._cron)
+            start_text, end_text = raw.split("-", 1)
+            start, end = int(start_text.strip()), int(end_text.strip())
         except ValueError:
-            logger.error(f"Cron 表达式无效：{self._cron}，定时签到未注册")
-            return []
-        return [{
-            "id": "CnlangSigninV2.Signin",
-            "name": "国语视界定时签到",
-            "trigger": trigger,
-            "func": self.signin,
-            "kwargs": {},
-        }]
+            logger.warning(f"随机延迟配置格式错误：{raw}，本次不延迟")
+            return 0
+        if start < 0 or end < start:
+            logger.warning(f"随机延迟区间无效：{raw}，本次不延迟")
+            return 0
+        return random.randint(start, end)
 
-    def stop_service(self):
-        """释放后台资源：定时任务由宿主调度器托管，随插件停用自动回收，无需额外清理。"""
-        logger.info("国语视界签到服务已停止")
+    def _build_say(self) -> str:
+        """获取一段符合站点长度要求的签到寄语，取不到时使用兜底文案。"""
+        say = ""
+        for attempt in range(1, SAY_MAX_ATTEMPTS + 1):
+            text = self._fetch(HITOKOTO_URL)
+            if text:
+                say = text.strip()
+            logger.info(f"尝试想说的话-{attempt}：{say}")
+            if SAY_MIN_LEN <= len(say) <= SAY_MAX_LEN:
+                return say
+        logger.warning("未获取到符合长度要求的签到寄语，使用默认文案")
+        return SAY_FALLBACK
 
-    # ------------------------------------------------------------------
-    # 签到核心流程
-    # ------------------------------------------------------------------
-
-    @eventmanager.register(EventType.PluginAction)
-    def signin(self, event: Event = None):
-        """执行签到：远程命令入口与定时服务共用的核心流程。"""
-        if event:
-            event_data = event.event_data or {}
-            if event_data.get("action") != "cnlang_signin":
-                return
-            logger.info("收到签到命令，开始执行...")
-
-        if not self._cookie:
-            self.__notify(False, "未配置Cookie")
-            return
-
-        # 随机延迟，降低被站点风控的概率
-        self.__random_sleep()
-
-        # 步骤1：获取签到页面，解析用户名与 formhash
-        logger.info("步骤1: 获取签到页面信息...")
-        sign_page_url = f"{self._base_url}/dsu_paulsign-sign.html?mobile=no"
-        res = self.__get_res(sign_page_url)
-        # 被 Cloudflare 拦截且开启了浏览器模式时，由浏览器完成整个签到流程
-        if self.__is_cf_blocked(res) and self._use_browser:
-            logger.info("疑似被Cloudflare拦截，启动浏览器模式...")
-            if self.__signin_by_browser():
-                return  # 浏览器模式已完成本次签到流程（含成功与明确的失败通知）
-            logger.info("浏览器模式不可用，重试直接请求...")
-            res = self.__get_res(sign_page_url)
-        if not res or res.status_code != 200:
-            reason = (f"status_code={res.status_code}" if res
-                      else "无响应（网络不通或被Cloudflare拦截：请确认Cookie包含cf_clearance且UA与浏览器一致）")
-            self.__notify(False, f"获取基本信息失败-{reason}")
-            return
-
-        user_info = res.text or ""
-
-        user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', user_info)
-        if not user_name_match:
-            self.__notify(False, "未获取到用户名-cookie或许已失效")
-            return
-        user_name = user_name_match.group(1)
-        logger.info(f"登录用户名为：{user_name}")
-
-        if re.search(r'(您今天已经签到过了或者签到时间还未开始)', user_info):
-            self.__notify(True, "您今天已经签到过了或者签到时间还未开始")
-            return
-
-        formhash_match = re.search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', user_info)
-        if not formhash_match:
-            self.__notify(False, "未获取到 formhash 值")
-            return
-        formhash_value = formhash_match.group(1)
-        logger.info(f"formhash：{formhash_value}")
-
-        month_match = re.search(r'<p>您本月已累计签到:<b>(\d+)</b>', user_info)
-        total_continuous_check_in = int(month_match.group(1)) + 1 if month_match else 1
-        logger.info(f"您本月已累计签到：{total_continuous_check_in}")
-
-        # 步骤2：提交签到请求
-        todaysay = self.__get_todaysay()
-        logger.info(f"最终想说的话：{todaysay}")
-        logger.info("步骤2: 提交签到请求...")
-        res = self.__post_res(
-            url=f"{self._base_url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1",
-            data={
-                "formhash": formhash_value,
-                "qdxq": "kx",
-                "qdmode": "1",
-                "todaysay": todaysay,
-                "fastreply": "0",
-            })
-        if not res or res.status_code != 200:
-            reason = f"status_code={res.status_code}" if res else "无响应（请检查网络或代理设置）"
-            self.__notify(False, f"请求签到接口失败-{reason}")
-            return
-
-        content_match = re.search(r'<div class="c">(.*?)</div>', res.text or "", re.DOTALL)
-        if not content_match:
-            self.__notify(False, "获取签到后的响应内容失败")
-            return
-        content = content_match.group(1).strip()
-        logger.info(content)
-
-        # 步骤3：获取积分信息
-        logger.info("步骤3: 获取积分信息...")
-        money = self.__fetch_money()
-        logger.info(f"当前大洋余额：{money}")
-
-        sign_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        text = (f"签到账号：{user_name}\n"
-                f"累计签到：{total_continuous_check_in} 天\n"
-                f"当前大洋：{money}\n"
-                f"签到时间：{sign_time}\n"
-                f"{content}")
-        self.__notify(True, text)
-        self.__save_history(user_name, total_continuous_check_in, money, content, sign_time)
-
-    def __save_history(self, user_name: str, total_check_in: int, money: str,
-                       content: str, sign_time: str):
-        """保存一条签到历史，并按保留天数裁剪旧记录。"""
-        history = self.get_data("history") or []
-        history.append({
-            "date": sign_time,
-            "username": user_name,
-            "totalContinuousCheckIn": total_check_in,
-            "money": money,
-            "content": content,
-        })
-        deadline = time.time() - self._history_days * 24 * 60 * 60
-        history = [record for record in history
-                   if self.__parse_time(record.get("date"))
-                   and self.__parse_time(record.get("date")).timestamp() >= deadline]
-        self.save_data(key="history", value=history)
-
-    # ------------------------------------------------------------------
-    # 签到辅助方法
-    # ------------------------------------------------------------------
-
-    def __get_headers(self) -> dict:
-        """构造携带 Cookie 的请求头（Host 与压缩协商由 HTTP 客户端自动处理）。"""
+    def _build_headers(self) -> Dict[str, str]:
+        """构造站点请求头，Cookie 取自插件配置。"""
         return {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
-            "Cache-Control": "max-age=0",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": (
+                "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"
+            ),
+            "cache-control": "max-age=0",
             "Upgrade-Insecure-Requests": "1",
+            "Host": SITE_HOST,
             "Cookie": self._cookie or "",
-            "User-Agent": self._user_agent or self._default_ua,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62"
+            ),
         }
 
-    def __get_proxies(self) -> dict:
-        """按配置返回代理：开启时使用系统代理，关闭时显式直连（绕过环境变量代理）。"""
+    def _get_proxies(self) -> Optional[Dict[str, str]]:
+        """按配置返回宿主系统代理；未开启或宿主未配置代理时返回 None。"""
         if not self._use_proxy:
-            return self._DIRECT_PROXIES
-        proxy = getattr(settings, "PROXY", None)
+            return None
+        proxy = settings.PROXY
         if not proxy:
-            logger.warning("已开启使用代理，但未配置系统代理，本次直连")
-            return self._DIRECT_PROXIES
-        logger.info("使用系统代理访问站点")
+            logger.warning("已开启使用代理，但宿主未配置系统代理")
+            return None
+        logger.info(f"使用系统代理：{proxy}")
         return proxy
 
-    @staticmethod
-    def __is_cf_blocked(res) -> bool:
-        """判断响应是否疑似被 Cloudflare 拦截（无响应超时，或返回 403/503 挑战页）。"""
-        return res is None or res.status_code in (403, 503)
+    def _fetch(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """发起一次请求并返回响应正文。
 
-    def __refresh_cookies_from_browser(self, ctx, page):
-        """合并浏览器新签发的Cookie与原配置Cookie（浏览器值优先），并记录浏览器实际UA。"""
-        merged = {}
-        for pair in (self._cookie or "").split(";"):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                merged[key.strip()] = value.strip()
-        for c in ctx.cookies() or []:
-            if c.get("name"):
-                merged[c["name"]] = c.get("value", "")
-        self._cookie = "; ".join(f"{k}={v}" for k, v in merged.items())
-        try:
-            browser_ua = page.evaluate("navigator.userAgent")
-            if browser_ua:
-                self._user_agent = browser_ua
-        except Exception:
-            pass
-        self.__update_config()
-        logger.info("浏览器模式：Cookie已刷新并保存")
-
-    @staticmethod
-    def __is_cf_challenge_page(html: str, title: str) -> bool:
-        """判断页面是否为 Cloudflare 挑战页（挑战页标题固定为 Just a moment/请稍候）。"""
-        title = title or ""
-        if "Just a moment" in title or "请稍候" in title or "Attention Required" in title:
-            return True
-        return "challenges.cloudflare.com" in (html or "") and "cf-chl" in html
-
-    @staticmethod
-    def __try_click_cf_checkbox(page) -> None:
-        """尽力点击 Cloudflare Turnstile 人机验证复选框（交互式挑战不会自动通过，静默失败不影响流程）。"""
-        try:
-            frames = getattr(page, "frames", None) or []
-            mouse = getattr(page, "mouse", None)
-            if not mouse:
-                return
-            for frame in frames:
-                try:
-                    if "challenges.cloudflare.com" not in (frame.url or ""):
-                        continue
-                    el = frame.frame_element()
-                    box = el.bounding_box() if el else None
-                    if box:
-                        mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
-                        logger.info("浏览器模式：检测到交互式验证，已尝试点击人机验证框")
-                        return
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    def __wait_cf_pass(self, page, rounds: int = 30, click_checkbox: bool = False) -> bool:
-        """轮询等待当前页面通过 Cloudflare 验证（有真实内容且不再是挑战页）。
-
-        click_checkbox=True 时，等待过程中周期性尝试点击 Turnstile 复选框。
-        """
-        for i in range(rounds):
-            try:
-                html_now = page.content() or ""
-                title_now = page.title() or ""
-            except Exception:
-                html_now, title_now = "", ""
-            no_content = len(html_now) < 500 and not title_now
-            if not no_content and not self.__is_cf_challenge_page(html_now, title_now):
-                return True
-            if click_checkbox and not no_content and i % 3 == 1:
-                self.__try_click_cf_checkbox(page)
-            if i % 5 == 0:
-                logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
-            time.sleep(2)
-        return False
-
-    def __signin_by_browser(self) -> bool:
-        """CF拦截时的完整浏览器签到：过验证、读页面、浏览器内提交签到、刷新Cookie。
-
-        cf_clearance 与 TLS 指纹绑定，requests 无法复用浏览器拿到的通行证，
-        因此签到请求必须在浏览器页面上下文内通过 fetch 完成。
-        返回 True 表示已完整处理（含成功与明确的失败通知），False 表示浏览器不可用。
+        :param url: 目标地址
+        :param headers: 请求头，None 时使用 RequestUtils 默认头
+        :param data: 非空时使用 POST，否则使用 GET
+        :return: 响应正文；请求异常或状态码非 200 时返回 None
         """
         try:
-            from app.sdk.browser import launch_browser_context
-        except ImportError:
-            logger.error("当前宿主不支持浏览器自动化，无法使用浏览器模式")
-            return False
-
-        ctx = None
-        page = None
-        try:
-            launch_kwargs = {"headless": True}
-            # 浏览器使用与插件一致的 UA，保证 cf_clearance 对 requests 流程同样有效
-            if self._user_agent:
-                launch_kwargs["user_agent"] = self._user_agent
-            # 开启代理时浏览器同样走系统代理
-            proxy_url = None
-            if self._use_proxy:
-                proxy = getattr(settings, "PROXY", None)
-                if proxy and proxy.get("https"):
-                    proxy_url = proxy["https"]
-
-            # 诊断：确认配置Cookie中是否包含论坛登录态（auth）
-            has_auth = "_auth=" in (self._cookie or "")
-            cookie_keys = [p.split("=", 1)[0].strip() for p in (self._cookie or "").split(";") if "=" in p]
-            logger.info(f"浏览器模式：配置Cookie包含 {len(cookie_keys)} 个字段，"
-                        f"论坛登录态(auth)：{'有' if has_auth else '【无】'}")
-
-            # 网络模式：配置了代理先走代理，失败后自动切直连重试一轮（代理失效不至于整轮报废）
-            network_modes = ["proxy", "direct"] if proxy_url else ["direct"]
-            passed = False
-            for mode in network_modes:
-                if ctx:
-                    try:
-                        ctx.close()
-                    except Exception:
-                        pass
-                    ctx, page = None, None
-                if mode == "proxy":
-                    launch_kwargs["proxy"] = {"server": proxy_url}
-                    logger.info("浏览器模式：按系统代理访问站点...")
-                else:
-                    launch_kwargs.pop("proxy", None)
-                    if len(network_modes) > 1:
-                        logger.info("浏览器模式：代理模式失败，改为直连重试...")
-
-                try:
-                    ctx = launch_browser_context(**launch_kwargs)
-                    page = ctx.new_page()
-                    page.set_default_timeout(60000)
-                    # 配置Cookie写入浏览器Cookie罐：避免请求头覆盖把浏览器新拿到的
-                    # cf_clearance 顶回旧值；add_cookies 不可用时回退请求头方式
-                    if self._cookie:
-                        add_cookies = getattr(ctx, "add_cookies", None)
-                        jar_cookies = []
-                        if add_cookies:
-                            for part in self._cookie.split(";"):
-                                if "=" not in part:
-                                    continue
-                                k, v = part.split("=", 1)
-                                jar_cookies.append({"name": k.strip(), "value": v.strip(),
-                                                    "domain": ".cnlang.org", "path": "/"})
-                        if add_cookies and jar_cookies:
-                            try:
-                                add_cookies(jar_cookies)
-                                logger.info(f"浏览器模式：{len(jar_cookies)} 个Cookie字段已写入浏览器会话")
-                            except Exception as cookie_err:
-                                logger.warning(f"浏览器模式：Cookie写入失败（{cookie_err}），改用请求头方式")
-                                page.set_extra_http_headers({"cookie": self._cookie})
-                        else:
-                            page.set_extra_http_headers({"cookie": self._cookie})
-
-                    # 先访问站点首页：CF 验证对全站生效，首页更容易触发并完成挑战
-                    logger.info("浏览器模式：正在访问站点，等待Cloudflare验证...")
-                    goto_failed = False
-                    try:
-                        page.goto(f"{self._base_url}/", wait_until="domcontentloaded", timeout=45000)
-                    except Exception as goto_err:
-                        # goto 超时不一定是死局：页面可能已部分加载，交给下面的轮询判断
-                        goto_failed = True
-                        logger.warning(f"浏览器模式：首页加载超时（{goto_err.__class__.__name__}），检查已加载内容...")
-                except Exception as launch_err:
-                    logger.error(f"浏览器模式：浏览器启动/访问异常 - {launch_err}")
-                    continue
-
-                # 轮询等待页面加载出真实内容（cf_clearance 未过期时 CF 不会重新签发，
-                # 因此以"不再是挑战页"为通过标准，而不是等待新 cf_clearance 出现）
-                for i in range(30):
-                    try:
-                        html_now = page.content() or ""
-                        title_now = page.title() or ""
-                    except Exception:
-                        html_now, title_now = "", ""
-                    # 连接被挂起时页面停留在空白页（about:blank），识别出来避免傻等
-                    no_content = len(html_now) < 500 and not title_now
-                    if not no_content and not self.__is_cf_challenge_page(html_now, title_now):
-                        passed = True
-                        break
-                    if goto_failed and no_content and i >= 2:
-                        logger.error("浏览器模式：服务器未返回页面内容（连接可能被挂起）")
-                        break
-                    # 每10秒输出一次页面标题，便于诊断卡在哪个环节
-                    if i % 5 == 0:
-                        logger.info(f"浏览器模式：等待验证中... 当前页面标题：{title_now}")
-                    time.sleep(2)
-
-                if passed:
-                    break
-
-            if not passed:
-                logger.error("浏览器模式：等待超时，Cloudflare验证未通过（可能需要人工完成交互验证）")
-                if page:
-                    try:
-                        shot_path = self.get_data_path() / "cf_challenge_failed.png"
-                        shot_path.write_bytes(page.screenshot())
-                        logger.error(f"浏览器模式：失败页面截图已保存到 {shot_path}")
-                    except Exception:
-                        pass
-                self.__notify(False, "Cloudflare验证未通过（浏览器模式等待超时）")
-                return True
-
-            # CF 已通过，合并刷新 Cookie（保留原论坛登录态）
-            self.__refresh_cookies_from_browser(ctx, page)
-
-            # 访问签到页，解析用户名与 formhash
-            # 签到页可能单独再触发一次CF挑战，goto超时容忍+轮询等待挑战通过
-            try:
-                page.goto(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no",
-                          wait_until="domcontentloaded", timeout=45000)
-            except Exception:
-                logger.warning("浏览器模式：签到页加载事件超时，检查已加载内容...")
-            # 签到页可能单独再触发一次CF挑战：goto超时容忍，等待+重载最多3轮，
-            # 等待过程中周期性尝试点击Turnstile人机验证框（交互式挑战需点击）
-            sign_page_ok = False
-            for retry in range(3):
-                if self.__wait_cf_pass(page, rounds=10, click_checkbox=True):
-                    sign_page_ok = True
-                    break
-                if retry < 2:
-                    logger.info(f"浏览器模式：签到页挑战未通过，重载页面重试（第{retry + 2}/3轮）...")
-                    try:
-                        page.reload(wait_until="domcontentloaded", timeout=45000)
-                    except Exception:
-                        pass
-            if not sign_page_ok:
-                logger.error(f"浏览器模式：签到页标题：{page.title()}")
-                try:
-                    shot_path = self.get_data_path() / "signin_page_failed.png"
-                    shot_path.write_bytes(page.screenshot())
-                    logger.error(f"浏览器模式：签到页截图已保存到 {shot_path}")
-                except Exception:
-                    pass
-                self.__notify(False, "签到页Cloudflare验证未通过，请稍后重试")
-                return True
-            html = page.content() or ""
-
-            user_name_match = re.search(r'title="访问我的空间">(.*?)</a>', html)
-            if not user_name_match:
-                try:
-                    logger.error(f"浏览器模式：签到页标题：{page.title()}")
-                    shot_path = self.get_data_path() / "signin_page_failed.png"
-                    shot_path.write_bytes(page.screenshot())
-                    logger.error(f"浏览器模式：签到页截图已保存到 {shot_path}")
-                except Exception:
-                    pass
-                self.__notify(False, "论坛登录态已失效，请重新复制完整Cookie（cf_clearance已自动刷新）")
-                return True
-            user_name = user_name_match.group(1)
-            logger.info(f"登录用户名为：{user_name}")
-
-            if re.search(r'(您今天已经签到过了或者签到时间还未开始)', html):
-                self.__notify(True, "您今天已经签到过了或者签到时间还未开始")
-                return True
-
-            formhash_match = re.search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
-            if not formhash_match:
-                self.__notify(False, "未获取到 formhash 值")
-                return True
-            formhash_value = formhash_match.group(1)
-
-            month_match = re.search(r'<p>您本月已累计签到:<b>(\d+)</b>', html)
-            total_continuous_check_in = int(month_match.group(1)) + 1 if month_match else 1
-
-            todaysay = self.__get_todaysay()
-            logger.info(f"最终想说的话：{todaysay}")
-
-            # 在浏览器页面上下文内提交签到（共享浏览器 Cookie 与 TLS 指纹）
-            logger.info("浏览器模式：提交签到请求...")
-            sign_resp = page.evaluate(
-                """async (data) => {
-                    const resp = await fetch('/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
-                        body: new URLSearchParams(data).toString()
-                    });
-                    return await resp.text();
-                }""",
-                {"formhash": formhash_value, "qdxq": "kx", "qdmode": "1",
-                 "todaysay": todaysay, "fastreply": "0"})
-
-            content_match = re.search(r'<div class="c">(.*?)</div>', sign_resp or "", re.DOTALL)
-            if not content_match:
-                self.__notify(False, "获取签到后的响应内容失败")
-                return True
-            content = content_match.group(1).strip()
-            logger.info(content)
-
-            # 浏览器内获取积分信息
-            credit_html = page.evaluate(
-                """async () => {
-                    const resp = await fetch('/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu');
-                    return await resp.text();
-                }""")
-            money_match = re.search(r'<span id="hcredit_2">(\d+)</span>', credit_html or "")
-            money = money_match.group(1) if money_match else "0"
-            logger.info(f"当前大洋余额：{money}")
-
-            sign_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            text = (f"签到账号：{user_name}\n"
-                    f"累计签到：{total_continuous_check_in} 天\n"
-                    f"当前大洋：{money}\n"
-                    f"签到时间：{sign_time}\n"
-                    f"{content}")
-            self.__notify(True, text)
-            self.__save_history(user_name, total_continuous_check_in, money, content, sign_time)
-            return True
+            client = RequestUtils(headers=headers, proxies=self._get_proxies())
+            if data is not None:
+                response = client.post_res(url, data=data)
+            else:
+                response = client.get_res(url)
         except Exception as err:
-            logger.error(f"浏览器模式执行失败：{err}")
-            return False
-        finally:
-            if ctx:
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-
-    def __get_res(self, url: str):
-        """GET 请求站点：按配置走代理，代理无响应时自动回退显式直连一次。"""
-        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).get_res(url=url)
-        if res is None and self._use_proxy:
-            logger.warning("代理请求无响应，自动回退直连重试...")
-            res = RequestUtils(headers=self.__get_headers(), proxies=self._DIRECT_PROXIES).get_res(url=url)
-        return res
-
-    def __post_res(self, url: str, data: dict):
-        """POST 请求站点：按配置走代理，代理无响应时自动回退显式直连一次。"""
-        res = RequestUtils(headers=self.__get_headers(), proxies=self.__get_proxies()).post_res(url=url, data=data)
-        if res is None and self._use_proxy:
-            logger.warning("代理请求无响应，自动回退直连重试...")
-            res = RequestUtils(headers=self.__get_headers(), proxies=self._DIRECT_PROXIES).post_res(url=url, data=data)
-        return res
-
-    def __random_sleep(self):
-        """按 100-200 形式的配置随机 sleep；配置为空或格式错误时不延迟。"""
-        if not self._random_delay:
-            return
-        try:
-            start, end = map(int, str(self._random_delay).split("-"))
-            seconds = random.randint(min(start, end), max(start, end))
-        except (ValueError, AttributeError):
-            logger.warning("随机延迟设置格式错误（应为 100-200），本次不延迟")
-            return
-        if seconds > 0:
-            logger.info(f"随机延迟 {seconds} 秒...")
-            time.sleep(seconds)
-
-    def __get_todaysay(self) -> str:
-        """从一言接口随机获取 6-50 字的签到心情，多次失败时使用默认文案。"""
-        for attempt in range(1, 11):
-            try:
-                res = RequestUtils(proxies=self._DIRECT_PROXIES).get_res(
-                    "https://v1.hitokoto.cn/?encode=text")
-                text = (res.text or "").strip() if res else ""
-                logger.info(f"尝试想说的话-{attempt}: {text}")
-                if 6 <= len(text) <= 50:
-                    return text
-            except Exception as err:
-                logger.warning(f"获取一言失败（第{attempt}次）：{err}")
-        return self._default_todaysay
-
-    def __fetch_money(self) -> str:
-        """请求积分页面并解析当前大洋余额，失败时返回 0。"""
-        res = self.__get_res(
-            f"{self._base_url}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1"
-            f"&ajaxtarget=extcreditmenu_menu")
-        if res and res.status_code == 200:
-            match = re.search(r'<span id="hcredit_2">(\d+)</span>', res.text or "")
-            if match:
-                return match.group(1)
-        return "0"
+            logger.error(f"请求 {url} 异常：{err}")
+            return None
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else "无响应"
+            logger.error(f"请求 {url} 失败，状态码：{status}")
+            return None
+        return response.text
 
     @staticmethod
-    def __parse_time(date_str: Optional[str]) -> Optional[datetime]:
-        """安全解析历史记录时间，格式异常时返回 None。"""
-        if not date_str:
+    def _search(pattern: str, text: str, flags: int = 0) -> Optional[str]:
+        """在站点响应中按正则提取第一个分组，未命中返回 None。"""
+        if not text:
             return None
+        match = re.search(pattern, text, flags)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _now() -> str:
+        """返回当前本地时间字符串，统一历史记录与通知的时间格式。"""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _parse_date(value: Any) -> Optional[datetime]:
+        """把历史记录中的时间字符串解析为 datetime，解析失败返回 None。"""
         try:
-            return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _is_success(record: Dict[str, Any]) -> bool:
+        """判断一条历史记录是否签到成功。
+
+        新数据直接读取 ``success`` 字段；旧版本只以响应文本判断，这里保留回退逻辑。
+        """
+        if "success" in record:
+            return bool(record["success"])
+        return "签到成功" in (record.get("content") or "")
+
+    def _prune_history(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按保留天数裁剪历史记录，时间无法解析的记录直接丢弃。"""
+        deadline = time.time() - self._history_days * 24 * 60 * 60
+        pruned: List[Dict[str, Any]] = []
+        for record in history:
+            record_time = self._parse_date(record.get("date"))
+            if record_time is not None and record_time.timestamp() >= deadline:
+                pruned.append(record)
+        return pruned
+
+    def _last_known_money(self) -> str:
+        """取最近一次已知的大洋余额，取不到时返回 "0"。"""
+        last = self.get_data(KEY_LAST_RESULT) or {}
+        if last.get("money"):
+            return str(last["money"])
+        history = self.get_data(KEY_HISTORY) or []
+        if history:
+            newest = max(history, key=lambda item: item.get("date", ""))
+            return str(newest.get("money") or "0")
+        return "0"
+
+    def _next_sign_time(self) -> str:
+        """按 cron 表达式推算下次签到时间，未启用或表达式非法时返回“未设置”。"""
+        if not (self._enabled and self._cron):
+            return "未设置"
+        try:
+            timezone = ZoneInfo(settings.TZ)
+            trigger = CronTrigger.from_crontab(self._cron, timezone=timezone)
+            next_run = trigger.get_next_fire_time(None, datetime.now(tz=timezone))
+        except (ValueError, TypeError) as err:
+            logger.error(f"推算下次签到时间失败：{err}")
+            return "未设置"
+        return next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "未设置"
+
     # ------------------------------------------------------------------
-    # 通知
+    # 详情页数据
     # ------------------------------------------------------------------
 
-    def __notify(self, success: bool, text: str):
-        """记录日志并按所选样式推送签到结果通知。"""
-        logger.info(text)
-        if not self._notify:
-            return
+    def get_status_summary(self) -> Dict[str, Any]:
+        """汇总详情页所需的运行状态，并实时探测站点账号信息。"""
+        status_data: Dict[str, Any] = {
+            "status": "运行中" if self._enabled else "已停止",
+            "next_sign_time": self._next_sign_time(),
+            "last_sign_time": "无",
+            "last_sign_status": "无",
+            "continuous_days": 0,
+            "month_signs": 0,
+            "total_signs": 0,
+            "account": {
+                "username": "未知",
+                "money": "0",
+                "usergroup": "用户",
+                "cookie_status": "无效",
+            },
+        }
 
-        sign_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        is_cookie_expired = (not success) and ("cookie" in text.lower() or "未获取到用户名" in text)
-        style = self._NOTIFY_STYLES.get(self._notify_style) or self._NOTIFY_STYLES["style1"]
-        prefix = style["prefix"]
+        # 历史数据不依赖网络，先填充，保证站点不可用时详情页仍有内容
+        history = self.get_data(KEY_HISTORY) or []
+        if history:
+            newest = max(history, key=lambda item: item.get("date", ""))
+            status_data["last_sign_time"] = newest.get("date", "无")
+            status_data["last_sign_status"] = "成功" if self._is_success(newest) else "失败"
+            status_data["total_signs"] = len(history)
 
-        if success:
-            status_line = f"{prefix}✅ 签到成功"
-            detail_lines = [f"{prefix}📝 {line}" for line in text.splitlines() if line.strip()]
-        else:
-            status_line = f"{prefix}❌ {'Cookie已失效' if is_cookie_expired else '签到失败'}"
-            detail_lines = [f"{prefix}📝 失败原因：{text}"]
+        if not self._cookie:
+            return status_data
 
-        lines = [style["top"], status_line, style["top"],
-                 *detail_lines, f"{prefix}⏰ 执行时间：{sign_time}"]
-        if is_cookie_expired:
-            lines.append(f"{prefix}🔑 请更新Cookie后重试")
-        lines.append(style["bottom"])
+        # 实时探测：签到页 -> 积分 -> 用户组，任一失败只影响对应字段
+        headers = self._build_headers()
+        page = self._fetch(SIGN_PAGE_URL, headers=headers)
+        if page:
+            username = self._search(r'title="访问我的空间">(.*?)</a>', page)
+            if username:
+                status_data["account"]["username"] = username
+                status_data["account"]["cookie_status"] = "有效"
 
-        self.post_message(
-            mtype=NotificationType.Plugin,
-            title=style["title"],
-            text="\n".join(lines)
+            month_signs = self._search(r"您本月已累计签到:<b>(\d+)</b>", page)
+            if month_signs and month_signs.isdigit():
+                status_data["month_signs"] = int(month_signs)
+
+            continuous_days = self._search(r"您已经连续签到<b>(\d+)</b>天", page)
+            if continuous_days and continuous_days.isdigit():
+                status_data["continuous_days"] = int(continuous_days)
+
+            if re.search(r"您今天已经签到过了或者签到时间还未开始", page):
+                status_data["last_sign_status"] = "成功"
+                if status_data["last_sign_time"] == "无":
+                    status_data["last_sign_time"] = self._now()
+
+        credit_page = self._fetch(CREDIT_URL, headers=headers)
+        money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_page or "")
+        if money:
+            status_data["account"]["money"] = money
+
+        usergroup_page = self._fetch(USERGROUP_URL, headers=headers)
+        group_name = self._search(
+            r"您目前属于用户组: <strong>(.*?)</strong>", usergroup_page or ""
         )
+        if group_name:
+            status_data["account"]["usergroup"] = group_name
+
+        return status_data
+
+    def _analyze_history(self, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """统计签到历史：成功率、大洋收益、连续签到天数与最佳签到时段。"""
+        if not history:
+            return {
+                "success_rate": "0%",
+                "total_days": 0,
+                "success_days": 0,
+                "fail_days": 0,
+                "total_money": 0,
+                "avg_money": 0,
+                "max_continuous": 0,
+                "current_continuous": 0,
+                "best_time": "无",
+                "month_stats": {},
+            }
+
+        total_days = len(history)
+        success_records = [record for record in history if self._is_success(record)]
+        success_days = len(success_records)
+        success_rate = f"{success_days / total_days * 100:.1f}%"
+
+        money_values = [
+            int(record["money"])
+            for record in history
+            if str(record.get("money", "")).isdigit()
+        ]
+        total_money = sum(money_values)
+        avg_money = f"{total_money / success_days:.1f}" if success_days else 0
+
+        # 成功签到的日期集合（同一天多次签到只算一天），按时间倒序
+        success_day_list = sorted(
+            {
+                record_date.date()
+                for record_date in (
+                    self._parse_date(item.get("date")) for item in success_records
+                )
+                if record_date is not None
+            },
+            reverse=True,
+        )
+
+        # 历史最长连续签到
+        max_continuous = 0
+        streak = 0
+        previous_day = None
+        for day in success_day_list:
+            if previous_day is not None and (previous_day - day).days == 1:
+                streak += 1
+            else:
+                streak = 1
+            previous_day = day
+            max_continuous = max(max_continuous, streak)
+
+        # 当前连续签到：从最新一条成功记录起逐日回溯，遇到断档即停止
+        current_continuous = 0
+        expected_day = None
+        for day in success_day_list:
+            if expected_day is None:
+                current_continuous = 1
+            elif day == expected_day:
+                current_continuous += 1
+            else:
+                break
+            expected_day = day - timedelta(days=1)
+
+        # 统计签到成功次数最多的时段
+        hour_stats: Dict[int, int] = {}
+        for record in success_records:
+            record_time = self._parse_date(record.get("date"))
+            if record_time is None:
+                continue
+            hour_stats[record_time.hour] = hour_stats.get(record_time.hour, 0) + 1
+        best_hour = (
+            max(hour_stats.items(), key=lambda item: item[1])[0] if hour_stats else None
+        )
+
+        return {
+            "success_rate": success_rate,
+            "total_days": total_days,
+            "success_days": success_days,
+            "fail_days": total_days - success_days,
+            "total_money": total_money,
+            "avg_money": avg_money,
+            "max_continuous": max_continuous,
+            "current_continuous": current_continuous,
+            "best_time": f"{best_hour:02d}:00" if best_hour is not None else "无",
+            "month_stats": {},
+        }
 
     # ------------------------------------------------------------------
     # 配置页面
     # ------------------------------------------------------------------
 
-    def get_form(self) -> tuple[list[dict], dict[str, Any]]:
-        """拼装插件配置页面，返回页面配置与默认配置模型。"""
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """拼装配置页面。
+
+        :return: 1、Vuetify 页面配置；2、默认配置数据结构
+        """
         return [
             {
                 'component': 'VForm',
@@ -742,7 +975,11 @@ class CnlangSigninV2(_PluginBase):
                     # 基础设置卡片
                     {
                         'component': 'VCard',
-                        'props': {'title': '基础设置', 'variant': 'outlined', 'class': 'mb-4'},
+                        'props': {
+                            'title': '基础设置',
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
                         'content': [
                             {
                                 'component': 'VCardText',
@@ -752,7 +989,10 @@ class CnlangSigninV2(_PluginBase):
                                         'content': [
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSwitch',
@@ -767,7 +1007,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSwitch',
@@ -782,7 +1025,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSwitch',
@@ -797,7 +1043,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSwitch',
@@ -812,7 +1061,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSwitch',
@@ -821,23 +1073,6 @@ class CnlangSigninV2(_PluginBase):
                                                             'label': '使用代理',
                                                             'color': 'primary',
                                                             'prepend-icon': 'mdi-proxy'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'use_browser',
-                                                            'label': '浏览器模式',
-                                                            'color': 'success',
-                                                            'prepend-icon': 'mdi-robot',
-                                                            'hint': '被Cloudflare拦截时自动用浏览器完成签到并刷新Cookie',
-                                                            'persistent-hint': True
                                                         }
                                                     }
                                                 ]
@@ -851,7 +1086,11 @@ class CnlangSigninV2(_PluginBase):
                     # 运行设置卡片
                     {
                         'component': 'VCard',
-                        'props': {'title': '运行设置', 'variant': 'outlined', 'class': 'mb-4'},
+                        'props': {
+                            'title': '运行设置',
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
                         'content': [
                             {
                                 'component': 'VCardText',
@@ -861,7 +1100,10 @@ class CnlangSigninV2(_PluginBase):
                                         'content': [
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VCronField',
@@ -877,7 +1119,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
@@ -893,7 +1138,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
@@ -909,7 +1157,10 @@ class CnlangSigninV2(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VSelect',
@@ -917,11 +1168,11 @@ class CnlangSigninV2(_PluginBase):
                                                             'model': 'notify_style',
                                                             'label': '通知样式',
                                                             'items': [
-                                                                {'title': '简约风格', 'value': 'style1'},
-                                                                {'title': '清新风格', 'value': 'style2'},
-                                                                {'title': '科技风格', 'value': 'style3'},
-                                                                {'title': '商务风格', 'value': 'style4'},
-                                                                {'title': '优雅风格', 'value': 'style5'}
+                                                                {'title': '简约风格', 'value': 'style1', 'prepend-icon': 'mdi-view-dashboard'},
+                                                                {'title': '清新风格', 'value': 'style2', 'prepend-icon': 'mdi-flower'},
+                                                                {'title': '科技风格', 'value': 'style3', 'prepend-icon': 'mdi-rocket'},
+                                                                {'title': '商务风格', 'value': 'style4', 'prepend-icon': 'mdi-briefcase'},
+                                                                {'title': '优雅风格', 'value': 'style5', 'prepend-icon': 'mdi-star'}
                                                             ],
                                                             'prepend-inner-icon': 'mdi-palette',
                                                             'hint': '选择通知消息的显示样式',
@@ -939,7 +1190,11 @@ class CnlangSigninV2(_PluginBase):
                     # Cookie设置卡片
                     {
                         'component': 'VCard',
-                        'props': {'title': 'Cookie设置', 'variant': 'outlined', 'class': 'mb-4'},
+                        'props': {
+                            'title': 'Cookie设置',
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
                         'content': [
                             {
                                 'component': 'VCardText',
@@ -949,7 +1204,9 @@ class CnlangSigninV2(_PluginBase):
                                         'content': [
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12},
+                                                'props': {
+                                                    'cols': 12
+                                                },
                                                 'content': [
                                                     {
                                                         'component': 'VTextarea',
@@ -957,25 +1214,9 @@ class CnlangSigninV2(_PluginBase):
                                                             'model': 'cookie',
                                                             'label': 'Cnlang Cookie',
                                                             'rows': 5,
-                                                            'placeholder': '请填写完整Cookie，需包含 cf_clearance',
+                                                            'placeholder': '请填写您的Cookie信息',
                                                             'prepend-inner-icon': 'mdi-cookie',
-                                                            'hint': '从浏览器开发者工具复制完整Cookie，必须包含 cf_clearance（Cloudflare验证）'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'user_agent',
-                                                            'label': '浏览器UA（User-Agent）',
-                                                            'placeholder': '留空使用默认UA',
-                                                            'prepend-inner-icon': 'mdi-web',
-                                                            'hint': 'cf_clearance与UA绑定，请填写与浏览器完全一致的UA（开发者工具-网络-请求标头中的User-Agent）'
+                                                            'hint': '从浏览器中获取的Cookie信息'
                                                         }
                                                     }
                                                 ]
@@ -986,49 +1227,305 @@ class CnlangSigninV2(_PluginBase):
                             }
                         ]
                     },
+                    # 使用说明卡片
                     {
                         'component': 'VCard',
-                        'props': {'title': '使用说明', 'variant': 'outlined', 'class': 'mb-4'},
+                        'props': {
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
                         'content': [
+                            {
+                                'component': 'VCardTitle',
+                                'props': {
+                                    'class': 'text-h6'
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VIcon',
+                                        'props': {
+                                            'color': 'info',
+                                            'class': 'me-2'
+                                        },
+                                        'text': 'mdi-help-circle'
+                                    },
+                                    {
+                                        'component': 'span',
+                                        'props': {
+                                            'class': 'font-weight-bold'
+                                        },
+                                        'text': '使用说明'
+                                    }
+                                ]
+                            },
                             {
                                 'component': 'VCardText',
                                 'content': [
                                     {
-                                        'component': 'VAlert',
+                                        'component': 'div',
                                         'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'class': 'mb-3',
-                                            'text': '一键自动签到，支持自定义周期与随机延迟；签到结果实时推送，历史记录本地安全保存。特别鸣谢 imaliang 大佬，插件签到逻辑参考自他的脚本。'
+                                            'class': 'mb-4'
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-2'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'amber',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-star'
+                                                    },
+                                                    {'component': 'span', 'text': '特别鸣谢 imaliang 大佬，插件源码来自于他的脚本。'}
+                                                ]
+                                            },
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-2'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'success',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-rocket'
+                                                    },
+                                                    {'component': 'span', 'text': '一键自动签到，省心省力。'}
+                                                ]
+                                            },
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-2'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'info',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-clock-outline'
+                                                    },
+                                                    {'component': 'span', 'text': '灵活定时，支持自定义周期与随机延迟。'}
+                                                ]
+                                            },
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-2'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'warning',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-bell'
+                                                    },
+                                                    {'component': 'span', 'text': '多样通知，签到结果实时推送。'}
+                                                ]
+                                            },
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-2'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'primary',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-calendar'
+                                                    },
+                                                    {'component': 'span', 'text': '历史记录清晰可查，数据本地安全保存。'}
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {
+                                            'class': 'my-4'
                                         }
                                     },
                                     {
                                         'component': 'div',
-                                        'props': {'class': 'text-subtitle-1 font-weight-bold mb-2'},
-                                        'text': '获取Cookie步骤：'
-                                    },
-                                    {
-                                        'component': 'ol',
-                                        'props': {'class': 'ml-6 mb-3'},
+                                        'props': {
+                                            'class': 'text-subtitle-1 font-weight-bold mb-3'
+                                        },
                                         'content': [
-                                            {'component': 'li', 'props': {'class': 'mb-1'},
-                                             'text': '使用浏览器（建议 Chrome 或 Edge）访问 bbs.cnlang.org 并登录账号'},
-                                            {'component': 'li', 'props': {'class': 'mb-1'},
-                                             'text': '按 F12 打开开发者工具，切换到“网络/Network”标签'},
-                                            {'component': 'li', 'props': {'class': 'mb-1'},
-                                             'text': '刷新页面，在请求列表中找到 bbs.cnlang.org 的请求'},
-                                            {'component': 'li', 'props': {'class': 'mb-1'},
-                                             'text': '在“请求标头/Headers”中找到 Cookie: 开头的行，复制整行值（不含 Cookie: 前缀）'},
-                                            {'component': 'li', 'text': '将复制的 Cookie 粘贴到上方 Cookie 设置框中并保存'}
+                                            {
+                                                'component': 'VIcon',
+                                                'props': {
+                                                    'color': 'primary',
+                                                    'class': 'me-2'
+                                                },
+                                                'text': 'mdi-cookie'
+                                            },
+                                            {
+                                                'component': 'span',
+                                                'text': '获取Cookie步骤：'
+                                            }
                                         ]
                                     },
                                     {
-                                        'component': 'VAlert',
+                                        'component': 'div',
                                         'props': {
-                                            'type': 'warning',
-                                            'variant': 'tonal',
-                                            'text': 'Cookie 通常会在一段时间后失效，如遇签到失败请更新 Cookie；请勿泄露 Cookie 给他人；建议开启通知功能，及时了解签到状态。'
-                                        }
+                                            'class': 'ml-6'
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'ol',
+                                                'props': {
+                                                    'class': 'mb-4'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'content': [
+                                                            {
+                                                                'component': 'span',
+                                                                'text': '使用浏览器（建议使用Chrome或Edge）访问 '
+                                                            },
+                                                            {
+                                                                'component': 'a',
+                                                                'props': {
+                                                                    'href': 'https://bbs.cnlang.org/',
+                                                                    'target': '_blank',
+                                                                    'class': 'text-decoration-underline text-primary',
+                                                                    'style': 'transition: all 0.3s ease; text-decoration-thickness: 1px; text-underline-offset: 2px;'
+                                                                },
+                                                                'text': 'bbs.cnlang.org'
+                                                            },
+                                                            {
+                                                                'component': 'span',
+                                                                'text': ' 并登录您的账号'
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'text': '按F12打开开发者工具（或右键点击页面，选择"检查"）'
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'text': '在开发者工具中，切换到"网络/Network"标签'
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'text': '刷新页面，在网络请求列表中找到 bbs.cnlang.org'
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'text': '点击该请求，在右侧详情中找到"请求标头/Headers"部分'
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'props': {
+                                                            'class': 'mb-2'
+                                                        },
+                                                        'text': '找到"Cookie:"开头的行，复制整行Cookie值（不包含"Cookie:"前缀）'
+                                                    },
+                                                    {
+                                                        'component': 'li',
+                                                        'text': '将复制的Cookie值粘贴到插件的Cookie设置框中'
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {
+                                            'class': 'mt-3 pa-4',
+                                            'style': 'background-color: rgba(var(--v-theme-warning), 0.1); border-radius: 8px;'
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'd-flex align-center mb-3'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VIcon',
+                                                        'props': {
+                                                            'color': 'warning',
+                                                            'class': 'me-2'
+                                                        },
+                                                        'text': 'mdi-alert'
+                                                    },
+                                                    {
+                                                        'component': 'span',
+                                                        'props': {
+                                                            'class': 'text-subtitle-1 font-weight-bold'
+                                                        },
+                                                        'text': '注意事项：'
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'div',
+                                                'props': {
+                                                    'class': 'ml-8'
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'ul',
+                                                        'props': {
+                                                            'class': 'mb-0'
+                                                        },
+                                                        'content': [
+                                                            {
+                                                                'component': 'li',
+                                                                'props': {
+                                                                    'class': 'mb-2'
+                                                                },
+                                                                'text': 'Cookie通常会在一段时间后失效，如遇签到失败请更新Cookie'
+                                                            },
+                                                            {
+                                                                'component': 'li',
+                                                                'props': {
+                                                                    'class': 'mb-2'
+                                                                },
+                                                                'text': '请勿泄露您的Cookie给他人，以免账号被盗用'
+                                                            },
+                                                            {
+                                                                'component': 'li',
+                                                                'text': '建议开启通知功能，及时了解签到状态'
+                                                            }
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        ]
                                     }
                                 ]
                             }
@@ -1046,49 +1543,273 @@ class CnlangSigninV2(_PluginBase):
             "history_days": 30,
             "cron": "0 7 * * *",
             "notify_style": "style1",
-            "use_proxy": False,
-            "user_agent": "",
-            "use_browser": False,
-            "username": "",
-            "password": ""
+            "use_proxy": False
         }
 
     # ------------------------------------------------------------------
     # 详情页面
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def __stat_col(icon: str, color: str, label: str, value: Any, md: int = 3) -> dict:
-        """生成一个带图标的统计信息小卡片列。"""
-        return {
-            'component': 'VCol',
-            'props': {'cols': 12, 'sm': 6, 'md': md},
+    def get_page(self) -> List[dict]:
+        """拼装详情页面：账号信息、签到状态与历史统计三张卡片。"""
+        status = self.get_status_summary()
+        history = self.get_data(KEY_HISTORY) or []
+        stats = self._analyze_history(history)
+
+        # 账号信息卡片
+        account_card = {
+            'component': 'VCard',
+            'props': {
+                'variant': 'outlined',
+                'class': 'mb-4'
+            },
             'content': [
                 {
-                    'component': 'VCard',
-                    'props': {'variant': 'outlined', 'class': 'mb-2'},
+                    'component': 'VCardTitle',
+                    'props': {
+                        'class': 'text-h6'
+                    },
                     'content': [
                         {
-                            'component': 'VCardText',
-                            'props': {'class': 'd-flex align-center'},
+                            'component': 'VIcon',
+                            'props': {
+                                'color': 'primary',
+                                'class': 'me-2'
+                            },
+                            'text': 'mdi-account'
+                        },
+                        {
+                            'component': 'span',
+                            'text': '账号信息'
+                        }
+                    ]
+                },
+                {
+                    'component': 'VCardText',
+                    'content': [
+                        {
+                            'component': 'VRow',
+                            'props': {
+                                'dense': True
+                            },
                             'content': [
+                                # 用户名
                                 {
-                                    'component': 'VIcon',
-                                    'props': {'color': color, 'class': 'me-2'},
-                                    'text': icon
-                                },
-                                {
-                                    'component': 'div',
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
                                     'content': [
                                         {
-                                            'component': 'div',
-                                            'props': {'class': 'text-subtitle-2'},
-                                            'text': label
-                                        },
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'primary',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-account-circle'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '用户名'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status.get("account", {}).get("username", "未知")
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 用户组
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
                                         {
-                                            'component': 'div',
-                                            'props': {'class': 'text-h6'},
-                                            'text': str(value)
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'info',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-account-group'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '用户组'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status.get("account", {}).get("usergroup", "未知")
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 大洋余额
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-currency-usd'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '大洋余额'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status.get("account", {}).get("money", "0")
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # Cookie状态
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success' if status.get("account", {}).get("cookie_status") == "有效" else 'error',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-cookie' if status.get("account", {}).get("cookie_status") == "有效" else 'mdi-cookie-off'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': 'Cookie状态'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status.get("account", {}).get("cookie_status", "无效")
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
                                         }
                                     ]
                                 }
@@ -1099,22 +1820,32 @@ class CnlangSigninV2(_PluginBase):
             ]
         }
 
-    def __section_card(self, icon: str, title: str, cols: list[dict]) -> dict:
-        """生成一个带标题的区块卡片，内容为若干统计列。"""
-        return {
+        # 状态展示卡片
+        status_card = {
             'component': 'VCard',
-            'props': {'variant': 'outlined', 'class': 'mb-4'},
+            'props': {
+                'variant': 'outlined',
+                'class': 'mb-4'
+            },
             'content': [
                 {
                     'component': 'VCardTitle',
-                    'props': {'class': 'text-h6'},
+                    'props': {
+                        'class': 'text-h6'
+                    },
                     'content': [
                         {
                             'component': 'VIcon',
-                            'props': {'color': 'primary', 'class': 'me-2'},
-                            'text': icon
+                            'props': {
+                                'color': 'primary',
+                                'class': 'me-2'
+                            },
+                            'text': 'mdi-information'
                         },
-                        {'component': 'span', 'text': title}
+                        {
+                            'component': 'span',
+                            'text': '签到状态'
+                        }
                     ]
                 },
                 {
@@ -1122,256 +1853,745 @@ class CnlangSigninV2(_PluginBase):
                     'content': [
                         {
                             'component': 'VRow',
-                            'props': {'dense': True},
-                            'content': cols
+                            'props': {
+                                'dense': True
+                            },
+                            'content': [
+                                # 服务状态
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success' if status["status"] == "运行中" else 'error',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-power' if status["status"] == "运行中" else 'mdi-power-off'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '服务状态'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status["status"]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 下次签到时间
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'info',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-clock-outline'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '下次签到'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status["next_sign_time"]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 连续签到
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'warning',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-calendar-check'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '连续签到'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': f"{status['continuous_days']} 天"
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 本月签到
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'primary',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-calendar-month'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '本月签到'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': f"{status['month_signs']} 次"
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 总签到次数
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-counter'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '总签到'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': f"{status['total_signs']} 次"
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 最后签到状态
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 4
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success' if status["last_sign_status"] == "成功" else 'error',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-check-circle' if status["last_sign_status"] == "成功" else 'mdi-alert-circle'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '最后签到'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': status["last_sign_status"]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
                         }
                     ]
                 }
             ]
         }
 
-    @staticmethod
-    def __history_table(history: list) -> dict:
-        """生成签到历史表格，按时间倒序展示。"""
-        header = ['时间', '账号', '连续签到次数', '当前大洋', '响应']
-        return {
-            'component': 'VTable',
-            'props': {'hover': True, 'density': 'compact', 'style': 'background: transparent;'},
+        # 统计分析卡片
+        stats_card = {
+            'component': 'VCard',
+            'props': {
+                'variant': 'outlined',
+                'class': 'mb-4'
+            },
             'content': [
                 {
-                    'component': 'thead',
+                    'component': 'VCardTitle',
+                    'props': {
+                        'class': 'text-h6'
+                    },
                     'content': [
                         {
-                            'component': 'tr',
-                            'content': [
-                                {
-                                    'component': 'th',
-                                    'props': {'class': 'text-caption font-weight-bold text-primary'},
-                                    'text': title
-                                } for title in header
-                            ]
+                            'component': 'VIcon',
+                            'props': {
+                                'color': 'primary',
+                                'class': 'me-2'
+                            },
+                            'text': 'mdi-chart-box'
+                        },
+                        {
+                            'component': 'span',
+                            'text': '签到统计'
                         }
                     ]
                 },
                 {
-                    'component': 'tbody',
+                    'component': 'VCardText',
                     'content': [
+                        # 统计数据行
                         {
-                            'component': 'tr',
+                            'component': 'VRow',
+                            'props': {
+                                'dense': True
+                            },
+                            'content': [
+                                # 签到成功率
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'success',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-percent'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '签到成功率'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': stats["success_rate"]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 累计获得大洋
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'warning',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-currency-usd'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '累计大洋'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': str(stats["total_money"])
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 平均每次大洋
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'info',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-calculator'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '平均大洋'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': str(stats["avg_money"])
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                # 最佳签到时间
+                                {
+                                    'component': 'VCol',
+                                    'props': {
+                                        'cols': 12,
+                                        'sm': 6,
+                                        'md': 3
+                                    },
+                                    'content': [
+                                        {
+                                            'component': 'VCard',
+                                            'props': {
+                                                'variant': 'outlined',
+                                                'class': 'mb-2'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'VCardText',
+                                                    'props': {
+                                                        'class': 'd-flex align-center'
+                                                    },
+                                                    'content': [
+                                                        {
+                                                            'component': 'VIcon',
+                                                            'props': {
+                                                                'color': 'primary',
+                                                                'class': 'me-2'
+                                                            },
+                                                            'text': 'mdi-clock-outline'
+                                                        },
+                                                        {
+                                                            'component': 'div',
+                                                            'content': [
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-subtitle-2'
+                                                                    },
+                                                                    'text': '最佳时间'
+                                                                },
+                                                                {
+                                                                    'component': 'div',
+                                                                    'props': {
+                                                                        'class': 'text-h6'
+                                                                    },
+                                                                    'text': stats["best_time"]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        # 历史记录表格
+                        {
+                            'component': 'VDivider',
+                            'props': {
+                                'class': 'my-4'
+                            }
+                        },
+                        {
+                            'component': 'div',
+                            'props': {
+                                'class': 'text-subtitle-1 d-flex align-center mb-4'
+                            },
                             'content': [
                                 {
-                                    'component': 'td',
-                                    'props': {'class': 'text-caption text-medium-emphasis'},
-                                    'text': str(h.get(key, ''))
-                                } for key in ("date", "username", "totalContinuousCheckIn", "money", "content")
+                                    'component': 'VIcon',
+                                    'props': {
+                                        'color': 'primary',
+                                        'class': 'me-2',
+                                        'size': 'small'
+                                    },
+                                    'text': 'mdi-history'
+                                },
+                                {
+                                    'component': 'span',
+                                    'text': '签到历史'
+                                }
                             ]
-                        } for h in sorted(history, key=lambda x: x.get("date", ""), reverse=True)
+                        },
+                        {
+                            'component': 'VTable',
+                            'props': {
+                                'hover': True,
+                                'density': 'compact',
+                                'class': 'sign-history-table',
+                                'style': 'background: transparent;'
+                            },
+                            'content': [
+                                {
+                                    'component': 'thead',
+                                    'content': [
+                                        {
+                                            'component': 'tr',
+                                            'props': {
+                                                'style': 'background: rgba(var(--v-theme-surface-variant), 0.1);'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-caption font-weight-bold text-primary'
+                                                    },
+                                                    'text': '时间'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-caption font-weight-bold text-primary'
+                                                    },
+                                                    'text': '账号'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-caption font-weight-bold text-primary'
+                                                    },
+                                                    'text': '连续签到次数'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-caption font-weight-bold text-primary'
+                                                    },
+                                                    'text': '当前大洋'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-caption font-weight-bold text-primary'
+                                                    },
+                                                    'text': '响应'
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                {
+                                    'component': 'tbody',
+                                    'content': [
+                                        {
+                                            'component': 'tr',
+                                            'props': {
+                                                'style': 'background: rgba(var(--v-theme-surface), 0.02);'
+                                            },
+                                            'content': [
+                                                {
+                                                    'component': 'td',
+                                                    'props': {
+                                                        'class': 'text-caption text-medium-emphasis'
+                                                    },
+                                                    'text': h.get("date")
+                                                },
+                                                {
+                                                    'component': 'td',
+                                                    'props': {
+                                                        'class': 'text-caption text-medium-emphasis'
+                                                    },
+                                                    'text': h.get("username")
+                                                },
+                                                {
+                                                    'component': 'td',
+                                                    'props': {
+                                                        'class': 'text-caption text-medium-emphasis'
+                                                    },
+                                                    'text': str(h.get("totalContinuousCheckIn"))
+                                                },
+                                                {
+                                                    'component': 'td',
+                                                    'props': {
+                                                        'class': 'text-caption text-medium-emphasis'
+                                                    },
+                                                    'text': str(h.get("money"))
+                                                },
+                                                {
+                                                    'component': 'td',
+                                                    'props': {
+                                                        'class': 'text-caption text-medium-emphasis'
+                                                    },
+                                                    'text': h.get("content")
+                                                }
+                                            ]
+                                        } for h in sorted(history, key=lambda x: x.get("date", ""), reverse=True)
+                                    ]
+                                }
+                            ]
+                        }
                     ]
                 }
             ]
         }
 
-    def get_page(self) -> list[dict]:
-        """返回插件详情页：账号信息、签到状态、签到统计与历史记录。"""
-        status = self.get_status_summary()
-        history = self.get_data("history") or []
-        stats = self.__analyze_signin_history(history)
-        account = status.get("account", {})
-        cookie_ok = account.get("cookie_status") == "有效"
-
-        # 账号信息卡片
-        account_card = self.__section_card("mdi-account", "账号信息", [
-            self.__stat_col("mdi-account-circle", "primary", "用户名", account.get("username", "未知")),
-            self.__stat_col("mdi-account-group", "info", "用户组", account.get("usergroup", "未知")),
-            self.__stat_col("mdi-currency-usd", "success", "大洋余额", account.get("money", "0")),
-            self.__stat_col("mdi-cookie" if cookie_ok else "mdi-cookie-off",
-                            "success" if cookie_ok else "error",
-                            "Cookie状态", account.get("cookie_status", "无效")),
-        ])
-
-        # 签到状态卡片
-        running = status["status"] == "运行中"
-        last_ok = status["last_sign_status"] == "成功"
-        status_card = self.__section_card("mdi-information", "签到状态", [
-            self.__stat_col("mdi-power" if running else "mdi-power-off",
-                            "success" if running else "error",
-                            "服务状态", status["status"], md=4),
-            self.__stat_col("mdi-clock-outline", "info", "下次签到", status["next_sign_time"], md=4),
-            self.__stat_col("mdi-calendar-check", "warning", "连续签到", f"{status['continuous_days']} 天", md=4),
-            self.__stat_col("mdi-calendar-month", "primary", "本月签到", f"{status['month_signs']} 次", md=4),
-            self.__stat_col("mdi-counter", "success", "总签到", f"{status['total_signs']} 次", md=4),
-            self.__stat_col("mdi-check-circle" if last_ok else "mdi-alert-circle",
-                            "success" if last_ok else "error",
-                            "最后签到", status["last_sign_status"], md=4),
-        ])
-
-        # 签到统计卡片（统计列 + 历史表格）
-        stats_card = self.__section_card("mdi-chart-box", "签到统计", [
-            self.__stat_col("mdi-percent", "success", "签到成功率", stats["success_rate"]),
-            self.__stat_col("mdi-currency-usd", "warning", "累计大洋", stats["total_money"]),
-            self.__stat_col("mdi-calculator", "info", "平均大洋", stats["avg_money"]),
-            self.__stat_col("mdi-clock-outline", "primary", "最佳时间", stats["best_time"]),
-        ])
-        # 在统计卡片末尾追加历史记录表格
-        stats_card['content'][1]['content'].extend([
-            {'component': 'VDivider', 'props': {'class': 'my-4'}},
-            {
-                'component': 'div',
-                'props': {'class': 'text-subtitle-1 d-flex align-center mb-4'},
-                'content': [
-                    {
-                        'component': 'VIcon',
-                        'props': {'color': 'primary', 'class': 'me-2', 'size': 'small'},
-                        'text': 'mdi-history'
-                    },
-                    {'component': 'span', 'text': '签到历史'}
-                ]
-            },
-            self.__history_table(history)
-        ])
-
         return [account_card, status_card, stats_card]
-
-    # ------------------------------------------------------------------
-    # 状态与统计
-    # ------------------------------------------------------------------
-
-    def get_status_summary(self) -> dict:
-        """获取服务状态摘要：实时请求站点获取账号信息，并结合本地历史补充统计。"""
-        status_data = {
-            "status": "运行中" if self._enabled else "已停止",
-            "next_sign_time": self.__next_run_time(),
-            "last_sign_time": "无",
-            "last_sign_status": "无",
-            "continuous_days": 0,
-            "month_signs": 0,
-            "total_signs": 0,
-            "account": {
-                "username": "未知",
-                "money": "0",
-                "usergroup": "用户",
-                "cookie_status": "无效"
-            }
-        }
-
-        # 本地历史补充：最后签到时间与总次数
-        history = self.get_data("history") or []
-        sorted_history = sorted(history, key=lambda x: x.get("date", ""), reverse=True)
-        if sorted_history:
-            status_data["last_sign_time"] = sorted_history[0].get("date", "无")
-            if "签到成功" in sorted_history[0].get("content", ""):
-                status_data["last_sign_status"] = "成功"
-        status_data["total_signs"] = len(sorted_history)
-
-        if not self._cookie:
-            return status_data
-
-        try:
-            # 签到页面：用户名、本月签到、连续天数、今日是否已签
-            res = self.__get_res(f"{self._base_url}/dsu_paulsign-sign.html?mobile=no")
-            if res and res.status_code == 200:
-                sign_info = res.text or ""
-                username_match = re.search(r'title="访问我的空间">(.*?)</a>', sign_info)
-                if username_match:
-                    status_data["account"]["username"] = username_match.group(1)
-                    status_data["account"]["cookie_status"] = "有效"
-                month_match = re.search(r'您本月已累计签到:<b>(\d+)</b>', sign_info)
-                if month_match:
-                    status_data["month_signs"] = int(month_match.group(1))
-                continuous_match = re.search(r'您已经连续签到<b>(\d+)</b>天', sign_info)
-                if continuous_match:
-                    status_data["continuous_days"] = int(continuous_match.group(1))
-                if re.search(r'您今天已经签到过了或者签到时间还未开始', sign_info):
-                    status_data["last_sign_status"] = "成功"
-
-            # 积分页面：大洋余额
-            status_data["account"]["money"] = self.__fetch_money()
-
-            # 用户组页面：当前用户组
-            group_res = self.__get_res(f"{self._base_url}/home.php?mod=spacecp&ac=usergroup")
-            if group_res and group_res.status_code == 200:
-                group_match = re.search(r'您目前属于用户组: <strong>(.*?)</strong>', group_res.text or "")
-                if group_match:
-                    status_data["account"]["usergroup"] = group_match.group(1)
-        except Exception as err:
-            logger.error(f"获取状态信息失败：{err}")
-
-        return status_data
-
-    def __next_run_time(self) -> str:
-        """根据 cron 表达式计算下次签到时间，失败时返回 未设置。"""
-        if not (self._enabled and self._cron):
-            return "未设置"
-        try:
-            trigger = CronTrigger.from_crontab(self._cron)
-            next_fire = trigger.get_next_fire_time(None, datetime.now(tz=ZoneInfo(settings.TZ)))
-            return next_fire.strftime('%Y-%m-%d %H:%M:%S') if next_fire else "未设置"
-        except Exception as err:
-            logger.error(f"获取下次运行时间失败：{err}")
-            return "未设置"
-
-    def __analyze_signin_history(self, history: list) -> dict:
-        """分析签到历史：成功率、大洋统计、连续天数与最佳签到时段。"""
-        empty = {
-            "success_rate": "0%",
-            "total_days": 0,
-            "success_days": 0,
-            "fail_days": 0,
-            "total_money": 0,
-            "avg_money": 0,
-            "max_continuous": 0,
-            "current_continuous": 0,
-            "best_time": "无",
-        }
-        if not history:
-            return empty
-
-        total_days = len(history)
-        success_records = [h for h in history if "签到成功" in h.get("content", "")]
-        success_days = len(success_records)
-        success_rate = f"{(success_days / total_days * 100):.1f}%"
-
-        # 大洋统计
-        total_money = sum(int(h.get("money")) for h in history if str(h.get("money", "")).isdigit())
-        avg_money = f"{total_money / success_days:.1f}" if success_days > 0 else "0"
-
-        # 连续签到：按成功签到的去重日期倒序计算
-        dates = sorted({d for d in (self.__parse_time(h.get("date")) for h in success_records) if d},
-                       reverse=True)
-        max_continuous = current_continuous = 0
-        if dates:
-            streak = 1
-            max_continuous = 1
-            for i in range(1, len(dates)):
-                if (dates[i - 1].date() - dates[i].date()).days == 1:
-                    streak += 1
-                    max_continuous = max(max_continuous, streak)
-                else:
-                    streak = 1
-            current_continuous = 1
-            for i in range(1, len(dates)):
-                if (dates[i - 1].date() - dates[i].date()).days == 1:
-                    current_continuous += 1
-                else:
-                    break
-
-        # 最佳签到时段：成功记录中出现次数最多的小时
-        hour_stats = {}
-        for h in success_records:
-            parsed = self.__parse_time(h.get("date"))
-            if parsed:
-                hour_stats[parsed.hour] = hour_stats.get(parsed.hour, 0) + 1
-        best_hour = max(hour_stats.items(), key=lambda x: x[1])[0] if hour_stats else None
-        best_time = f"{best_hour:02d}:00" if best_hour is not None else "无"
-
-        return {
-            "success_rate": success_rate,
-            "total_days": total_days,
-            "success_days": success_days,
-            "fail_days": total_days - success_days,
-            "total_money": total_money,
-            "avg_money": avg_money,
-            "max_continuous": max_continuous,
-            "current_continuous": current_continuous,
-            "best_time": best_time,
-        }
