@@ -831,7 +831,11 @@ def test_execute_signin_switches_to_browser_mode_on_cloudflare(host, monkeypatch
 
 
 def test_execute_signin_advises_enabling_browser_mode(host):
-    """关闭浏览器模式时，Cloudflare 拦截应给出可执行建议而非“未知错误”。"""
+    """关闭浏览器模式时，Cloudflare 拦截应给出可执行建议而非“未知错误”。
+
+    站点签到路径的挑战是交互式的，自动化客户端都过不去，因此建议文案的重点是
+    「如何刷新 Cookie」，而不是「打开浏览器模式」。
+    """
     module = host.module
     plugin = _enabled_plugin(host, browser_mode=False, notify=True)
     host.request.routes = {
@@ -844,8 +848,9 @@ def test_execute_signin_advises_enabling_browser_mode(host):
 
     assert result["success"] is False
     assert result["content"] == module.CF_ADVICE
-    assert "浏览器模式" in result["content"]
     assert "cf_clearance" in result["content"]
+    assert "Cookie" in result["content"]
+    assert "navigator.userAgent" in result["content"]
 
 
 def test_cloudflare_block_reports_browser_unavailable(host):
@@ -1947,3 +1952,284 @@ def test_module_import_has_no_side_effects(host):
     """导入插件模块不应发起请求或登记调度任务。"""
     assert host.request.calls == []
     assert host.scheduler.added == []
+
+
+# ---------------------------------------------------------------------------
+# curl_cffi 快速路径
+# ---------------------------------------------------------------------------
+
+
+class _StubCurlResponse:
+    """模拟 curl_cffi 响应对象（status_code / text / headers 与 requests 一致）。"""
+
+    def __init__(self, status_code=200, text="", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {} if headers is None else dict(headers)
+
+
+class _StubCurlRequests:
+    """模拟 ``curl_cffi.requests`` 模块，记录每次调用的参数。"""
+
+    calls = []
+    routes = {}
+    error = None
+
+    @classmethod
+    def reset(cls):
+        cls.calls = []
+        cls.routes = {}
+        cls.error = None
+
+    @classmethod
+    def _call(cls, method, url, **kwargs):
+        cls.calls.append({"method": method, "url": url, "kwargs": kwargs})
+        if cls.error is not None:
+            raise cls.error
+        return cls.routes.get(url)
+
+    @classmethod
+    def get(cls, url, **kwargs):
+        return cls._call("GET", url, **kwargs)
+
+    @classmethod
+    def post(cls, url, **kwargs):
+        return cls._call("POST", url, **kwargs)
+
+
+def _install_curl_cffi(monkeypatch, *, available=True, targets=None):
+    """把 curl_cffi 桩模块装入 ``sys.modules``，返回记录调用的桩类。
+
+    :param available: False 表示模拟「宿主未安装 curl_cffi」
+    :param targets: 模拟 curl_cffi 支持的 impersonate 目标列表
+    :return: ``_StubCurlRequests``
+    """
+    _StubCurlRequests.reset()
+    if not available:
+        # sys.modules 中值为 None 时，import 会直接抛 ImportError
+        monkeypatch.setitem(sys.modules, "curl_cffi", None)
+        return _StubCurlRequests
+
+    class _Item:
+        def __init__(self, value):
+            self.value = value
+
+    imp_mod = types.ModuleType("curl_cffi.requests.impersonate")
+    imp_mod.BrowserType = [_Item(v) for v in (targets or ["chrome131", "chrome136"])]
+
+    req_mod = types.ModuleType("curl_cffi.requests")
+    req_mod.get = _StubCurlRequests.get
+    req_mod.post = _StubCurlRequests.post
+    req_mod.impersonate = imp_mod
+
+    pkg = types.ModuleType("curl_cffi")
+    pkg.requests = req_mod
+
+    monkeypatch.setitem(sys.modules, "curl_cffi", pkg)
+    monkeypatch.setitem(sys.modules, "curl_cffi.requests", req_mod)
+    monkeypatch.setitem(sys.modules, "curl_cffi.requests.impersonate", imp_mod)
+    return _StubCurlRequests
+
+
+CHROME_131_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def test_resolve_impersonate_auto_matches_ua_chrome_version(host, monkeypatch):
+    """auto 模式应挑一个版本号不超过 UA 里 Chrome 主版本的受支持目标。"""
+    _install_curl_cffi(monkeypatch, targets=["chrome124", "chrome131", "chrome136"])
+    resolve = host.module._resolve_impersonate
+
+    assert resolve("auto", CHROME_131_UA) == "chrome131"
+    # 140 没有精确匹配，应退到不超过它的最大值
+    assert resolve("auto", CHROME_131_UA.replace("/131.", "/140.")) == "chrome136"
+    # 比所有已知目标都旧时退回默认目标
+    assert resolve("auto", CHROME_131_UA.replace("/131.", "/120.")) == "chrome"
+
+
+def test_resolve_impersonate_explicit_and_disabled(host, monkeypatch):
+    """显式目标原样返回；空串/None 表示关闭 curl_cffi。"""
+    _install_curl_cffi(monkeypatch)
+    resolve = host.module._resolve_impersonate
+
+    assert resolve("chrome136", CHROME_131_UA) == "chrome136"
+    assert resolve("", CHROME_131_UA) is None
+    assert resolve(None, CHROME_131_UA) is None
+    # UA 里没有 Chrome 版本号时退回默认目标
+    assert resolve("auto", "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0") == "chrome"
+
+
+def test_request_uses_curl_cffi_when_available(host, monkeypatch):
+    """安装了 curl_cffi 时应优先用它发请求，并带上 impersonate 与请求头。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    plugin = _enabled_plugin(host, user_agent=CHROME_131_UA)
+    stub.routes[host.module.SIGN_PAGE_URL] = _StubCurlResponse(200, "<html>ok</html>")
+
+    text, status, blocked = plugin._request(
+        host.module.SIGN_PAGE_URL, headers={"Cookie": "a=1"}
+    )
+
+    assert (text, status, blocked) == ("<html>ok</html>", 200, False)
+    assert len(stub.calls) == 1
+    assert stub.calls[0]["method"] == "GET"
+    assert stub.calls[0]["kwargs"]["impersonate"] == "chrome131"
+    assert stub.calls[0]["kwargs"]["headers"] == {"Cookie": "a=1"}
+    assert host.request.calls == []  # 不应回退到宿主网络组件
+
+
+def test_request_falls_back_when_curl_cffi_raises(host, monkeypatch):
+    """curl_cffi 抛异常时必须静默回退宿主 RequestUtils。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    stub.error = RuntimeError("boom")
+    plugin = _enabled_plugin(host)
+    host.request.routes[host.module.SIGN_PAGE_URL] = host.response_cls(200, "<html>ok</html>")
+
+    text, status, blocked = plugin._request(host.module.SIGN_PAGE_URL)
+
+    assert (text, status, blocked) == ("<html>ok</html>", 200, False)
+    assert host.request.calls  # 回退确实发生了
+
+
+def test_request_skips_curl_cffi_when_disabled(host, monkeypatch):
+    """关闭 use_curl_cffi 后不得调用 curl_cffi。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    plugin = _enabled_plugin(host, use_curl_cffi=False)
+    host.request.routes[host.module.SIGN_PAGE_URL] = host.response_cls(200, "ok")
+
+    plugin._request(host.module.SIGN_PAGE_URL)
+
+    assert stub.calls == []
+    assert host.request.calls
+
+
+def test_request_skips_curl_cffi_when_impersonate_blank(host, monkeypatch):
+    """impersonate 留空等同于关闭 curl_cffi。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    plugin = _enabled_plugin(host, impersonate="")
+    host.request.routes[host.module.SIGN_PAGE_URL] = host.response_cls(200, "ok")
+
+    plugin._request(host.module.SIGN_PAGE_URL)
+
+    assert stub.calls == []
+    assert host.request.calls
+
+
+def test_request_works_without_curl_cffi_installed(host, monkeypatch):
+    """宿主未安装 curl_cffi 时快速路径照常可用。"""
+    _install_curl_cffi(monkeypatch, available=False)
+    plugin = _enabled_plugin(host)
+    host.request.routes[host.module.SIGN_PAGE_URL] = host.response_cls(200, "ok")
+
+    text, status, _blocked = plugin._request(host.module.SIGN_PAGE_URL)
+
+    assert (text, status) == ("ok", 200)
+
+
+def test_request_via_curl_cffi_still_detects_challenge(host, monkeypatch):
+    """经 curl_cffi 拿到的挑战页同样要能被识别并触发浏览器模式切换。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    plugin = _enabled_plugin(host)
+    stub.routes[host.module.SIGN_PAGE_URL] = _StubCurlResponse(
+        403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+    )
+
+    text, status, blocked = plugin._request(host.module.SIGN_PAGE_URL)
+
+    assert (text, status, blocked) == (None, 403, True)
+
+
+def test_request_via_curl_cffi_posts_form_data(host, monkeypatch):
+    """curl_cffi 路径下的签到提交必须是 POST 且携带表单数据。"""
+    stub = _install_curl_cffi(monkeypatch, targets=["chrome131"])
+    plugin = _enabled_plugin(host)
+    stub.routes[host.module.SIGN_SUBMIT_URL] = _StubCurlResponse(200, "ok")
+
+    text, status, _blocked = plugin._request(
+        host.module.SIGN_SUBMIT_URL, data={"formhash": "abc"}
+    )
+
+    assert (text, status) == ("ok", 200)
+    assert stub.calls[0]["method"] == "POST"
+    assert stub.calls[0]["kwargs"]["data"] == {"formhash": "abc"}
+
+
+# ---------------------------------------------------------------------------
+# 强制浏览器模式
+# ---------------------------------------------------------------------------
+
+
+def test_force_browser_skips_fast_path(host, monkeypatch):
+    """开启「强制浏览器模式」时不应发出任何 HTTP 请求。"""
+    plugin = _enabled_plugin(host, force_browser=True, browser_mode=True)
+    page = _FakePage(html="", title="Just a moment...")
+    calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
+    monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+    )
+    monkeypatch.setattr(
+        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+    )
+
+    plugin.signin()
+
+    assert calls, "应当直接进入浏览器模式"
+    assert host.request.calls == [], "强制浏览器模式不得走 HTTP 快速路径"
+
+
+def test_force_browser_without_browser_mode_still_advises(host):
+    """同时关闭浏览器模式时，强制开关也不应让流程崩溃。"""
+    plugin = _enabled_plugin(host, force_browser=True, browser_mode=False)
+    host.request.routes[host.module.SIGN_PAGE_URL] = host.response_cls(
+        403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+    )
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert result["content"] == host.module.CF_ADVICE
+
+
+def test_force_browser_still_requires_cookie(host):
+    """未配置 Cookie 时应优先报「未配置Cookie」，而不是去开浏览器。"""
+    plugin = _enabled_plugin(host, force_browser=True, cookie="")
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert result["content"] == "未配置Cookie"
+
+
+# ---------------------------------------------------------------------------
+# 新增配置项的生命周期
+# ---------------------------------------------------------------------------
+
+
+def test_save_config_preserves_new_anti_bot_fields(host):
+    """新增配置项必须参与回写，否则保存配置时会被静默清空。"""
+    plugin = _enabled_plugin(
+        host, force_browser=True, use_curl_cffi=False, impersonate="chrome136"
+    )
+
+    plugin._save_config()
+    saved = plugin.get_config()
+
+    assert saved["force_browser"] is True
+    assert saved["use_curl_cffi"] is False
+    assert saved["impersonate"] == "chrome136"
+
+
+def test_get_form_exposes_curl_cffi_settings(host):
+    """配置页应包含 curl_cffi 开关、伪装目标与强制浏览器模式开关。"""
+    plugin = _enabled_plugin(host)
+    form, defaults = plugin.get_form()
+    serialized = json.dumps(form, ensure_ascii=False)
+
+    assert "use_curl_cffi" in serialized
+    assert "impersonate" in serialized
+    assert "force_browser" in serialized
+    assert defaults["use_curl_cffi"] is True
+    assert defaults["impersonate"] == "auto"
+    assert defaults["force_browser"] is False

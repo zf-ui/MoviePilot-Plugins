@@ -118,23 +118,29 @@ CF_CHALLENGE_HTML_MARKERS = (
     "<title>请稍候",
     "<title>attention required",
 )
-# 未开启浏览器模式且被 Cloudflare 拦截时给出的可执行建议
+# 站点签到路径上的 Cloudflare 挑战是 **interactive** 类型（Turnstile 勾选框），
+# 必须由真实浏览器执行 JS 并完成交互。已实测确认无法被自动化的客户端绕过：
+#   · 纯 requests / urllib        -> 403 + Cf-Mitigated: challenge
+#   · curl_cffi（chrome150 指纹 + 完整 Client Hints + 论坛会话）-> 同样 403
+#   · 无头 Chrome / 有头全新 profile Chrome（跑满 150s）-> 始终拿不到 cf_clearance
+# 唯一能直接放行的是**有效的 cf_clearance**，因此这里给的建议只围绕「如何刷新 Cookie」。
 CF_ADVICE = (
-    "站点启用了 Cloudflare 人机验证，纯 requests 无法通过。请任选其一：\n"
-    "1）开启「浏览器模式」，由宿主内置浏览器完成验证后自动签到"
-    "（先访问首页换取通行证，再访问签到页；无头失败会自动升级到有头重试）；\n"
-    "2）【最稳】关闭「浏览器模式」，改用你自己的浏览器 Cookie：\n"
-    "   · 用 Chrome/Edge 登录站点，F12 → 网络 → 刷新 → 复制任一请求的完整 Cookie "
-    "（必须包含 cf_clearance）；\n"
-    "   · 在同一页执行 navigator.userAgent，把「浏览器UA」填成这个值——"
-    "cf_clearance 与 UA 绑定，不一致会立即失效；\n"
-    "   · cf_clearance 有效期通常只有几十分钟，失效后重新复制即可。"
+    "站点对签到路径下发了 Cloudflare 交互式人机验证（Turnstile 勾选框）。"
+    "这类验证必须由真实浏览器人工完成——纯 HTTP 请求（包括模拟 Chrome 指纹的 "
+    "curl_cffi）和无头/虚拟显示浏览器都过不去，唯一能直接放行的是有效的 cf_clearance。\n"
+    "请按下面步骤更新配置里的 Cookie：\n"
+    "1）用 Chrome/Edge 登录 cnlang.org，打开签到页并完成验证；\n"
+    "2）F12 → 网络 → 刷新 → 点任意一个发往 cnlang.org 的请求 → 复制请求头里的"
+    "完整 Cookie（必须包含 cf_clearance）；\n"
+    "3）在同一页面执行 navigator.userAgent，把结果填进「浏览器UA」——"
+    "cf_clearance 与 UA 绑定，不一致会被立即拒绝；\n"
+    "4）cf_clearance 有效期有限，失效后重复上述步骤即可。"
 )
-# Cloudflare 自管 Cookie：与 UA / TLS 指纹 / IP 绑定。**来自用户自己浏览器的**旧值注入
-# 会让 CF 直接不信任该会话（通行证对不上它自己的签发记录），因此注入时必须剔除，让
-# 浏览器自行取得一张全新的、自洽的通行证。论坛登录态（_auth 等）不受影响。
-# 反过来，插件上一轮**由本浏览器自己签发**的通行证身份自洽，会缓存起来复用
-# （见 KEY_CF_COOKIES），这是让签到从第二次起变快的关键。
+# Cloudflare 自管 Cookie（cf_clearance / __cf_bm / cf_chl_* …）。
+# 早期版本以为「把旧通行证注入浏览器会让 CF 不信任会话」而把它们剔除，实测不成立：
+# cf_clearance 是**域级**的，只要还在有效期内，注入后首页与签到页都能直接放行。
+# 因此现在的策略是**照常注入**（见 _inject_cookies），只在需要区分分类时使用本函数
+# （见 _refresh_cookies_from_browser）。
 CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfduid")
 CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
 # 单次挑战等待预算（秒）。挑战过程不可中断：中途 reload 会让 Turnstile 的进度归零，
@@ -150,16 +156,108 @@ CF_HEADED_BUDGET = 45
 def _is_cloudflare_cookie(name: str) -> bool:
     """判断一个 Cookie 名是否由 Cloudflare 自己管理。
 
-    这类 Cookie（cf_clearance / __cf_bm / cf_chl_* …）与签发时的 UA、TLS 指纹和 IP
-    强绑定。把用户浏览器里的旧值原样注入无头浏览器，会让 Cloudflare 发现
-    「通行证对不上自己的签发记录」而直接不信任会话——这恰恰是签到页持续下发
-    交互式挑战的常见原因。因此注入前必须剔除，由浏览器自行取得新的通行证。
+    这类 Cookie（cf_clearance / __cf_bm / cf_chl_* …）与签发时的 UA 和 IP 绑定。
+    注意：**不再**据此剔除 Cookie——cf_clearance 是域级通行证，有效期内注入后
+    首页与签到页都会直接放行，剔除只会让每次执行都从零重新撞挑战。
+    本函数现在只用于「把 CF Cookie 与论坛登录态 Cookie 分开处理」的分类场景。
 
     :param name: Cookie 名
     :return: 是否属于 Cloudflare 自管 Cookie
     """
     lowered = (name or "").strip().lower()
     return lowered in CF_COOKIE_NAMES or lowered.startswith(CF_COOKIE_PREFIXES)
+
+
+# ----------------------------------------------------------------------
+# curl_cffi：真实 Chrome TLS/JA3 指纹的 HTTP 客户端（可选增强）
+# ----------------------------------------------------------------------
+# 宿主自带的 RequestUtils 走 Python 的 OpenSSL 栈，TLS 指纹与真实 Chrome 差异明显。
+# curl_cffi 能复刻 Chrome 的 TLS/JA3 + HTTP/2 指纹与请求头顺序，让快速路径尽可能
+# 贴近真实浏览器。**注意**：它并不能绕过上面的交互式挑战（已实测），
+# 作用是让「拿着有效 cf_clearance 的快速路径」以最接近浏览器的形态发出请求。
+#
+# 配置项 impersonate 的取值：
+#   "auto"（默认）—— 按「浏览器UA」里的 Chrome 主版本号挑选最接近的受支持目标，
+#                    让 TLS 指纹版本与 UA 版本一致；UA 不含版本号时用最新版 chrome。
+#   具体值（如 "chrome131"）—— 强制使用该目标。
+#   空字符串 —— 关闭 curl_cffi，完全使用宿主网络组件。
+CURL_CFFI_DEFAULT_TARGET = "chrome"
+# curl_cffi 的 impersonate 参数名（不同版本保持一致）
+CURL_CFFI_IMPERSONATE_ARG = "impersonate"
+# 请求超时（秒）
+REQUEST_TIMEOUT = 30
+# curl_cffi 模块的惰性导入缓存。_UNSET 表示尚未探测。
+_UNSET = object()
+_curl_cffi_module: Any = _UNSET
+
+
+def _import_curl_cffi() -> Optional[Any]:
+    """导入 curl_cffi 的 requests 模块；不可用时返回 None。
+
+    只在首次调用时探测一次并缓存结果，避免每次请求都走一遍 import 机制。
+    宿主未安装 curl_cffi 是完全正常的（它是可选的增强项）。
+
+    :return: ``curl_cffi.requests`` 模块，或 None
+    """
+    global _curl_cffi_module
+    if _curl_cffi_module is _UNSET:
+        try:
+            from curl_cffi import requests as curl_requests  # noqa: PLC0415 - 可选依赖
+
+            _curl_cffi_module = curl_requests
+        except Exception:  # noqa: BLE001 - 未安装 / 版本不兼容都按不可用处理
+            _curl_cffi_module = None
+    return _curl_cffi_module
+
+
+def _curl_cffi_targets() -> Tuple[str, ...]:
+    """返回当前 curl_cffi 版本支持的 impersonate 目标名列表。
+
+    导入失败时返回空元组，调用方据此退回 ``CURL_CFFI_DEFAULT_TARGET``。
+
+    :return: 受支持的目标名（如 ``("chrome131", "chrome136", …)``）
+    """
+    try:
+        from curl_cffi.requests.impersonate import BrowserType  # noqa: PLC0415
+
+        return tuple(item.value for item in BrowserType)
+    except Exception:  # noqa: BLE001 - 取不到就当作没有清单
+        return ()
+
+
+def _resolve_impersonate(target: Optional[str], user_agent: Optional[str]) -> Optional[str]:
+    """把配置的伪装目标解析成 curl_cffi 实际可用的目标名。
+
+    ``auto`` 会读取 UA 里的 ``Chrome/<主版本>``，在 curl_cffi 支持的目标里挑一个
+    版本号不超过它的最大值，从而让 TLS 指纹版本与 UA 版本尽量一致——两者不一致本身
+    就是「非真实浏览器」的特征。
+
+    :param target: 配置值；None/空串表示关闭 curl_cffi
+    :param user_agent: 配置的浏览器 UA，可为 None
+    :return: 可直接传给 curl_cffi 的目标名；None 表示不使用 curl_cffi
+    """
+    value = (target or "").strip()
+    if not value:
+        return None
+    if value.lower() != "auto":
+        return value
+
+    match = re.search(r"Chrome/(\d+)", user_agent or "")
+    if not match:
+        return CURL_CFFI_DEFAULT_TARGET
+    major = int(match.group(1))
+
+    known = _curl_cffi_targets()
+    if not known:
+        return CURL_CFFI_DEFAULT_TARGET
+    candidates = []
+    for name in known:
+        hit = re.fullmatch(r"chrome(\d+)", name)
+        if hit and int(hit.group(1)) <= major:
+            candidates.append((int(hit.group(1)), name))
+    if not candidates:
+        return CURL_CFFI_DEFAULT_TARGET
+    return max(candidates)[1]
 
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
@@ -321,7 +419,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.5"
+    plugin_version = "3.6.6"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -354,6 +452,12 @@ class CnlangSigninV2(_PluginBase):
     _user_agent: Optional[str] = None
     # 被 Cloudflare 拦截时是否自动切换浏览器模式完成签到
     _browser_mode: bool = True
+    # 是否跳过快速路径，直接走浏览器模式（用于主动验证浏览器模式是否可用）
+    _force_browser: bool = False
+    # 是否使用 curl_cffi（真实 Chrome TLS 指纹）作为快速路径的 HTTP 客户端
+    _use_curl_cffi: bool = True
+    # curl_cffi 的 impersonate 目标；"auto" 表示按 UA 自动匹配，空串表示关闭
+    _impersonate: str = "auto"
     # 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie（懒加载，见 _stored_cf_cookies）
     _cf_cookies: Optional[List[Dict[str, str]]] = None
 
@@ -388,6 +492,16 @@ class CnlangSigninV2(_PluginBase):
         self._user_agent = (config.get("user_agent") or "").strip() or None
         # 默认开启：站点常态启用 Cloudflare，关闭后 requests 被拦截时会直接失败
         self._browser_mode = bool(config.get("browser_mode", True))
+        # 默认关闭：只有用户主动想验证浏览器模式时才跳过快速路径
+        self._force_browser = bool(config.get("force_browser", False))
+        # 默认开启：curl_cffi 未安装时会自动回退宿主网络组件，不影响可用性
+        self._use_curl_cffi = bool(config.get("use_curl_cffi", True))
+        # "auto" 按 UA 自动匹配 Chrome 版本；空串表示关闭 curl_cffi。
+        # 注意：缺失（None）与显式留空（""）语义不同——前者取默认 auto，后者是关闭。
+        raw_impersonate = config.get("impersonate")
+        self._impersonate = (
+            "auto" if raw_impersonate is None else str(raw_impersonate).strip()
+        )
         try:
             self._history_days = max(int(config.get("history_days") or 30), 1)
         except (TypeError, ValueError):
@@ -576,11 +690,16 @@ class CnlangSigninV2(_PluginBase):
     def _execute_signin(self) -> Dict[str, Any]:
         """签到主流程：探测登录态 -> 提交签到 -> 汇总结果 -> 落库并通知。
 
-        先走纯 requests 快速路径；一旦被 Cloudflare 人机验证拦截，按配置切换到
-        浏览器模式完成整轮签到（验证与提交都在浏览器页面上下文内进行）。
+        默认先走 HTTP 快速路径（可用时经 curl_cffi 以真实 Chrome 指纹发出）；一旦被
+        Cloudflare 人机验证拦截，按配置切换到浏览器模式完成整轮签到。开启「强制浏览器
+        模式」时跳过快速路径，直接走浏览器模式——这是主动验证浏览器模式是否可用的手段。
         """
         if not self._cookie:
             return self._record_failure("未配置Cookie")
+
+        if self._force_browser:
+            logger.info("已开启「强制浏览器模式」，跳过 HTTP 快速路径")
+            return self._handle_cloudflare_block()
 
         headers = self._build_headers()
         proxy_hint = "（使用代理）" if self._use_proxy else ""
@@ -680,12 +799,14 @@ class CnlangSigninV2(_PluginBase):
     def _signin_by_browser(self) -> bool:
         """在真实浏览器中完成整轮签到。
 
-        cf_clearance 与 TLS 指纹、User-Agent 绑定，requests 无法复用浏览器拿到的
-        通行证，因此通过验证后的签到提交也必须在浏览器页面上下文内完成。
+        **实测结论（重要）**：站点签到路径上的挑战是 Cloudflare 的 **interactive**
+        类型（Turnstile 勾选框），必须由真实浏览器人工完成。实测已确认以下客户端
+        全部无法通过：纯 requests、curl_cffi（chrome150 指纹 + 完整 Client Hints）、
+        无头 Chrome、以及全新 profile 的有头 Chrome（跑满 150 秒仍未取得
+        ``cf_clearance``）。因此本方法的定位是**尽力而为的兜底**：宿主环境恰好具备
+        真实显示、且浏览器可信度足够时才有机会通过；容器内的 Xvfb 虚拟显示基本无效。
 
-        站点对签到页下发的是**交互式**托管挑战，能否通过几乎完全取决于浏览器自身的
-        可信度。因此这里按可信度从高到低依次尝试多种启动参数，任一尝试拿到签到页即
-        立即停止：
+        尝试顺序（按可信度从高到低），任一尝试拿到签到页即停止：
 
         1. 无头 + 拟人化：宿主默认配置，与宿主自身启动浏览器的方式完全一致；
         2. 有头 + 拟人化：无头 Chromium 是 Cloudflare 下发交互式挑战的常见诱因，
@@ -1494,6 +1615,9 @@ class CnlangSigninV2(_PluginBase):
             "use_proxy": self._use_proxy,
             "user_agent": self._user_agent or "",
             "browser_mode": self._browser_mode,
+            "force_browser": self._force_browser,
+            "use_curl_cffi": self._use_curl_cffi,
+            "impersonate": self._impersonate,
             "onlyonce": False,
             "clear": False,
         }
@@ -1647,28 +1771,12 @@ class CnlangSigninV2(_PluginBase):
         :return: 三元组，见上文
         """
         proxies = self._get_proxies()
-        try:
-            client = RequestUtils(headers=headers, proxies=proxies)
-            if data is not None:
-                response = client.post_res(url, data=data)
-            else:
-                response = client.get_res(url)
-        except Exception as err:
-            logger.error(f"请求 {url} 异常：{err}")
-            return None, None, False
+        response = self._send(url, headers=headers, data=data, proxies=proxies)
 
         if response is None and proxies:
             # 代理不可用时回退直连重试一轮，避免代理失效导致整轮签到报废
             logger.warning("代理请求无响应，自动回退直连重试...")
-            try:
-                client = RequestUtils(headers=headers, proxies=DIRECT_PROXIES)
-                if data is not None:
-                    response = client.post_res(url, data=data)
-                else:
-                    response = client.get_res(url)
-            except Exception as err:
-                logger.error(f"直连重试 {url} 异常：{err}")
-                return None, None, False
+            response = self._send(url, headers=headers, data=data, proxies=DIRECT_PROXIES)
 
         if response is None:
             logger.error(f"请求 {url} 失败，无响应")
@@ -1680,6 +1788,104 @@ class CnlangSigninV2(_PluginBase):
             logger.error(f"请求 {url} 失败，状态码：{response.status_code}")
             return None, response.status_code, False
         return response.text, response.status_code, False
+
+    def _send(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]],
+        data: Optional[Dict[str, Any]],
+        proxies: Optional[Dict[str, str]],
+    ) -> Any:
+        """发送一次请求：优先 curl_cffi，失败时回退宿主 RequestUtils。
+
+        curl_cffi 复刻 Chrome 的 TLS/JA3 + HTTP/2 指纹与请求头顺序，让「带着有效
+        cf_clearance 的快速路径」以最接近真实浏览器的形态发出请求。它**不能**绕过
+        站点的交互式挑战（已实测），作用是降低被重新挑战的概率；未安装 curl_cffi
+        或请求出错时静默回退，完全不影响可用性。
+
+        :param url: 目标地址
+        :param headers: 请求头
+        :param data: 非空时使用 POST
+        :param proxies: 代理映射，None 或全空表示直连
+        :return: 响应对象（具备 status_code / text / headers）；失败返回 None
+        """
+        curl_requests = _import_curl_cffi() if self._use_curl_cffi else None
+        if curl_requests is not None:
+            target = _resolve_impersonate(self._impersonate, self._user_agent)
+            if target:
+                try:
+                    return self._send_via_curl_cffi(
+                        curl_requests,
+                        url,
+                        target=target,
+                        headers=headers,
+                        data=data,
+                        proxies=proxies,
+                    )
+                except Exception as err:  # noqa: BLE001 - 增强路径失败必须回退而非中断
+                    logger.warning(f"curl_cffi 请求失败，回退宿主网络组件：{err}")
+        return self._send_via_request_utils(url, headers=headers, data=data, proxies=proxies)
+
+    def _send_via_curl_cffi(
+        self,
+        curl_requests: Any,
+        url: str,
+        *,
+        target: str,
+        headers: Optional[Dict[str, str]],
+        data: Optional[Dict[str, Any]],
+        proxies: Optional[Dict[str, str]],
+    ) -> Any:
+        """用 curl_cffi 发起请求（真实 Chrome TLS 指纹）。
+
+        :param curl_requests: ``curl_cffi.requests`` 模块
+        :param url: 目标地址
+        :param target: impersonate 目标名
+        :param headers: 请求头
+        :param data: 非空时使用 POST
+        :param proxies: 代理映射
+        :return: curl_cffi 响应对象
+        """
+        kwargs: Dict[str, Any] = {
+            "headers": headers,
+            "timeout": REQUEST_TIMEOUT,
+            "allow_redirects": True,
+            CURL_CFFI_IMPERSONATE_ARG: target,
+        }
+        # curl_cffi 不接受值为 None 的代理项（DIRECT_PROXIES 就是这种形态）
+        proxy_map = {key: value for key, value in (proxies or {}).items() if value}
+        if proxy_map:
+            kwargs["proxies"] = proxy_map
+        logger.info(f"使用 curl_cffi 请求 {url}（impersonate={target}）")
+        if data is not None:
+            return curl_requests.post(url, data=data, **kwargs)
+        return curl_requests.get(url, **kwargs)
+
+    def _send_via_request_utils(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]],
+        data: Optional[Dict[str, Any]],
+        proxies: Optional[Dict[str, str]],
+    ) -> Any:
+        """用宿主 RequestUtils 发起请求；异常时返回 None。
+
+        :param url: 目标地址
+        :param headers: 请求头
+        :param data: 非空时使用 POST
+        :param proxies: 代理映射
+        :return: requests 响应对象；异常时返回 None
+        """
+        try:
+            client = RequestUtils(headers=headers, proxies=proxies)
+            if data is not None:
+                return client.post_res(url, data=data)
+            return client.get_res(url)
+        except Exception as err:  # noqa: BLE001 - 网络异常统一按无响应处理
+            logger.error(f"请求 {url} 异常：{err}")
+            return None
 
     @staticmethod
     def _is_cf_challenge(response: Any) -> bool:
@@ -2251,7 +2457,48 @@ class CnlangSigninV2(_PluginBase):
                                                 'component': 'VCol',
                                                 'props': {
                                                     'cols': 12,
-                                                    'md': 8
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'force_browser',
+                                                            'label': '强制浏览器模式',
+                                                            'color': 'deep-orange',
+                                                            'prepend-icon': 'mdi-flask-outline'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'use_curl_cffi',
+                                                            'label': 'curl_cffi 指纹',
+                                                            'color': 'info',
+                                                            'prepend-icon': 'mdi-fingerprint'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
                                                 },
                                                 'content': [
                                                     {
@@ -2261,7 +2508,26 @@ class CnlangSigninV2(_PluginBase):
                                                             'label': '浏览器UA（User-Agent）',
                                                             'placeholder': '留空使用内置默认 UA',
                                                             'prepend-inner-icon': 'mdi-account-search',
-                                                            'hint': 'cf_clearance 与 UA 绑定：请填写与浏览器完全一致的 UA，否则 Cloudflare 会重新发起验证'
+                                                            'hint': 'cf_clearance 与 UA 绑定：请填写与浏览器完全一致的 UA，否则会被立即拒绝'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'impersonate',
+                                                            'label': '指纹伪装目标',
+                                                            'placeholder': 'auto',
+                                                            'prepend-inner-icon': 'mdi-incognito',
+                                                            'hint': 'auto=按 UA 里的 Chrome 版本自动匹配；也可填 chrome131；留空则关闭 curl_cffi'
                                                         }
                                                     }
                                                 ]
@@ -2282,7 +2548,7 @@ class CnlangSigninV2(_PluginBase):
                                                         'props': {
                                                             'type': 'info',
                                                             'variant': 'tonal',
-                                                            'text': '站点启用了 Cloudflare 人机验证，纯 requests 会被 403 拦截。开启「浏览器模式」后，插件会自动改用宿主内置的无头浏览器完成验证并在浏览器内提交签到。'
+                                                            'text': '站点对签到路径下发了 Cloudflare 交互式人机验证（Turnstile 勾选框），必须由真实浏览器人工完成。实测确认：纯 requests、curl_cffi 指纹伪装、无头/虚拟显示浏览器均无法通过；唯一能直接放行的是有效的 cf_clearance。因此请以「更新 Cookie」为主要手段，浏览器模式仅作兜底。'
                                                         }
                                                     }
                                                 ]
@@ -2611,6 +2877,9 @@ class CnlangSigninV2(_PluginBase):
             "notify_style": "style1",
             "use_proxy": False,
             "browser_mode": True,
+            "force_browser": False,
+            "use_curl_cffi": True,
+            "impersonate": "auto",
             "user_agent": ""
         }
 
