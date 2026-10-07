@@ -133,7 +133,9 @@ CF_ADVICE = (
     "2）F12 → 网络 → 刷新 → 点任意一个发往 cnlang.org 的请求 → 复制请求头里的"
     "完整 Cookie（必须包含 cf_clearance）；\n"
     "3）在同一页面执行 navigator.userAgent，把结果填进「浏览器UA」——"
-    "cf_clearance 与 UA 绑定，不一致会被立即拒绝；\n"
+    "cf_clearance 与 UA 绑定，不一致会被立即拒绝。"
+    "注意：3.6.7 之前的版本可能把这里改成了浏览器模式的 UA（形如 Chrome/154），"
+    "若发现该值与你的真实浏览器不符，请**覆盖掉它**，否则新 Cookie 同样会被拒绝；\n"
     "4）cf_clearance 有效期有限，失效后重复上述步骤即可。"
 )
 # Cloudflare 自管 Cookie（cf_clearance / __cf_bm / cf_chl_* …）。
@@ -269,6 +271,10 @@ KEY_LAST_RESULT = "last_result"
 # 是因为配置在「保存插件配置」时会被前端表单整体覆盖，未在表单里声明的内部字段
 # 会被静默清空。
 KEY_CF_COOKIES = "cf_cookies"
+# 浏览器实际使用的 UA。**必须存插件数据，绝不能写进配置字段**：配置里的「浏览器UA」
+# 是用户为「自己的浏览器 + 自己的 Cookie」设定的，被浏览器模式的 UA 覆盖后，
+# 用户再粘贴一份新鲜 Cookie 也会因 UA 不匹配而立刻失效——等于把唯一可用的方案弄坏。
+KEY_BROWSER_UA = "browser_user_agent"
 
 # 宿主调度器中的一次性任务 ID：同 ID 重复登记只保留最后一次
 JOB_SIGNIN_ONCE = "signin_once"
@@ -419,7 +425,7 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.6"
+    plugin_version = "3.6.7"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -460,6 +466,9 @@ class CnlangSigninV2(_PluginBase):
     _impersonate: str = "auto"
     # 上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie（懒加载，见 _stored_cf_cookies）
     _cf_cookies: Optional[List[Dict[str, str]]] = None
+    # 浏览器实际使用的 UA（懒加载，见 _stored_browser_user_agent）。
+    # 与 _user_agent 严格区分：_user_agent 是用户配置，本字段只用于「用户没配时兜底」。
+    _browser_user_agent: Optional[str] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -842,8 +851,19 @@ class CnlangSigninV2(_PluginBase):
                 continue
             if done:
                 return True
+        # 浏览器模式失败时，必须把「怎么办」一并给出。否则用户只看到一串技术细节
+        # （如「未取得签到页（标题：…）」），完全不知道下一步该做什么。
+        logger.warning(
+            "浏览器模式未能通过 Cloudflare 挑战。站点签到路径的挑战是 interactive 类型"
+            "（Turnstile 勾选框），必须真实浏览器人工完成，自动化浏览器过不去。"
+            "若你的宿主跑在 Docker 容器里（Xvfb 虚拟显示），浏览器模式基本无效，"
+            "建议关闭「浏览器模式」以免每次白等约 2.5 分钟。"
+        )
         self._record_failure(
-            "浏览器模式未通过 Cloudflare 人机验证，未能完成签到：" + "；".join(reasons)
+            "浏览器模式未通过 Cloudflare 人机验证，未能完成签到："
+            + "；".join(reasons)
+            + "\n\n"
+            + CF_ADVICE
         )
         return True
 
@@ -1066,6 +1086,35 @@ class CnlangSigninV2(_PluginBase):
         self._cf_cookies = items
         return items
 
+    def _stored_browser_user_agent(self) -> Optional[str]:
+        """读取上一轮浏览器实际使用的 UA（存插件数据，不占配置字段）。
+
+        :return: 浏览器 UA；无缓存或读取失败时返回 None
+        """
+        if self._browser_user_agent is not None:
+            return self._browser_user_agent
+        try:
+            value = self.get_data(KEY_BROWSER_UA)
+        except Exception as err:  # noqa: BLE001 - 读取失败按无缓存处理
+            logger.debug(f"浏览器模式：读取浏览器 UA 缓存失败：{err}")
+            return None
+        self._browser_user_agent = str(value).strip() if value else None
+        return self._browser_user_agent
+
+    def _effective_user_agent(self) -> Optional[str]:
+        """返回快速路径实际要发送的 UA。
+
+        优先级：**用户显式配置的 UA** > 上一轮浏览器记录的 UA > 内置默认 UA。
+
+        用户配置永远优先：配置里的 UA 是用户为「自己的浏览器 + 自己的 Cookie」设定的，
+        而 ``cf_clearance`` 与 UA 绑定。浏览器模式只有在用户没配 UA 时才允许兜底，
+        **绝不能反过来覆盖用户的配置**——否则用户粘贴一份新鲜 Cookie 也会因 UA 不匹配
+        而立刻失效（这正是 3.6.6 及更早版本实际踩到的坑）。
+
+        :return: UA 字符串；三者都没有时返回 None（调用方回落 DEFAULT_USER_AGENT）
+        """
+        return self._user_agent or self._stored_browser_user_agent()
+
     def _inject_cookies(self, context: Any, page: Any) -> None:
         """把配置 Cookie 与缓存的 Cloudflare 通行证写入浏览器会话。
 
@@ -1122,22 +1171,25 @@ class CnlangSigninV2(_PluginBase):
             logger.warning(f"浏览器模式：Cookie 写入请求头失败（{err}）")
 
     def _refresh_cookies_from_browser(self, context: Any, page: Any) -> None:
-        """把浏览器新签发的 Cookie 分流写回：CF 通行证单独缓存，其余合并进配置。
+        """把浏览器新签发的 Cookie 收进插件数据缓存，**不改动用户的配置字段**。
 
-        Cloudflare 的 cf_clearance 只在签发它的那套浏览器身份下有效，因此**不写进
-        用户配置的 Cookie 字段**（该字段同时供 requests 快速路径使用，混入一批无效值
-        只会让人困惑，也会把用户的登录 Cookie 淹没）；而是单独存进插件数据
-        （``KEY_CF_COOKIES``），下次启动浏览器时**原样注入回去**（含 domain / path）。
+        这是 3.6.7 的重要修正。早期版本会把浏览器会话 Cookie 合并回配置的 Cookie
+        字段、并把浏览器 UA 写进配置的 UA 字段，带来两个真实危害：
 
-        注意这里只是「不写进配置字段」，注入时仍然照常注入——见 ``_inject_cookies``。
-        让浏览器带着上一轮的通行证启动，可以直接跳过首页与签到页的挑战，是最有效的
-        提速手段。
+        1. **覆盖用户配置的 UA**。用户的「浏览器UA」是为「他自己的浏览器 + 他自己的
+           Cookie」设定的，而 cf_clearance 与 UA 绑定。被浏览器模式的 UA（如 Chrome/154）
+           覆盖后，用户再粘贴一份新鲜 Cookie 也会因 UA 不匹配立即失效——**等于把唯一
+           可用的方案弄坏**。
+        2. **Cookie 字段被越滚越大**。每轮都合并浏览器会话 Cookie，实测一次执行里
+           从 16 条涨到 26 条，用户的登录 Cookie 被淹没。
 
-        其余 Cookie（``_auth``、``saltkey`` 等论坛登录态）合并回配置字段，保持快速
-        路径与浏览器会话一致。
+        现在的做法：
 
-        另外必须记录**浏览器实际使用的 UA**：cf_clearance 与 UA 绑定，写回的 Cookie
-        配上一个不同的 UA 会立即失效。
+        - Cloudflare 通行证（cf_clearance / __cf_bm / cf_chl_* …）存进插件数据
+          （``KEY_CF_COOKIES``，带 domain / path），下次启动浏览器时原样注入回去；
+        - 浏览器 UA 存进插件数据（``KEY_BROWSER_UA``），仅在用户**没有**配置 UA 时
+          作为快速路径的兜底（见 ``_effective_user_agent``）；
+        - 用户配置的 Cookie / UA 字段**一个字节都不动**。
 
         :param context: 浏览器上下文
         :param page: 浏览器页面
@@ -1148,33 +1200,27 @@ class CnlangSigninV2(_PluginBase):
             logger.debug(f"浏览器模式：读取浏览器 Cookie 失败：{err}")
             cookies = []
 
-        merged: Dict[str, str] = {}
-        for pair in (self._cookie or "").split(";"):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                merged[key.strip()] = value.strip()
         cf_items: List[Dict[str, str]] = []
+        seen: set = set()
         for item in cookies:
             name = item.get("name")
-            if not name:
+            if not name or not _is_cloudflare_cookie(name):
                 continue
-            value = item.get("value", "")
-            if _is_cloudflare_cookie(name):
-                # 连 domain / path 一起存：同名 Cookie 可能有多条（不同作用域），
-                # 只留 name=value 会把它们压成一条，注入时丢失作用域。
-                cf_items.append(
-                    {
-                        "name": name,
-                        "value": value,
-                        "domain": item.get("domain") or f".{SITE_HOST}",
-                        "path": item.get("path") or "/",
-                    }
-                )
-                merged.pop(name, None)
+            # 连 domain / path 一起存：同名 Cookie 可能有多条（不同作用域），
+            # 只留 name=value 会把它们压成一条，注入时丢失作用域。
+            entry = {
+                "name": str(name),
+                "value": str(item.get("value", "")),
+                "domain": str(item.get("domain") or f".{SITE_HOST}"),
+                "path": str(item.get("path") or "/"),
+            }
+            # 按 (name, domain, path) 去重：注入的缓存 + 浏览器新签发的会同时出现，
+            # 不去重的话缓存会一轮比一轮长（实测 2 -> 5 -> 4 -> 7 条地涨）。
+            fingerprint = (entry["name"], entry["domain"], entry["path"])
+            if fingerprint in seen:
                 continue
-            merged[name] = value
-        if merged:
-            self._cookie = "; ".join(f"{key}={value}" for key, value in merged.items())
+            seen.add(fingerprint)
+            cf_items.append(entry)
 
         if cf_items:
             self._cf_cookies = cf_items
@@ -1194,10 +1240,21 @@ class CnlangSigninV2(_PluginBase):
             logger.debug(f"浏览器模式：读取浏览器 UA 失败：{err}")
             browser_ua = None
         if browser_ua:
-            self._user_agent = browser_ua
-            logger.info(f"浏览器模式：已记录浏览器实际 UA：{browser_ua}")
-        self._save_config()
-        logger.info(f"浏览器模式：已合并浏览器 {len(cookies)} 个 Cookie 并写回配置")
+            self._browser_user_agent = str(browser_ua)
+            try:
+                self.save_data(KEY_BROWSER_UA, self._browser_user_agent)
+            except Exception as err:  # noqa: BLE001 - 缓存失败不影响本次签到结果
+                logger.debug(f"浏览器模式：缓存浏览器 UA 失败：{err}")
+            if self._user_agent:
+                logger.info(
+                    f"浏览器模式：浏览器实际 UA 为 {browser_ua}，"
+                    "但用户已配置 UA，配置值优先，不作覆盖"
+                )
+            else:
+                logger.info(
+                    f"浏览器模式：已记录浏览器实际 UA（{browser_ua}），"
+                    "仅在未配置「浏览器UA」时用于快速路径"
+                )
 
     def _solve_cloudflare(
         self,
@@ -1739,7 +1796,7 @@ class CnlangSigninV2(_PluginBase):
             "Host": SITE_HOST,
             "Cookie": self._cookie or "",
             # Cloudflare 签发的 cf_clearance 与 UA 绑定，配置了自定义 UA 时必须原样发送
-            "User-Agent": self._user_agent or DEFAULT_USER_AGENT,
+            "User-Agent": self._effective_user_agent() or DEFAULT_USER_AGENT,
         }
 
     def _get_proxies(self) -> Optional[Dict[str, str]]:
@@ -1812,7 +1869,7 @@ class CnlangSigninV2(_PluginBase):
         """
         curl_requests = _import_curl_cffi() if self._use_curl_cffi else None
         if curl_requests is not None:
-            target = _resolve_impersonate(self._impersonate, self._user_agent)
+            target = _resolve_impersonate(self._impersonate, self._effective_user_agent())
             if target:
                 try:
                     return self._send_via_curl_cffi(

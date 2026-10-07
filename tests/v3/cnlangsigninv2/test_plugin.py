@@ -1080,9 +1080,11 @@ def test_inject_cookies_skips_when_no_cookie(host):
 
 
 def test_refresh_cookies_records_browser_user_agent(host):
-    """写回 Cookie 时必须同时记录浏览器实际 UA——cf_clearance 与 UA 绑定。
+    """浏览器 UA 存进插件数据，且**绝不覆盖用户配置的 UA**。
 
-    否则写回的 Cookie 配上一个不同的 UA 会立即失效，requests 快速路径永远走不通。
+    配置里的 UA 是用户为「自己的浏览器 + 自己的 Cookie」设定的，而 cf_clearance 与 UA
+    绑定。一旦被浏览器模式的 UA 覆盖，用户再粘贴一份新鲜 Cookie 也会因 UA 不匹配立即
+    失效——等于把唯一可用的方案弄坏（3.6.6 及更早版本实际踩到的坑）。
     """
     module = host.module
     plugin = _enabled_plugin(host, cookie="sid=abc", user_agent="ConfiguredUA")
@@ -1093,14 +1095,85 @@ def test_refresh_cookies_records_browser_user_agent(host):
 
     plugin._refresh_cookies_from_browser(context, page)
 
-    assert plugin._user_agent == "BrowserRealUA"
-    assert plugin.saved_config["user_agent"] == "BrowserRealUA"
+    # 浏览器 UA 进插件数据
+    assert plugin._browser_user_agent == "BrowserRealUA"
+    assert plugin.store[module.KEY_BROWSER_UA] == "BrowserRealUA"
+    # 用户配置的 UA 原样保留
+    assert plugin._user_agent == "ConfiguredUA"
+    # 整个流程不得回写用户配置
+    assert plugin.saved_config == {}
     # Cloudflare 通行证单独缓存（带 domain/path），不污染用户配置的 Cookie 字段
     assert [item["name"] for item in plugin._cf_cookies] == ["cf_clearance"]
     assert plugin._cf_cookies[0]["value"] == "fresh"
     assert plugin.store[module.KEY_CF_COOKIES] == plugin._cf_cookies
     assert "cf_clearance" not in (plugin._cookie or "")
-    assert "sid=abc" in plugin._cookie
+    assert plugin._cookie == "sid=abc"
+
+
+def test_refresh_cookies_never_rewrites_config_cookie(host):
+    """浏览器会话里的论坛 Cookie 不得合并进用户配置的 Cookie 字段。
+
+    早期版本会把浏览器会话 Cookie 合并回去，实测一次执行里从 16 条涨到 26 条，
+    把用户的登录 Cookie 淹没。
+    """
+    plugin = _enabled_plugin(host, cookie="sid=abc", user_agent="ConfiguredUA")
+    context = _FakeContext(
+        cookies=[
+            {"name": "cf_clearance", "value": "fresh"},
+            {"name": "3rir_2132_saltkey", "value": "browser-salt"},
+            {"name": "3rir_2132_sid", "value": "browser-sid"},
+            {"name": "3rir_2132_auth", "value": "browser-auth"},
+        ]
+    )
+
+    plugin._refresh_cookies_from_browser(context, _FakePage())
+
+    assert plugin._cookie == "sid=abc"
+    assert plugin.saved_config == {}
+
+
+def test_refresh_cookies_dedupes_repeated_scope(host):
+    """同一 (name, domain, path) 的重复通行证只缓存一条，避免缓存逐轮膨胀。"""
+    module = host.module
+    plugin = _enabled_plugin(host, cookie="sid=abc")
+    context = _FakeContext(
+        cookies=[
+            {"name": "cf_clearance", "value": "v1", "domain": ".cnlang.org", "path": "/"},
+            {"name": "cf_clearance", "value": "v1", "domain": ".cnlang.org", "path": "/"},
+            {"name": "cf_clearance", "value": "v2", "domain": "cnlang.org", "path": "/"},
+        ]
+    )
+
+    plugin._refresh_cookies_from_browser(context, _FakePage())
+
+    cached = plugin.store[module.KEY_CF_COOKIES]
+    assert len(cached) == 2
+    assert [item["domain"] for item in cached] == [".cnlang.org", "cnlang.org"]
+
+
+def test_effective_user_agent_prefers_configured_over_browser(host):
+    """用户配置的 UA 永远优先于浏览器记录的 UA。"""
+    plugin = _enabled_plugin(host, user_agent="ConfiguredUA")
+    plugin._browser_user_agent = "BrowserRealUA"
+
+    assert plugin._effective_user_agent() == "ConfiguredUA"
+
+
+def test_effective_user_agent_falls_back_to_browser_ua(host):
+    """用户没配 UA 时才用浏览器记录的 UA 兜底。"""
+    module = host.module
+    plugin = _enabled_plugin(host, user_agent="")
+    plugin.store[module.KEY_BROWSER_UA] = "BrowserRealUA"
+    plugin._browser_user_agent = None
+
+    assert plugin._effective_user_agent() == "BrowserRealUA"
+
+
+def test_effective_user_agent_without_any_record(host):
+    """都没有时返回 None，由调用方回落内置默认 UA。"""
+    plugin = _enabled_plugin(host, user_agent="")
+
+    assert plugin._effective_user_agent() is None
 
 
 def test_refresh_cookies_keeps_configured_cookie_when_browser_has_none(host):
@@ -1373,8 +1446,9 @@ def test_browser_mode_falls_back_to_in_page_fetch(host, monkeypatch):
     assert last["success"] is True
     assert last["username"] == "tester"
     assert last["money"] == "777"
-    # 浏览器实际 UA 应被记录，供后续 requests 快速路径复用
-    assert plugin.saved_config["user_agent"] == "RealUA"
+    # 浏览器实际 UA 记录进插件数据，且不覆盖用户配置字段
+    assert plugin.store[module.KEY_BROWSER_UA] == "RealUA"
+    assert "user_agent" not in plugin.saved_config
 
 
 def test_browser_mode_reports_failure_when_both_paths_challenged(host, monkeypatch):
@@ -1395,6 +1469,12 @@ def test_browser_mode_reports_failure_when_both_paths_challenged(host, monkeypat
     last = plugin.get_data(module.KEY_LAST_RESULT)
     assert last["success"] is False
     assert "Cloudflare" in last["content"]
+    # 失败信息必须带上「怎么办」，否则用户只看到一串技术细节
+    assert module.CF_ADVICE in last["content"]
+    assert "cf_clearance" in last["content"]
+    assert "navigator.userAgent" in last["content"]
+    # 必须点明「旧版本可能污染过这个字段」，否则被改坏 UA 的用户照做仍然失败
+    assert "Chrome/154" in last["content"]
     # 无头失败后必须升级到有头模式再试一次
     assert [call["headless"] for call in calls] == [True, False]
 
