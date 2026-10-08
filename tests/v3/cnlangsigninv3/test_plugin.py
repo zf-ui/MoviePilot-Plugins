@@ -9,14 +9,15 @@
 import importlib.util
 import json
 import sys
+import time
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
 import pytest
 
-PLUGIN_ID = "cnlangsigninv2"
+PLUGIN_ID = "cnlangsigninv3"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_FILE = REPO_ROOT / "plugins.v3" / PLUGIN_ID / "__init__.py"
 INDEX_FILE = REPO_ROOT / "package.v3.json"
@@ -293,7 +294,7 @@ def _enabled_plugin(host, **overrides):
     """构造一个已按给定配置初始化的插件实例。"""
     config = {"enabled": True, "cron": "0 7 * * *", "cookie": "a=1; b=2"}
     config.update(overrides)
-    plugin = host.module.CnlangSigninV2()
+    plugin = host.module.CnlangSigninV3()
     plugin.init_plugin(config)
     return plugin
 
@@ -317,14 +318,14 @@ def _record(date, success=True, money="100", content="签到成功"):
 
 def test_metadata_matches_directory_and_index(host):
     """主类名、目录名与 package.v3.json 中的版本必须一致。"""
-    plugin_cls = host.module.CnlangSigninV2
+    plugin_cls = host.module.CnlangSigninV3
     index = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
 
-    assert plugin_cls.__name__ == "CnlangSigninV2"
+    assert plugin_cls.__name__ == "CnlangSigninV3"
     assert PLUGIN_FILE.parent.name == plugin_cls.__name__.lower()
-    assert "CnlangSigninV2" in index
-    assert index["CnlangSigninV2"]["version"] == plugin_cls.plugin_version
-    assert next(iter(index["CnlangSigninV2"]["history"])) == f"v{plugin_cls.plugin_version}"
+    assert "CnlangSigninV3" in index
+    assert index["CnlangSigninV3"]["version"] == plugin_cls.plugin_version
+    assert next(iter(index["CnlangSigninV3"]["history"])) == f"v{plugin_cls.plugin_version}"
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +414,7 @@ def test_onlyonce_registers_host_job_and_resets_flag(host):
 
     assert len(host.scheduler.added) == 1
     added = host.scheduler.added[0]
-    assert added["plugin_id"] == "CnlangSigninV2"
+    assert added["plugin_id"] == "CnlangSigninV3"
     assert added["job_id"] == host.module.JOB_SIGNIN_ONCE
     assert added["delay_seconds"] == 3
     assert plugin.saved_config["onlyonce"] is False
@@ -424,7 +425,7 @@ def test_onlyonce_falls_back_to_background_thread(host, monkeypatch):
     host.scheduler.available = False
     fallback = []
     monkeypatch.setattr(
-        host.module.CnlangSigninV2,
+        host.module.CnlangSigninV3,
         "_run_in_background",
         lambda self, delay_seconds=0: fallback.append(delay_seconds),
     )
@@ -446,7 +447,7 @@ def test_init_plugin_survives_missing_once_job_api(host, monkeypatch):
     monkeypatch.delattr(host.scheduler_module, "add_plugin_once_job", raising=False)
     fallback = []
     monkeypatch.setattr(
-        host.module.CnlangSigninV2,
+        host.module.CnlangSigninV3,
         "_run_in_background",
         lambda self, delay_seconds=0: fallback.append(delay_seconds),
     )
@@ -491,7 +492,7 @@ def test_resolve_timezone_degrades_instead_of_raising(host, monkeypatch):
 
     assert module._resolve_timezone() is None
 
-    plugin = module.CnlangSigninV2()
+    plugin = module.CnlangSigninV3()
     plugin._cron = "0 7 * * *"
     # 表达式合法时仍应构建出触发器，只是不再指定时区
     assert plugin._build_trigger() is not None
@@ -517,7 +518,7 @@ def test_stop_service_is_idempotent(host):
 
 def test_get_service_empty_when_disabled(host):
     """插件停用时不注册定时服务。"""
-    plugin = host.module.CnlangSigninV2()
+    plugin = host.module.CnlangSigninV3()
     plugin.init_plugin({"enabled": False, "cron": "0 7 * * *"})
 
     assert plugin.get_service() == []
@@ -536,7 +537,7 @@ def test_get_service_registers_cron_trigger(host):
     services = plugin.get_service()
 
     assert len(services) == 1
-    assert services[0]["id"] == "CnlangSigninV2.Signin"
+    assert services[0]["id"] == "CnlangSigninV3.Signin"
     assert services[0]["func"] == plugin._scheduled_signin
     assert services[0]["trigger"] is not None
 
@@ -660,9 +661,9 @@ def test_build_headers_contains_cookie_and_fixed_accept_encoding(host):
 
 def test_search_returns_first_group_or_none(host):
     """正则提取未命中时返回 None。"""
-    assert host.module.CnlangSigninV2._search(r"a(\d+)", "a12b") == "12"
-    assert host.module.CnlangSigninV2._search(r"x(\d+)", "a12b") is None
-    assert host.module.CnlangSigninV2._search(r"a(\d+)", "") is None
+    assert host.module.CnlangSigninV3._search(r"a(\d+)", "a12b") == "12"
+    assert host.module.CnlangSigninV3._search(r"x(\d+)", "a12b") is None
+    assert host.module.CnlangSigninV3._search(r"a(\d+)", "") is None
 
 
 # ---------------------------------------------------------------------------
@@ -699,12 +700,12 @@ def test_is_cf_challenge_detects_official_marker(host):
     """Cloudflare 官方标记 Cf-Mitigated: challenge 应立即判定为挑战页。"""
     response = host.response_cls(403, "", headers={"Cf-Mitigated": "challenge"})
 
-    assert host.module.CnlangSigninV2._is_cf_challenge(response) is True
+    assert host.module.CnlangSigninV3._is_cf_challenge(response) is True
 
 
 def test_is_cf_challenge_falls_back_to_body_heuristic(host):
     """无官方标记时，仅当 Server 为 cloudflare 且正文含挑战特征才判定拦截。"""
-    cls = host.module.CnlangSigninV2
+    cls = host.module.CnlangSigninV3
 
     assert (
         cls._is_cf_challenge(
@@ -730,7 +731,7 @@ def test_is_cf_challenge_falls_back_to_body_heuristic(host):
 
 def test_is_cf_challenge_tolerates_missing_headers(host):
     """响应对象没有 headers 属性时不得抛异常，按未拦截处理。"""
-    assert host.module.CnlangSigninV2._is_cf_challenge(_BareResponse()) is False
+    assert host.module.CnlangSigninV3._is_cf_challenge(_BareResponse()) is False
 
 
 def test_request_flags_cloudflare_challenge_with_status(host):
@@ -821,7 +822,7 @@ def test_execute_signin_switches_to_browser_mode_on_cloudflare(host, monkeypatch
         )
         return True
 
-    monkeypatch.setattr(module.CnlangSigninV2, "_signin_by_browser", _fake_browser)
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browser", _fake_browser)
 
     result = plugin.signin()
 
@@ -1000,7 +1001,7 @@ def _install_browser_stub(monkeypatch, context):
 
 def test_is_cf_challenge_page_covers_title_and_body(host):
     """挑战页识别应同时覆盖标题特征与正文特征，普通页面不得误判。"""
-    cls = host.module.CnlangSigninV2
+    cls = host.module.CnlangSigninV3
 
     assert cls._is_cf_challenge_page("<html></html>", "Just a moment...") is True
     assert cls._is_cf_challenge_page("<html></html>", "请稍候...") is True
@@ -1348,7 +1349,7 @@ def test_solve_cloudflare_limits_checkbox_clicks(host, monkeypatch):
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     clicks = []
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_try_click_cf_checkbox", staticmethod(lambda page: clicks.append(1) or True)
+        host.module.CnlangSigninV3, "_try_click_cf_checkbox", staticmethod(lambda page: clicks.append(1) or True)
     )
     page = _FakePage(html="<html><body>" + "x" * 800 + "</body></html>", title="Just a moment...")
 
@@ -1371,10 +1372,10 @@ def test_browser_mode_does_not_override_user_agent_by_default(host, monkeypatch)
     calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        host.module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        host.module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     plugin._signin_by_browser()
@@ -1390,10 +1391,10 @@ def test_browser_mode_passes_explicitly_configured_user_agent(host, monkeypatch)
     calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        host.module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        host.module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     plugin._signin_by_browser()
@@ -1411,7 +1412,7 @@ def test_sign_page_via_fetch_rejects_challenge_response(host, monkeypatch):
     page = _FakePage()
     page.fetch_map = {module.SIGN_PAGE_URL: CF_CHALLENGE_BODY}
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: True
     )
 
     assert plugin._sign_page_via_fetch(_FakeBrowserContext(pages=[page]), page) == ""
@@ -1434,7 +1435,7 @@ def test_browser_mode_falls_back_to_in_page_fetch(host, monkeypatch):
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     # 文档导航（签到页）始终被挑战，但首页正常
     monkeypatch.setattr(
-        module.CnlangSigninV2,
+        module.CnlangSigninV3,
         "_solve_cloudflare",
         lambda self, page, **kwargs: "首页" in (kwargs.get("label") or ""),
     )
@@ -1459,10 +1460,10 @@ def test_browser_mode_reports_failure_when_both_paths_challenged(host, monkeypat
     calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page, _FakePage()]))
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     assert plugin._signin_by_browser() is True
@@ -1494,10 +1495,10 @@ def test_browser_launch_passes_host_humanize_settings(host, monkeypatch):
     monkeypatch.setattr(host.module.settings, "CLOAKBROWSER_HUMANIZE", True, raising=False)
     monkeypatch.setattr(host.module.settings, "CLOAKBROWSER_HUMAN_PRESET", "careful", raising=False)
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+        host.module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: True
     )
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+        host.module.CnlangSigninV3, "_finish_browser_signin", lambda self, page, html: True
     )
 
     plugin._signin_by_browser()
@@ -1576,10 +1577,10 @@ def test_browser_flow_warms_up_homepage_before_sign_page(host, monkeypatch):
     _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: True
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+        module.CnlangSigninV3, "_finish_browser_signin", lambda self, page, html: True
     )
 
     plugin._signin_by_browser()
@@ -1599,10 +1600,10 @@ def test_browser_flow_persists_cf_cookies_right_after_homepage(host, monkeypatch
     _install_browser_stub(monkeypatch, context)
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: True
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: True
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_finish_browser_signin", lambda self, page, html: True
+        module.CnlangSigninV3, "_finish_browser_signin", lambda self, page, html: True
     )
 
     plugin._signin_by_browser()
@@ -1618,10 +1619,10 @@ def test_browser_flow_continues_when_homepage_warmup_fails(host, monkeypatch):
     _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     plugin._signin_by_browser()
@@ -1652,12 +1653,12 @@ def test_browser_mode_retries_headed_after_headless_challenge(host, monkeypatch)
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     # 只让无头那次卡住：有头页面视为已通过
     monkeypatch.setattr(
-        module.CnlangSigninV2,
+        module.CnlangSigninV3,
         "_solve_cloudflare",
         lambda self, page, **kwargs: page is headed_page,
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     assert plugin._signin_by_browser() is True
@@ -1688,10 +1689,10 @@ def test_browser_mode_survives_headed_launch_failure(host, monkeypatch):
     monkeypatch.setitem(sys.modules, "app.sdk.browser", module_stub)
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     assert plugin._signin_by_browser() is True
@@ -2020,7 +2021,7 @@ def test_get_form_exposes_anti_bot_settings(host):
 
 def test_get_command_registers_remote_action(host):
     """远程命令应注册为 PluginAction 并携带本插件动作标识。"""
-    commands = host.module.CnlangSigninV2.get_command()
+    commands = host.module.CnlangSigninV3.get_command()
 
     assert len(commands) == 1
     assert commands[0]["cmd"] == "/cnlang_signin"
@@ -2247,10 +2248,10 @@ def test_force_browser_skips_fast_path(host, monkeypatch):
     calls = _install_browser_stub(monkeypatch, _FakeBrowserContext(pages=[page]))
     monkeypatch.setattr(host.module.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_solve_cloudflare", lambda self, page, **kwargs: False
+        host.module.CnlangSigninV3, "_solve_cloudflare", lambda self, page, **kwargs: False
     )
     monkeypatch.setattr(
-        host.module.CnlangSigninV2, "_sign_page_via_fetch", lambda self, context, page: ""
+        host.module.CnlangSigninV3, "_sign_page_via_fetch", lambda self, context, page: ""
     )
 
     plugin.signin()
@@ -2313,3 +2314,301 @@ def test_get_form_exposes_curl_cffi_settings(host):
     assert defaults["use_curl_cffi"] is True
     assert defaults["impersonate"] == "auto"
     assert defaults["force_browser"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare 通行证有效期观测
+# ---------------------------------------------------------------------------
+
+
+def test_split_cookie_header_keeps_order_and_skips_noise(host):
+    """Cookie 头解析应保持顺序，并跳过没有 '=' 的片段。"""
+    module = host.module
+    assert module._split_cookie_header("  a=1 ; ; b=2; c=3 ") == [
+        ("a", "1"),
+        ("b", "2"),
+        ("c", "3"),
+    ]
+    assert module._split_cookie_header(None) == []
+    assert module._split_cookie_header("noequals") == []
+
+
+def test_cf_clearance_values_returns_every_scope(host):
+    """同名 cf_clearance 可能有多条（作用域不同），必须全部取出。"""
+    module = host.module
+    header = "cf_clearance=one; 3rir_2132_sid=x; cf_clearance=two"
+    assert module._cf_clearance_values(header) == ["one", "two"]
+    assert module._cf_clearance_values("a=1") == []
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("abc-1759900000-1-deadbeef", 1759900000),
+        ("1759900000", 1759900000),
+        ("abc-1-deadbeef", None),  # 没有 10 位段
+        ("abc-12345678901234-x", None),  # 位数不对
+        ("abc-9999999999-x", None),  # 超出上界
+        ("abc-1000000000-x", None),  # 低于下界
+        ("deadbeef", None),
+        ("", None),
+    ],
+)
+def test_embedded_cf_timestamp_only_accepts_plausible_stamps(host, value, expected):
+    """只接受「整段 10 位数字且落在合理区间」的时间戳，避免误判随机 hex。"""
+    assert host.module._embedded_cf_timestamp(value) == expected
+
+
+def test_humanize_seconds_formats_units(host):
+    """秒数应格式化为可读文本，且不出现 '0 分钟' 这类冗余单位。"""
+    humanize = host.module.CnlangSigninV3._humanize_seconds
+    assert humanize(45) == "45 秒"
+    assert humanize(90) == "1 分钟"
+    assert humanize(7200) == "2 小时"
+    assert humanize(3720) == "1 小时 2 分钟"
+    assert humanize(86400 * 2 + 3600 * 3) == "2 天 3 小时"
+    assert humanize(86400 * 2) == "2 天"
+    assert humanize(-5) == "0 秒"  # 负数被夹到 0，不显示「-5 秒」
+    assert humanize("bad") == "bad"
+
+
+def test_set_cookie_values_prefers_get_list(host):
+    """优先使用 get_list（httpx 形态），否则回退到 get（requests 形态）。"""
+    module = host.module
+
+    class _HeadersWithList:
+        def get_list(self, name):
+            assert name == "set-cookie"
+            return ["a=1", "b=2"]
+
+        def get(self, name):  # pragma: no cover - 不应被调用
+            raise AssertionError("get_list 可用时不应回退到 get")
+
+    assert module._set_cookie_values(_HeadersWithList()) == ["a=1", "b=2"]
+    assert module._set_cookie_values({"Set-Cookie": "cf_clearance=x"}) == ["cf_clearance=x"]
+    assert module._set_cookie_values(None) == []
+    assert module._set_cookie_values({}) == []
+
+
+def test_parse_http_date_handles_rfc1123(host):
+    """HTTP 日期应按 UTC 解析为 Unix 秒。"""
+    module = host.module
+    expected = int(datetime(2026, 10, 21, 7, 28, tzinfo=timezone.utc).timestamp())
+    assert module._parse_http_date("Wed, 21 Oct 2026 07:28:00 GMT") == expected
+    assert module._parse_http_date("not a date") is None
+    assert module._parse_http_date("") is None
+
+
+def test_observe_cf_expiry_records_max_age(host):
+    """站点下发 Set-Cookie 时应记录 Max-Age 推出的到期时间。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin._observe_cf_expiry({"Set-Cookie": "cf_clearance=abc; Path=/; Max-Age=1800"})
+
+    state = plugin.store[module.KEY_CF_EXPIRY]
+    assert state["source"] == "response"
+    assert state["expires_at"] - state["observed_at"] == 1800
+
+
+def test_observe_cf_expiry_parses_expires_attribute(host):
+    """没有 Max-Age 时应回退解析 Expires。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin._observe_cf_expiry(
+        {"Set-Cookie": "cf_clearance=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT"}
+    )
+    expected = int(datetime(2026, 10, 21, 7, 28, tzinfo=timezone.utc).timestamp())
+    assert plugin.store[module.KEY_CF_EXPIRY]["expires_at"] == expected
+
+
+def test_observe_cf_expiry_ignores_other_cookies(host):
+    """非 cf_clearance 的 Cookie 不应被记录。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin._observe_cf_expiry({"Set-Cookie": "3rir_2132_sid=abc; Max-Age=3600"})
+    assert module.KEY_CF_EXPIRY not in plugin.store
+
+
+def test_observe_cf_expiry_skips_cookie_without_expiry(host):
+    """会话级 Cookie（没有 Max-Age / Expires）不应编造到期时间。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin._observe_cf_expiry({"Set-Cookie": "cf_clearance=abc; Path=/"})
+    assert module.KEY_CF_EXPIRY not in plugin.store
+
+
+def test_observe_browser_cf_expiry_records_zone_ttl(host):
+    """浏览器签发的通行证应记录为 browser 来源。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    now = int(time.time())
+    plugin._observe_browser_cf_expiry(now + 1800)
+
+    state = plugin.store[module.KEY_CF_EXPIRY]
+    assert state["source"] == "browser"
+    assert state["expires_at"] == now + 1800
+
+
+def test_observe_browser_cf_expiry_ignores_session_cookie(host):
+    """expires <= 0（会话级）或缺失时不应记录。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin._observe_browser_cf_expiry(0)
+    plugin._observe_browser_cf_expiry(-1)
+    plugin._observe_browser_cf_expiry(None)
+    assert module.KEY_CF_EXPIRY not in plugin.store
+
+
+def test_cf_status_reports_observed_expiry(host):
+    """站点下发过到期时间时，应报告精确的剩余时长。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    now = int(time.time())
+    plugin._cf_expiry = {"expires_at": now + 1800, "observed_at": now, "source": "response"}
+
+    text = plugin._cf_clearance_status()
+    assert "有效期至" in text
+    assert "30 分钟" in text
+
+
+def test_cf_status_reports_expired_observation(host):
+    """已过期的观测应提示重新复制 Cookie。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    now = int(time.time())
+    plugin._cf_expiry = {"expires_at": now - 600, "observed_at": now - 2400, "source": "response"}
+
+    text = plugin._cf_clearance_status()
+    assert "过期" in text
+    assert "重新复制 Cookie" in text
+
+
+def test_cf_status_uses_embedded_timestamp_as_expiry(host):
+    """值内嵌的时间戳在未来时，应判定为到期时间。"""
+    module = host.module
+    now = int(time.time())
+    plugin = _enabled_plugin(host, cookie=f"cf_clearance=abc-{now + 3600}-1-x; b=2")
+    plugin._cf_expiry = {}
+
+    text = plugin._cf_clearance_status()
+    assert "内嵌时间戳" in text
+    assert "到期" in text
+    assert "1 小时" in text
+
+
+def test_cf_status_uses_embedded_timestamp_as_issue_time(host):
+    """值内嵌的时间戳在过去时（签到仍成功），应判定为签发时间。"""
+    module = host.module
+    now = int(time.time())
+    plugin = _enabled_plugin(host, cookie=f"cf_clearance=abc-{now - 3600}-1-x")
+    plugin._cf_expiry = {}
+
+    text = plugin._cf_clearance_status()
+    assert "签发" in text
+
+
+def test_cf_status_is_honest_when_nothing_available(host):
+    """既没有站点下发、值里也没有时间戳时，必须明说无法确定而不是编造日期。"""
+    module = host.module
+    plugin = _enabled_plugin(host, cookie="cf_clearance=opaquevalue; b=2")
+    plugin._cf_expiry = {}
+
+    text = plugin._cf_clearance_status()
+    assert "无法确定" in text
+    assert str(module.CF_DEFAULT_TTL_MINUTES) in text
+
+
+def test_cf_status_reports_missing_cookie(host):
+    """Cookie 里没有 cf_clearance 时应明确指出。"""
+    module = host.module
+    plugin = _enabled_plugin(host, cookie="b=2")
+    plugin._cf_expiry = {}
+
+    assert "未在配置的 Cookie 中找到" in plugin._cf_clearance_status()
+
+
+def test_cf_status_keeps_browser_ttl_separate(host):
+    """浏览器观测到的是站点级 TTL，不能冒充这份 Cookie 的到期时间。"""
+    module = host.module
+    now = int(time.time())
+    plugin = _enabled_plugin(host, cookie="cf_clearance=opaquevalue")
+    plugin._cf_expiry = {"expires_at": now + 1800, "observed_at": now, "source": "browser"}
+
+    text = plugin._cf_clearance_status()
+    assert "无法确定" in text
+    assert "站点通行证有效期实测约 30 分钟" in text
+
+
+def test_cf_survival_note_uses_last_success(host):
+    """存活时长应基于上一次成功签到的时间。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin.save_data(module.KEY_LAST_SUCCESS, int(time.time()) - 7200)
+
+    note = plugin._cf_survival_note()
+    assert "上次成功签到" in note
+    assert "2 小时" in note
+
+
+def test_cf_survival_note_empty_without_record(host):
+    """没有成功记录时不显示这一行。"""
+    plugin = _enabled_plugin(host)
+    assert plugin._cf_survival_note() == ""
+
+
+def test_request_observes_cf_expiry_from_response(host):
+    """请求路径应把响应里的 Set-Cookie 交给观测逻辑。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    _StubRequestUtils.routes = {
+        module.SIGN_PAGE_URL: _StubResponse(
+            status_code=200,
+            text="ok",
+            headers={"Set-Cookie": "cf_clearance=abc; Max-Age=1800"},
+        )
+    }
+
+    body, status, blocked = plugin._request(
+        module.SIGN_PAGE_URL, headers={"Cookie": "a=1"}
+    )
+    assert (body, status, blocked) == ("ok", 200, False)
+    assert plugin.store[module.KEY_CF_EXPIRY]["source"] == "response"
+
+
+def test_record_success_includes_cf_status_and_marks_last_success(host):
+    """签到成功的通知里要带上通行证有效期，并记下成功时间。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    now = int(time.time())
+    plugin._cf_expiry = {"expires_at": now + 1800, "observed_at": now, "source": "response"}
+
+    result = plugin._record_success(
+        username="tester", total_signs=3, money="120", content="签到成功"
+    )
+
+    assert "Cloudflare 通行证" in result["message"]
+    assert "有效期至" in result["message"]
+    assert module.KEY_LAST_SUCCESS in plugin.store
+
+
+def test_record_failure_appends_survival_note_for_cloudflare(host):
+    """被 Cloudflare 拦截时，失败信息要带上「上次成功 + 存活时长」。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin.save_data(module.KEY_LAST_SUCCESS, int(time.time()) - 3600)
+
+    result = plugin._record_failure("浏览器模式未通过 Cloudflare 人机验证，未能完成签到")
+
+    assert "上次成功签到" in result["content"]
+    assert "1 小时" in result["content"]
+
+
+def test_record_failure_leaves_other_reasons_untouched(host):
+    """非 Cloudflare 的失败原因不应被追加存活时长。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    plugin.save_data(module.KEY_LAST_SUCCESS, int(time.time()) - 3600)
+
+    result = plugin._record_failure("未配置Cookie")
+
+    assert result["content"] == "未配置Cookie"

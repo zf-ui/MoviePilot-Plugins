@@ -1,13 +1,25 @@
-# 国语视界签到V3 (CnlangSigninV2)
+# 国语视界签到V3 (CnlangSigninV3)
 
 国语视界（[cnlang.org](https://bbs.cnlang.org/)）自动签到助手，按 MoviePilot **V3**
 插件开发规范实现。
 
-- 插件 ID：`CnlangSigninV2`
-- 插件目录：`plugins.v3/cnlangsigninv2/`
-- 插件版本：`3.6.7`
+- 插件 ID：`CnlangSigninV3`
+- 插件目录：`plugins.v3/cnlangsigninv3/`
+- 插件版本：`3.7.0`
 - 主系统要求：`>=3.0.0`
 
+> **v3.7.0 起插件改用独立 ID `CnlangSigninV3`，不再占用上游的 `CnlangSigninV2`。**
+> 此前为了让已安装用户的配置与签到数据不被孤立，本插件刻意沿用了上游
+> [xijin285/MoviePilot-Plugins](https://github.com/xijin285/MoviePilot-Plugins) 的插件 ID，
+> 结果两个仓库提供同一个 ID、**MoviePilot 按 ID 安装导致互相覆盖**——实测出现过插件在
+> 「国语视界签到V2」与「国语视界签到V3」之间来回跳、修复被上游版本静默覆盖的情况。
+> 现在两者可以共存、互不干扰。**代价是配置不会自动迁移**，请按
+> [从 V2 迁移](#从-v2-迁移) 重新填写一次。
+>
+> **v3.7.0 还新增了 Cloudflare 通行证有效期上报**：签到成功时会在日志与通知里告诉你
+> `cf_clearance` 什么时候失效，以及本站通行证实测能活多久。详见
+> [v3.7.0 变更说明](#v370-变更说明)。
+>
 > **v3.6.7 修复了一个会「弄坏唯一可用方案」的严重缺陷。** 3.6.6 及更早版本在浏览器模式
 > 运行后，会把**浏览器实际的 UA 写进你的「浏览器UA」配置**、并把浏览器会话 Cookie
 > **合并进你的 Cookie 配置**。由于 `cf_clearance` 与 UA 绑定，你的 UA 一旦被改成
@@ -78,7 +90,7 @@
 
 ## 插件 API
 
-所有接口都需要 `bear` 鉴权，最终路径为 `/api/v1/plugin/CnlangSigninV2/<path>`。
+所有接口都需要 `bear` 鉴权，最终路径为 `/api/v1/plugin/CnlangSigninV3/<path>`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -86,6 +98,70 @@
 | GET | `/history` | 签到历史明细与统计结果 |
 | POST | `/signin` | 立即执行一次签到，返回本次结果 |
 | POST | `/history/clear` | 清空签到历史与最近结果 |
+
+## 从 V2 迁移
+
+3.7.0 起插件 ID 变为 `CnlangSigninV3`、配置前缀变为 `cnlangsignin_v3_`，因此**旧插件的
+配置不会自动带过来**。迁移步骤：
+
+1. 在插件商店里更新本仓库，安装「国语视界签到**V3**」。
+2. 按 [获取 Cookie](#获取-cookie) 重新复制一份**完整**的 Cookie（必须含 `cf_clearance`），
+   并把「浏览器UA」填成与导出 Cookie 时**完全一致**的 `navigator.userAgent`。
+3. 按需重新设置签到周期、通知样式等。
+4. 卸载或停用旧的「国语视界签到V2」（若它来自上游仓库，留着不用即可）。
+
+> 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
+> 版本行为不一致，风险高于让用户重填一次。
+
+## v3.7.0 变更说明
+
+### 改用独立插件 ID
+
+| 项 | 旧 | 新 |
+| --- | --- | --- |
+| 插件 ID | `CnlangSigninV2` | `CnlangSigninV3` |
+| 插件目录 | `plugins.v3/cnlangsigninv2/` | `plugins.v3/cnlangsigninv3/` |
+| 配置前缀 | `cnlangsignin_v2_` | `cnlangsignin_v3_` |
+
+起因：本仓库与上游 `xijin285/MoviePilot-Plugins` 都提供插件 ID `CnlangSigninV2`，
+MoviePilot 按 ID 安装，两者互相覆盖。实测证据（同一天的两段日志）：
+
+```
+10/07 13:35  使用 curl_cffi 请求 …（impersonate=chrome150）          <- 本插件 3.6.6
+10/08 20:54  开始初始化插件... / 获取基本信息失败-status_code=无响应    <- 上游 2.5.8
+```
+
+即：修复被上游版本**静默覆盖**了，而用户完全看不出原因。改为独立 ID 后不再冲突。
+
+### 新增：cf_clearance 有效期上报
+
+Cloudflare 的 Challenge Passage（通行证寿命）是**站点侧**配置，外部读不到，官方文档
+只给了「默认 30 分钟」。因此插件按可靠性分三级上报，并且**绝不编造日期**：
+
+| 来源 | 输出示例 |
+| --- | --- |
+| 站点在响应里下发 `Set-Cookie`（`Max-Age` / `Expires`）——最权威 | `Cloudflare 通行证：有效期至 2026-10-08 22:16（剩余约 30 分钟）` |
+| Cookie 值内嵌时间戳且落在未来 | `Cloudflare 通行证内嵌时间戳：2026-10-08 22:16 到期（剩余约 30 分钟）` |
+| Cookie 值内嵌时间戳但已过去（签到仍成功） | `Cloudflare 通行证内嵌时间戳：2026-10-08 21:16 签发（12 分钟前）` |
+| 都没有 | `Cloudflare 通行证：到期时间无法确定（站点未下发，Cookie 值里也没有可解析的时间戳；Cloudflare 默认 30 分钟）` |
+
+浏览器模式运行时还会记录浏览器签发的 `cf_clearance` 的 `expires`，据此报出**站点级
+Challenge Passage 的实测长度**——这是唯一能拿到的真实 TTL 数据。它代表站点配置、
+不等于你那份 Cookie 的确切到期时间，因此会分开陈述：
+
+```
+Cloudflare 通行证：到期时间无法确定（…）；站点通行证有效期实测约 30 分钟（浏览器观测于 2026-10-08 21:14）
+```
+
+### 新增：Cookie 存活时长
+
+被 Cloudflare 拦截时，失败通知会附带：
+
+```
+上次成功签到：2026-10-08 21:18（9 小时 42 分钟前）
+```
+
+这是判断「本站通行证到底能活多久」的唯一实测依据，比任何猜测都可靠。
 
 ## v3.6.7 修复说明
 
@@ -474,16 +550,16 @@ Content-Type: text/html; charset=UTF-8
 ### 其他
 
 - 5 套通知样式由重复的字符串拼接收敛为模块级模板表；
-- 新增 43 个单元测试（`tests/v3/cnlangsigninv2/`）。
+- 新增 43 个单元测试（`tests/v3/cnlangsigninv3/`）。
 
 ## 开发与测试
 
 ```bash
 # 在 MoviePilot 宿主环境中运行
-../MoviePilot/.venv/bin/python -m compileall plugins.v3/cnlangsigninv2
+../MoviePilot/.venv/bin/python -m compileall plugins.v3/cnlangsigninv3
 ../MoviePilot/.venv/bin/python .github/scripts/check_plugin_versions.py \
   package.json package.v2.json package.v3.json
-../MoviePilot/.venv/bin/python -m pytest tests/v3/cnlangsigninv2
+../MoviePilot/.venv/bin/python -m pytest tests/v3/cnlangsigninv3
 ```
 
 测试使用轻量桩模块提供宿主接口，不访问真实站点，可在任意 Python 3.12+ 环境运行

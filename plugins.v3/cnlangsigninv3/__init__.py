@@ -1,7 +1,7 @@
 """国语视界（cnlang.org）自动签到插件 —— 按 MoviePilot V3 插件开发规范重写。
 
-主类 ``CnlangSigninV2`` 与插件 ID 一致，插件目录 ``cnlangsigninv2`` 为类名的小写形式，
-主类定义在本文件（``plugins.v3/cnlangsigninv2/__init__.py``）。
+主类 ``CnlangSigninV3`` 与插件 ID 一致，插件目录 ``cnlangsigninv3`` 为类名的小写形式，
+主类定义在本文件（``plugins.v3/cnlangsigninv3/__init__.py``）。
 
 相对旧版 V2 实现，本次重写遵守的 V3 约定：
 
@@ -22,6 +22,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
@@ -145,6 +146,8 @@ CF_ADVICE = (
 # （见 _refresh_cookies_from_browser）。
 CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfduid")
 CF_COOKIE_PREFIXES = ("cf_chl", "__cf")
+# 通行证本体：与 UA 绑定，有效期由站点侧的 Challenge Passage 决定
+CF_CLEARANCE_NAME = "cf_clearance"
 # 单次挑战等待预算（秒）。挑战过程不可中断：中途 reload 会让 Turnstile 的进度归零，
 # 因此这里给单次尝试一个长预算，而不是「短等待 + 反复重载」。
 CF_CHALLENGE_BUDGET = 60
@@ -261,6 +264,118 @@ def _resolve_impersonate(target: Optional[str], user_agent: Optional[str]) -> Op
         return CURL_CFFI_DEFAULT_TARGET
     return max(candidates)[1]
 
+
+def _split_cookie_header(cookie_header: Optional[str]) -> List[Tuple[str, str]]:
+    """把 Cookie 头拆成 ``(name, value)`` 列表，保持出现顺序。
+
+    :param cookie_header: 形如 ``a=1; b=2`` 的 Cookie 头
+    :return: 键值对列表，跳过没有 ``=`` 的片段
+    """
+    pairs: List[Tuple[str, str]] = []
+    for chunk in str(cookie_header or "").split(";"):
+        name, separator, value = chunk.partition("=")
+        name = name.strip()
+        if separator and name:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+def _cf_clearance_values(cookie_header: Optional[str]) -> List[str]:
+    """取出 Cookie 头里所有 ``cf_clearance`` 的值。
+
+    同名 Cookie 可能因作用域不同而存在多条，这里全部返回，由调用方决定如何展示。
+
+    :param cookie_header: Cookie 头
+    :return: 值列表，可能为空
+    """
+    return [
+        value
+        for name, value in _split_cookie_header(cookie_header)
+        if name == CF_CLEARANCE_NAME
+    ]
+
+
+def _embedded_cf_timestamp(value: str) -> Optional[int]:
+    """从 ``cf_clearance`` 的值里提取内嵌的 Unix 时间戳；无法确认时返回 None。
+
+    Cloudflare 没有公开这个值的格式，因此这里只接受「被 ``-`` 分隔、长度恰为 10 位、
+    且落在 ``CF_TIMESTAMP_MIN ~ CF_TIMESTAMP_MAX`` 区间」的**整段**数字。
+    宁可返回 None 让上层报「无法确定」，也不要把随机 hex 里的数字当成时间戳误导用户。
+
+    :param value: ``cf_clearance`` 的值
+    :return: Unix 秒；没有可信时间戳时返回 None
+    """
+    for segment in str(value or "").split("-"):
+        if len(segment) != 10 or not segment.isdigit():
+            continue
+        stamp = int(segment)
+        if CF_TIMESTAMP_MIN <= stamp <= CF_TIMESTAMP_MAX:
+            return stamp
+    return None
+
+
+def _format_timestamp(stamp: Any) -> str:
+    """把 Unix 秒格式化成本地 ``YYYY-MM-DD HH:MM``。
+
+    :param stamp: Unix 秒
+    :return: 可读时间字符串；无法转换时原样返回
+    """
+    try:
+        return datetime.fromtimestamp(int(stamp)).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, TypeError, ValueError):
+        return str(stamp)
+
+
+def _set_cookie_values(headers: Any) -> List[str]:
+    """尽量完整地取出响应里所有 ``Set-Cookie`` 值。
+
+    不同 HTTP 客户端的 ``headers`` 形态不一：httpx 提供 ``get_list``，requests 与
+    curl_cffi 会把多条合并成一个逗号分隔的字符串。这里逐级降级取值，任何一步失败
+    都只当作「没有」，不影响主流程。
+
+    :param headers: 响应头对象
+    :return: Set-Cookie 原始值列表
+    """
+    if headers is None:
+        return []
+    for getter in ("get_list", "getlist"):
+        method = getattr(headers, getter, None)
+        if not callable(method):
+            continue
+        try:
+            values = method("set-cookie")
+        except Exception:  # noqa: BLE001 - 取值失败按「没有」处理
+            values = None
+        if values:
+            return [str(item) for item in values]
+    try:
+        raw = headers.get("Set-Cookie") or headers.get("set-cookie")
+    except Exception:  # noqa: BLE001 - 非映射型 headers
+        return []
+    return [str(raw)] if raw else []
+
+
+def _parse_http_date(value: str) -> Optional[int]:
+    """把 HTTP 日期（RFC 1123）解析成 Unix 秒；解析失败返回 None。
+
+    :param value: ``Expires`` 字段的值
+    :return: Unix 秒；无法解析时返回 None
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    try:
+        return int(parsed.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
 
@@ -275,6 +390,21 @@ KEY_CF_COOKIES = "cf_cookies"
 # 是用户为「自己的浏览器 + 自己的 Cookie」设定的，被浏览器模式的 UA 覆盖后，
 # 用户再粘贴一份新鲜 Cookie 也会因 UA 不匹配而立刻失效——等于把唯一可用的方案弄坏。
 KEY_BROWSER_UA = "browser_user_agent"
+# 观测到的 cf_clearance 到期信息。Cloudflare 的 Challenge Passage 是**站点侧**配置，
+# 外部读不到（官方文档只给了「默认 30 分钟」），所以只能在站点自己下发 Set-Cookie、
+# 或浏览器上下文里带 expires 时把它记下来，再回报给用户。
+KEY_CF_EXPIRY = "cf_clearance_expiry"
+# 上一次签到成功的时间戳（Unix 秒）。Cookie 失效时用它算出「这份 Cookie 活了多久」，
+# 这是用户唯一能拿到的、关于本站通行证寿命的实测数据。
+KEY_LAST_SUCCESS = "last_success_at"
+
+# cf_clearance 的值里可能内嵌一个 Unix 时间戳。Cloudflare 没有公开格式，因此这里
+# 只接受「被 '-' 分隔、且落在 2017-07 ~ 2039-09 区间」的 10 位数字段，
+# 避免把随机 hex 片段里的数字误判成时间戳。
+CF_TIMESTAMP_MIN = 1_500_000_000
+CF_TIMESTAMP_MAX = 2_200_000_000
+# Cloudflare 文档给出的 Challenge Passage 默认值，仅用于「到期时间未知」时给用户一个参照。
+CF_DEFAULT_TTL_MINUTES = 30
 
 # 宿主调度器中的一次性任务 ID：同 ID 重复登记只保留最后一次
 JOB_SIGNIN_ONCE = "signin_once"
@@ -404,7 +534,7 @@ NOTIFY_TEMPLATES: Dict[str, Dict[str, str]] = {
 }
 
 
-class CnlangSigninV2(_PluginBase):
+class CnlangSigninV3(_PluginBase):
     """国语视界自动签到插件。
 
     职责：按配置的 cron 定时登录国语视界完成签到，按配置的样式发送通知，并把签到
@@ -425,13 +555,13 @@ class CnlangSigninV2(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.6.7"
+    plugin_version = "3.7.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
     author_url = "https://github.com/xijin285"
     # 插件配置项ID前缀
-    plugin_config_prefix = "cnlangsignin_v2_"
+    plugin_config_prefix = "cnlangsignin_v3_"
     # 加载顺序
     plugin_order = 2
     # 可使用的用户级别
@@ -469,6 +599,9 @@ class CnlangSigninV2(_PluginBase):
     # 浏览器实际使用的 UA（懒加载，见 _stored_browser_user_agent）。
     # 与 _user_agent 严格区分：_user_agent 是用户配置，本字段只用于「用户没配时兜底」。
     _browser_user_agent: Optional[str] = None
+    # 观测到的 cf_clearance 到期信息（懒加载，见 _stored_cf_expiry）。
+    # None 表示「尚未读取」，空字典表示「读过了但没有记录」。
+    _cf_expiry: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -1115,6 +1248,228 @@ class CnlangSigninV2(_PluginBase):
         """
         return self._user_agent or self._stored_browser_user_agent()
 
+    # ------------------------------------------------------------------
+    # Cloudflare 通行证有效期观测
+    # ------------------------------------------------------------------
+
+    def _stored_cf_expiry(self) -> Optional[Dict[str, Any]]:
+        """读取插件数据里记录的 cf_clearance 到期信息（懒加载）。
+
+        :return: 形如 ``{"expires_at": int, "observed_at": int, "source": str}``；
+                 没有记录时返回 None
+        """
+        if self._cf_expiry is None:
+            try:
+                value = self.get_data(KEY_CF_EXPIRY)
+            except Exception as err:  # noqa: BLE001 - 读不到按「没有记录」处理
+                logger.debug(f"读取 cf_clearance 到期信息失败：{err}")
+                value = None
+            self._cf_expiry = value if isinstance(value, dict) else {}
+        return self._cf_expiry or None
+
+    def _observe_cf_expiry(self, headers: Any) -> None:
+        """从响应头里捕获 Cloudflare 重新签发的 ``cf_clearance`` 及其有效期。
+
+        Cloudflare 的 Challenge Passage 是**站点侧**配置、外部读不到，所以只要站点在
+        响应里下发 ``Set-Cookie: cf_clearance=...``，就把它的 ``Max-Age`` / ``Expires``
+        记进插件数据，后续在签到结果里回报给用户。拿不到就什么都不做——绝不用默认值
+        冒充真实到期时间。
+
+        :param headers: 响应头对象
+        """
+        for raw in _set_cookie_values(headers):
+            if CF_CLEARANCE_NAME not in raw.lower():
+                continue
+            expires_at = self._extract_cookie_expiry(raw)
+            if expires_at is None:
+                continue
+            state: Dict[str, Any] = {
+                "expires_at": expires_at,
+                "observed_at": int(time.time()),
+                "source": "response",
+            }
+            if state == self._cf_expiry:
+                return
+            self._cf_expiry = state
+            try:
+                self.save_data(KEY_CF_EXPIRY, state)
+            except Exception as err:  # noqa: BLE001 - 记录失败不影响签到结果
+                logger.debug(f"保存 cf_clearance 到期信息失败：{err}")
+            logger.info(
+                f"Cloudflare 重新签发了 cf_clearance，有效期至 {_format_timestamp(expires_at)}"
+            )
+            return
+
+    @staticmethod
+    def _extract_cookie_expiry(raw_set_cookie: str) -> Optional[int]:
+        """从一条 ``Set-Cookie`` 里解析出到期时间（Unix 秒）。
+
+        优先 ``Max-Age``（相对时间，无时区歧义），再回退 ``Expires``（HTTP 日期）。
+
+        :param raw_set_cookie: 单条 Set-Cookie 原始值
+        :return: Unix 秒；解析不出来时返回 None
+        """
+        match = re.search(r"[Mm]ax-[Aa]ge\s*=\s*(-?\d+)", raw_set_cookie)
+        if match:
+            try:
+                return int(time.time()) + int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+        match = re.search(r"[Ee]xpires\s*=\s*([^;]+)", raw_set_cookie)
+        if match:
+            return _parse_http_date(match.group(1))
+        return None
+
+    def _observe_browser_cf_expiry(self, expires: Any) -> None:
+        """记录浏览器上下文里 ``cf_clearance`` 的 ``expires``。
+
+        浏览器签发的通行证与用户手动复制的同源，其寿命由**站点级 Challenge Passage**
+        决定，因此这个 TTL 对「我粘贴的 Cookie 大概能活多久」有直接参考价值。
+        注意它只代表站点配置，不代表用户那份 Cookie 的确切到期时间，回报时会分开陈述。
+
+        :param expires: 浏览器返回的 expires 字段（Unix 秒）；<=0 表示会话级 Cookie
+        """
+        try:
+            expires_at = int(expires)
+        except (TypeError, ValueError):
+            return
+        if expires_at <= 0:
+            return
+        now = int(time.time())
+        state: Dict[str, Any] = {
+            "expires_at": expires_at,
+            "observed_at": now,
+            "source": "browser",
+        }
+        if state == self._cf_expiry:
+            return
+        self._cf_expiry = state
+        try:
+            self.save_data(KEY_CF_EXPIRY, state)
+        except Exception as err:  # noqa: BLE001 - 记录失败不影响签到结果
+            logger.debug(f"保存浏览器观测到的 cf_clearance 到期时间失败：{err}")
+        if expires_at > now:
+            logger.info(
+                "浏览器签发的 cf_clearance 有效期至 "
+                f"{_format_timestamp(expires_at)}"
+                f"（站点通行证有效期约 {self._humanize_seconds(expires_at - now)}）"
+            )
+
+    def _cf_clearance_status(self) -> str:
+        """返回一行「cf_clearance 什么时候失效」的说明，用于签到结果。
+
+        来源优先级：
+
+        1. **站点在响应里亲自下发的到期时间**（``Set-Cookie``）——唯一能代表「你这份
+           Cookie 什么时候死」的权威来源；
+        2. 配置 Cookie 里 ``cf_clearance`` 值内嵌的时间戳——按它与当前时间的大小关系
+           判断是「到期时间」还是「签发时间」（签到成功说明它此刻仍然有效，
+           因此过去的戳只可能是签发时间）；
+        3. 都没有时**明确说明无法确定**，并给出 Cloudflare 的默认值作参照。
+
+        浏览器观测到的到期时间只代表**站点级 Challenge Passage**（来自首页那次自动
+        通过的挑战），并不等于这份 Cookie 的到期时间，因此单独陈述、不冒充精确值。
+
+        :return: 单行说明文本
+        """
+        observed = self._stored_cf_expiry() or {}
+        expires_at = observed.get("expires_at")
+        source = observed.get("source")
+
+        if expires_at and source == "response":
+            remaining = int(expires_at) - int(time.time())
+            if remaining > 0:
+                return (
+                    f"Cloudflare 通行证：有效期至 {_format_timestamp(expires_at)}"
+                    f"（剩余约 {self._humanize_seconds(remaining)}）"
+                )
+            return (
+                f"Cloudflare 通行证：已于 {_format_timestamp(expires_at)} 过期"
+                f"（{self._humanize_seconds(-remaining)}前），需重新复制 Cookie"
+            )
+
+        ttl_hint = ""
+        if expires_at and source == "browser":
+            ttl = int(expires_at) - int(observed.get("observed_at") or 0)
+            if ttl > 0:
+                ttl_hint = (
+                    f"；站点通行证有效期实测约 {self._humanize_seconds(ttl)}"
+                    f"（浏览器观测于 {_format_timestamp(observed.get('observed_at'))}）"
+                )
+
+        values = _cf_clearance_values(self._cookie)
+        if not values:
+            return "Cloudflare 通行证：未在配置的 Cookie 中找到 cf_clearance" + ttl_hint
+
+        now = int(time.time())
+        parts: List[str] = []
+        for value in values:
+            stamp = _embedded_cf_timestamp(value)
+            if stamp is None:
+                continue
+            if stamp > now:
+                parts.append(
+                    f"{_format_timestamp(stamp)} 到期"
+                    f"（剩余约 {self._humanize_seconds(stamp - now)}）"
+                )
+            else:
+                parts.append(
+                    f"{_format_timestamp(stamp)} 签发"
+                    f"（{self._humanize_seconds(now - stamp)}前）"
+                )
+        if parts:
+            return "Cloudflare 通行证内嵌时间戳：" + "；".join(parts) + ttl_hint
+        return (
+            "Cloudflare 通行证：到期时间无法确定（站点未下发，Cookie 值里也没有"
+            f"可解析的时间戳；Cloudflare 默认 {CF_DEFAULT_TTL_MINUTES} 分钟）"
+            + ttl_hint
+        )
+
+    def _cf_survival_note(self) -> str:
+        """Cookie 失效时报告「上次成功签到」与「这份 Cookie 活了多久」。
+
+        这是用户唯一能拿到的、关于本站通行证真实寿命的实测数据。
+
+        :return: 单行说明；没有成功记录时返回空串
+        """
+        try:
+            last = self.get_data(KEY_LAST_SUCCESS)
+        except Exception as err:  # noqa: BLE001 - 读不到就不显示这一行
+            logger.debug(f"读取上次成功签到时间失败：{err}")
+            return ""
+        if not last:
+            return ""
+        try:
+            elapsed = max(int(time.time()) - int(last), 0)
+        except (TypeError, ValueError):
+            return ""
+        return (
+            f"上次成功签到：{_format_timestamp(last)}"
+            f"（{self._humanize_seconds(elapsed)}前）"
+        )
+
+    @staticmethod
+    def _humanize_seconds(seconds: Any) -> str:
+        """把秒数格式化成「X 天 Y 小时」「Y 小时 Z 分钟」这类可读文本。
+
+        :param seconds: 秒数
+        :return: 可读文本
+        """
+        try:
+            total = max(int(seconds), 0)
+        except (TypeError, ValueError):
+            return str(seconds)
+        days, rest = divmod(total, 86400)
+        hours, rest = divmod(rest, 3600)
+        minutes = rest // 60
+        if days:
+            return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
+        if hours:
+            return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
+        if minutes:
+            return f"{minutes} 分钟"
+        return f"{total} 秒"
+
     def _inject_cookies(self, context: Any, page: Any) -> None:
         """把配置 Cookie 与缓存的 Cloudflare 通行证写入浏览器会话。
 
@@ -1206,6 +1561,9 @@ class CnlangSigninV2(_PluginBase):
             name = item.get("name")
             if not name or not _is_cloudflare_cookie(name):
                 continue
+            if name == CF_CLEARANCE_NAME:
+                # 浏览器签发的通行证带 expires，顺手记下站点级 Challenge Passage 的长度
+                self._observe_browser_cf_expiry(item.get("expires"))
             # 连 domain / path 一起存：同名 Cookie 可能有多条（不同作用域），
             # 只留 name=value 会把它们压成一条，注入时丢失作用域。
             entry = {
@@ -1561,9 +1919,14 @@ class CnlangSigninV2(_PluginBase):
             f"本月累计签到：{total_signs} 天\n"
             f"当前大洋：{money}\n"
             f"签到时间：{sign_time}\n"
-            f"{content}"
+            f"{content}\n"
+            f"{self._cf_clearance_status()}"
         )
         self._notify_result(success=True, detail=detail)
+        try:
+            self.save_data(KEY_LAST_SUCCESS, int(time.time()))
+        except Exception as err:  # noqa: BLE001 - 记录失败不影响签到结果
+            logger.debug(f"记录上次成功签到时间失败：{err}")
 
         history = self.get_data(KEY_HISTORY) or []
         history.append(
@@ -1593,7 +1956,12 @@ class CnlangSigninV2(_PluginBase):
     def _record_already_signed(self, username: str) -> Dict[str, Any]:
         """记录“今日已签到”：发送通知但不重复追加历史，避免统计虚高。"""
         sign_time = self._now()
-        detail = f"签到账号：{username}\n今日已完成签到，无需重复提交\n检查时间：{sign_time}"
+        detail = (
+            f"签到账号：{username}\n"
+            f"今日已完成签到，无需重复提交\n"
+            f"检查时间：{sign_time}\n"
+            f"{self._cf_clearance_status()}"
+        )
         self._notify_result(success=True, detail=detail)
         result = {
             "time": sign_time,
@@ -1610,6 +1978,12 @@ class CnlangSigninV2(_PluginBase):
     def _record_failure(self, reason: str) -> Dict[str, Any]:
         """记录一次失败：发送失败通知并保存最近结果。"""
         sign_time = self._now()
+        # Cloudflare 拦截通常意味着通行证已失效：顺手报出「上次成功签到」与存活时长。
+        # 这是用户判断本站通行证到底能活多久的唯一实测依据。
+        if "cloudflare" in reason.lower():
+            note = self._cf_survival_note()
+            if note and note not in reason:
+                reason = f"{reason}\n\n{note}"
         self._notify_result(success=False, detail=reason)
         result = {
             "time": sign_time,
@@ -1838,6 +2212,8 @@ class CnlangSigninV2(_PluginBase):
         if response is None:
             logger.error(f"请求 {url} 失败，无响应")
             return None, None, False
+        # 站点若在响应里重新签发 cf_clearance，顺手记下它的有效期
+        self._observe_cf_expiry(getattr(response, "headers", None))
         if self._is_cf_challenge(response):
             logger.error(f"请求 {url} 被 Cloudflare 人机验证拦截，状态码：{response.status_code}")
             return None, response.status_code, True
