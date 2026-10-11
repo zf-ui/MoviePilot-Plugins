@@ -3,12 +3,13 @@
     "name": "国语视界签到V3",
     "description": "国语视界（cnlang.org）自动签到助手：支持定时签到、随机延迟、系统代理、多种通知样式与签到历史统计。",
     "labels": "站点,工具",
-    "version": "3.7.0",
+    "version": "3.8.0",
     "icon": "https://raw.githubusercontent.com/xijin285/MoviePilot-Plugins/refs/heads/main/icons/cnlang.png",
     "author": "xijin285",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.8.0": "新增**自动登录**，修复 Cookie「只能签到一次、第二天就失效」的问题。① 【问题与根因】浏览器里复制出来的 Cookie 多为会话级，服务端一过期就失效；Discuz 只有在登录时带上 `cookietime`（登录页的「自动登录」）才会签发长期凭据。这不是插件 bug，而是缺少「自己登录拿长期 Cookie」的能力。实测确认登录页 `member.php?mod=logging&action=login` 是标准 Discuz 表单，没有 Cloudflare 质询、没有 Turnstile、没有 Geetest，只需要一个 4 位图片验证码（被 Cloudflare 质询的只有签到路径，登录路径不受影响）。② 【新增】自动登录：Cookie 失效时自动重新登录，取回 30 天有效期的长期 Cookie。触发时机为**仅当签到失败且判定 Cookie 失效时**，默认不会主动登录。③ 【新增】验证码识别默认「本地优先、付费回退」：本地用 ddddocr，识别不出、**或被站点判定填错**，改用打码平台（yescaptcha / 2captcha，可自定义接口地址），也可强制只用其中一种。本地「认错」只有站点知道，因此在收到「验证码填写错误」后会升级为打码平台优先，否则本地模型一旦对不准就永远走不到付费兜底。登录成功后 Cookie 会存进插件内部数据，并（可关闭地）回写进配置，重启后无需重填。④ 【新增】合并新旧 Cookie 时同名覆盖但**保留 cf_clearance**，避免登录把已拿到的Cloudflare 通行证冲掉；取到新 Cookie 后会先访问签到页验证确实已登录，验证不过则丢弃并如实报错，绝不假装成功。⑤ 【新增】配置页新增「自动登录设置」卡片（用户名/密码、安全提问与答案、验证码方案、打码平台与 Key、接口地址、是否回写 Cookie）。开启自动登录但账号或密码为空时会在日志里明确告警，不会静默失效。⑥ 【依赖】新增 pyproject.toml 声明 ddddocr（V3 只读 `[project].dependencies`，不读 requirements.txt）。用环境标记排除 Intel Mac——onnxruntime 没有 macOS x86_64 轮子，而依赖安装失败会导致**整个插件安装失败**，故让其退化为只用打码平台。⑦ 回归测试 164 -> 237（新增登录表单解析、验证码取图与识别、验证码升级兜底、MD5 密码、登录重试、Cookie 合并保留 cf_clearance、自动登录编排、配置三方同步等 73 项）。",
       "v3.7.0": "改用**独立插件 ID** 并新增 Cloudflare 通行证有效期上报。① 【重要】插件 ID 由 `CnlangSigninV2` 改为 `CnlangSigninV3`（目录 `plugins.v3/cnlangsigninv3/`、配置前缀 `cnlangsignin_v3_`）。此前为继承旧配置而沿用了上游 xijin285 的插件 ID，但两个仓库提供同一个 ID 会让 MoviePilot 按 ID 互相覆盖——实测出现插件在「国语视界签到V2」与「国语视界签到V3」之间来回跳、修复被上游版本静默覆盖的情况。改为独立 ID 后两者可共存，不再互相覆盖；**代价是配置不会自动迁移**，需要重新填写 Cookie 与「浏览器UA」（详见 README 的「从 V2 迁移」一节）。② 【新增】签到成功时在日志与通知里报告 `cf_clearance` 的有效期：优先使用站点在响应里下发的到期时间（Set-Cookie 的 Max-Age / Expires），其次解析 Cookie 值内嵌的时间戳并按与当前时间的大小关系判断是「到期」还是「签发」，都没有时**明确说明无法确定**，而不是编造一个日期。③ 【新增】浏览器模式会记录浏览器签发的 cf_clearance 的 expires，据此报出**站点级 Challenge Passage 的实测长度**——Cloudflare 的该配置外部读不到（官方文档只给了「默认 30 分钟」），这是唯一能拿到的实测值。④ 【新增】被 Cloudflare 拦截时，失败通知会附带「上次成功签到时间 + 这份 Cookie 存活了多久」，让用户能直接看到本站通行证的真实寿命。⑤ 回归测试 132 -> 164（新增 Cookie 解析、时间戳提取、到期判定、存活时长等 32 项）。"
     }
   }

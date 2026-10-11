@@ -17,6 +17,8 @@
 6. ``get_api()`` 返回真实的后端 API 声明，不再返回 ``None``。
 """
 
+import base64
+import hashlib
 import random
 import re
 import threading
@@ -376,6 +378,186 @@ def _parse_http_date(value: str) -> Optional[int]:
         return None
 
 
+# ----------------------------------------------------------------------
+# 自动登录：Discuz 登录页解析、Cookie 合并与验证码识别
+#
+# 「Cookie 只能签到一次，第二天就失效」的根因是：从浏览器复制的 Cookie 是会话级的，
+# Discuz 只有在登录时勾选「自动登录」（cookietime）才下发长期凭证。因此这里实现了
+# 用账号密码重新登录并换取长期 Cookie 的通道，让插件在 Cookie 失效时能自愈。
+# ----------------------------------------------------------------------
+
+# 登录页与登录提交地址。提交地址里的 loginhash 每次请求都不同，运行时再拼。
+LOGIN_PAGE_URL = "https://cnlang.org/member.php?mod=logging&action=login"
+LOGIN_SUBMIT_URL = (
+    "https://cnlang.org/member.php?mod=logging&action=login"
+    "&loginsubmit=yes&inajax=1"
+)
+# Discuz 验证码接口：先 action=update 拿脚本，再从脚本里取图片地址
+SECCODE_UPDATE_URL = "https://cnlang.org/misc.php?mod=seccode&action=update"
+# 勾选「自动登录」等价于 cookietime=2592000（30 天）。这正是让 Cookie 长期有效的关键。
+LOGIN_COOKIE_LIFETIME = "2592000"
+# 单轮自动登录最多尝试次数。3 次是刻意留出的余量：``auto`` 方案下本地识别可能给出
+# 「格式正确但内容错误」的答案，站点会以「验证码填写错误」拒绝，这时需要再给打码平台
+# 一次机会（见 ``_perform_login`` 的升级逻辑），否则本地模型一旦对不准就永远走不到付费兜底。
+LOGIN_MAX_ATTEMPTS = 3
+# 验证码提交时 Discuz 要求的固定值，来自登录页 updateseccode() 的第二个参数
+SECCODE_MODID = "member::logging"
+
+# 验证码识别方式
+CAPTCHA_MODE_AUTO = "auto"
+CAPTCHA_MODE_LOCAL = "local"
+CAPTCHA_MODE_SERVICE = "service"
+CAPTCHA_MODES = (CAPTCHA_MODE_AUTO, CAPTCHA_MODE_LOCAL, CAPTCHA_MODE_SERVICE)
+
+# 打码服务类型与默认地址
+CAPTCHA_SERVICE_YESCAPTCHA = "yescaptcha"
+CAPTCHA_SERVICE_2CAPTCHA = "2captcha"
+CAPTCHA_SERVICES = (CAPTCHA_SERVICE_YESCAPTCHA, CAPTCHA_SERVICE_2CAPTCHA)
+CAPTCHA_SERVICE_BASES: Dict[str, str] = {
+    CAPTCHA_SERVICE_YESCAPTCHA: "https://api.yescaptcha.com",
+    CAPTCHA_SERVICE_2CAPTCHA: "https://api.2captcha.com",
+}
+
+# Discuz 验证码固定 4 位；识别结果不符合这个长度时直接判为失败并重试
+CAPTCHA_LENGTH = 4
+# 打码任务轮询参数
+CAPTCHA_POLL_INTERVAL = 3
+CAPTCHA_POLL_RETRIES = 20
+# YesCaptcha 用于统计调用来源的 softID；2Captcha 不接受该字段，只在 YesCaptcha 时带上
+CAPTCHA_SOFT_ID = "62709"
+
+# ddddocr 引擎缓存。模块级而非实例级：加载 onnxruntime 模型开销很大（数秒 + 数十 MB），
+# 同一进程内只应加载一次。_DDDDOCR_UNAVAILABLE 置位后不再重试导入，避免每次签到都白等。
+_DDDDDOCR_ENGINE: Any = None
+_DDDDDOCR_UNAVAILABLE = False
+
+
+def _md5_hex(value: str) -> str:
+    """返回字符串的 MD5 十六进制摘要。
+
+    Discuz 登录页在提交前用页面里的 ``pwmd5()`` 把密码字段替换成 ``md5(明文)``，
+    因此服务端收到的是摘要而非明文。
+
+    :param value: 待摘要的字符串
+    :return: 32 位小写十六进制摘要
+    """
+    return hashlib.md5(str(value).encode("utf-8")).hexdigest()
+
+
+def _parse_login_form(html: str) -> Optional[Dict[str, str]]:
+    """从 Discuz 登录页提取自动登录所需的哈希值。
+
+    :param html: 登录页正文
+    :return: ``{"formhash", "loginhash", "seccodehash"}``；页面结构不符时返回 None
+    """
+    if not html:
+        return None
+    formhash = re.search(r'name="formhash"[^>]*value="([^"]+)"', html)
+    loginhash = re.search(r'id="loginform_([0-9A-Za-z]+)"', html)
+    if not formhash or not loginhash:
+        return None
+    seccode = re.search(r"updateseccode\('([0-9A-Za-z]+)'", html)
+    return {
+        "formhash": formhash.group(1),
+        "loginhash": loginhash.group(1),
+        "seccodehash": seccode.group(1) if seccode else "",
+    }
+
+
+def _parse_seccode_image_url(script: str) -> Optional[str]:
+    """从 ``misc.php?mod=seccode&action=update`` 的返回脚本里取出验证码图片地址。
+
+    :param script: 接口返回的 JavaScript 片段
+    :return: 图片地址（相对路径）；取不到时返回 None
+    """
+    match = re.search(r'src="([^"]*mod=seccode[^"]*)"', script or "")
+    return match.group(1) if match else None
+
+
+def _login_error_message(body: str) -> Optional[str]:
+    """提取 Discuz AJAX 登录响应里的错误文案。
+
+    Discuz 用 ``errorhandle_('文案')`` 回传失败，用 ``succeedhandle_`` 回传成功。
+
+    :param body: 登录响应正文
+    :return: 错误文案；没有明确错误时返回 None（由调用方用签到页做最终判定）
+    """
+    match = re.search(r"errorhandle_\('([^']*)'", body or "")
+    if match:
+        return match.group(1).strip() or "登录被拒绝"
+    return None
+
+
+def _is_captcha_error(message: str) -> bool:
+    """判断 Discuz 的报错文案是否指向验证码。
+
+    只有「验证码不对」这一种失败才值得换一种识别方式重试：账号密码错、账号被锁定
+    之类的问题再试多少次都一样，盲目重试只会让账号被风控。
+
+    :param message: ``_login_error_message`` 提取出的文案
+    :return: 是验证码相关问题返回 True
+    """
+    text = str(message or "").lower()
+    return "验证码" in text or "seccode" in text or "secode" in text
+
+
+def _cookies_to_dict(jar: Any) -> Dict[str, str]:
+    """把会话的 Cookie 容器转成 ``{name: value}``，兼容 curl_cffi 与 requests。
+
+    :param jar: ``session.cookies``
+    :return: 名称到值的映射
+    """
+    result: Dict[str, str] = {}
+    if jar is None:
+        return result
+    getter = getattr(jar, "get_dict", None)
+    if callable(getter):
+        try:
+            for name, value in (getter() or {}).items():
+                if name:
+                    result[str(name)] = str(value)
+            return result
+        except Exception as err:  # noqa: BLE001 - 换一种方式再试
+            logger.debug(f"读取会话 Cookie 失败（get_dict）：{err}")
+    try:
+        for item in getattr(jar, "jar", jar) or []:
+            name = getattr(item, "name", None)
+            if name:
+                result[str(name)] = str(getattr(item, "value", "") or "")
+    except Exception as err:  # noqa: BLE001 - 拿不到就按空处理
+        logger.debug(f"读取会话 Cookie 失败（jar）：{err}")
+    return result
+
+
+def _is_logged_in_cookies(cookies: Dict[str, str]) -> bool:
+    """判断会话里是否已出现 Discuz 的登录凭证 Cookie（``<表前缀>_auth``）。
+
+    :param cookies: ``{name: value}``
+    :return: 是否含登录凭证
+    """
+    return any(str(name).endswith("_auth") for name in (cookies or {}))
+
+
+def _merge_cookie_header(existing: Optional[str], fresh: Dict[str, str]) -> str:
+    """把新登录得到的 Cookie 合并进旧 Cookie 串。
+
+    同名项用新值覆盖，**旧串里其余字段一律保留**——尤其是 ``cf_clearance``：
+    它是站点签发的通行证，登录接口不会重新下发，丢掉它等于把已经通过的
+    Cloudflare 验证一并丢弃。
+
+    :param existing: 旧 Cookie 串，可为 None
+    :param fresh: 新登录得到的 ``{name: value}``
+    :return: 合并后的 Cookie 串
+    """
+    merged: Dict[str, str] = {}
+    for name, value in _split_cookie_header(existing):
+        merged[name] = value
+    for name, value in (fresh or {}).items():
+        if name and value:
+            merged[name] = str(value)
+    return "; ".join(f"{name}={value}" for name, value in merged.items())
+
+
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
 
@@ -397,6 +579,9 @@ KEY_CF_EXPIRY = "cf_clearance_expiry"
 # 上一次签到成功的时间戳（Unix 秒）。Cookie 失效时用它算出「这份 Cookie 活了多久」，
 # 这是用户唯一能拿到的、关于本站通行证寿命的实测数据。
 KEY_LAST_SUCCESS = "last_success_at"
+# 自动登录换来的 Cookie。存插件数据是双保险：即使用户关掉「回写配置」，
+# 或者配置在下次保存时被前端表单覆盖，插件手里仍然留着最近一次可用的 Cookie。
+KEY_LOGIN_COOKIE = "login_cookie"
 
 # cf_clearance 的值里可能内嵌一个 Unix 时间戳。Cloudflare 没有公开格式，因此这里
 # 只接受「被 '-' 分隔、且落在 2017-07 ~ 2039-09 区间」的 10 位数字段，
@@ -555,7 +740,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.7.0"
+    plugin_version = "3.8.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -603,6 +788,31 @@ class CnlangSigninV3(_PluginBase):
     # None 表示「尚未读取」，空字典表示「读过了但没有记录」。
     _cf_expiry: Optional[Dict[str, Any]] = None
 
+    # ---- 自动登录：Cookie 失效时用账号密码换取长期 Cookie ----
+    # 是否启用账号密码自动登录（默认关闭，需要用户显式提供账号密码）
+    _auto_login: bool = False
+    # 登录用户名
+    _account: Optional[str] = None
+    # 登录密码。只用于本地计算 md5 提交，日志里绝不输出。
+    _password: Optional[str] = None
+    # 安全提问编号；"0" 表示未设置（登录表单里就是 questionid=0）
+    _question_id: str = "0"
+    # 安全提问答案
+    _answer: Optional[str] = None
+    # 验证码识别方式：auto（本地优先，失败回退付费服务）/ local / service
+    _captcha_mode: str = CAPTCHA_MODE_AUTO
+    # 打码服务类型：yescaptcha / 2captcha
+    _captcha_service: str = CAPTCHA_SERVICE_YESCAPTCHA
+    # 打码服务密钥
+    _captcha_key: Optional[str] = None
+    # 打码服务地址，留空时按 _captcha_service 取默认值
+    _captcha_base_url: Optional[str] = None
+    # 自动登录成功后是否把新 Cookie 回写「Cookie」配置字段
+    _save_login_cookie: bool = True
+    # 本轮自动登录是否已因「验证码被拒」升级为优先用打码平台。
+    # 仅在 ``_perform_login`` 内部使用，每次登录开始时重置，不落配置。
+    _captcha_escalated: bool = False
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -644,6 +854,32 @@ class CnlangSigninV3(_PluginBase):
         self._impersonate = (
             "auto" if raw_impersonate is None else str(raw_impersonate).strip()
         )
+
+        # ---- 自动登录配置 ----
+        self._auto_login = bool(config.get("auto_login", False))
+        self._account = (config.get("account") or "").strip() or None
+        # 密码不做 strip：首尾空格可能是密码本身的一部分
+        self._password = config.get("password") or None
+        self._question_id = str(config.get("question_id") or "0").strip() or "0"
+        self._answer = (config.get("answer") or "").strip() or None
+        # 非法值一律回落到默认，避免前端传入意外字符串导致自动登录整体不可用
+        raw_captcha_mode = str(config.get("captcha_mode") or CAPTCHA_MODE_AUTO).strip()
+        self._captcha_mode = (
+            raw_captcha_mode if raw_captcha_mode in CAPTCHA_MODES else CAPTCHA_MODE_AUTO
+        )
+        raw_captcha_service = str(
+            config.get("captcha_service") or CAPTCHA_SERVICE_YESCAPTCHA
+        ).strip()
+        self._captcha_service = (
+            raw_captcha_service
+            if raw_captcha_service in CAPTCHA_SERVICES
+            else CAPTCHA_SERVICE_YESCAPTCHA
+        )
+        self._captcha_key = (config.get("captcha_key") or "").strip() or None
+        self._captcha_base_url = (config.get("captcha_base_url") or "").strip() or None
+        self._save_login_cookie = bool(config.get("save_login_cookie", True))
+        if self._auto_login and not (self._account and self._password):
+            logger.warning("已开启自动登录，但账号或密码为空，自动登录不会生效")
         try:
             self._history_days = max(int(config.get("history_days") or 30), 1)
         except (TypeError, ValueError):
@@ -835,14 +1071,37 @@ class CnlangSigninV3(_PluginBase):
         默认先走 HTTP 快速路径（可用时经 curl_cffi 以真实 Chrome 指纹发出）；一旦被
         Cloudflare 人机验证拦截，按配置切换到浏览器模式完成整轮签到。开启「强制浏览器
         模式」时跳过快速路径，直接走浏览器模式——这是主动验证浏览器模式是否可用的手段。
+
+        若站点 Cookie 已失效（签到页拿不到用户名）且已配置账号密码，则自动重新登录
+        换取长期 Cookie 后重试一次。这是「Cookie 只能签到一次，第二天就失效」的自愈路径。
         """
-        if not self._cookie:
+        if not self._cookie and not self._auto_login_ready():
             return self._record_failure("未配置Cookie")
 
         if self._force_browser:
             logger.info("已开启「强制浏览器模式」，跳过 HTTP 快速路径")
             return self._handle_cloudflare_block()
 
+        result, retry_reason = self._signin_once()
+        if retry_reason and self._auto_login_ready():
+            if self._auto_login_now(retry_reason):
+                result, retry_reason = self._signin_once()
+                if retry_reason:
+                    logger.warning(f"自动登录后重试仍未成功：{retry_reason}")
+            else:
+                logger.warning("自动登录未能取得可用 Cookie")
+        if result is not None:
+            return result
+        return self._record_failure(retry_reason or "签到失败")
+
+    def _signin_once(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """执行一轮签到尝试。
+
+        :return: ``(结果, 需要重新登录的原因)``。成功或终态失败时第二项为 None；
+            「Cookie 失效」这类可以靠重新登录修复的情况只返回原因、不产生结果，
+            由调用方决定是否触发自动登录——这样就不会先发一条失败通知、
+            紧接着又发一条成功通知。
+        """
         headers = self._build_headers()
         proxy_hint = "（使用代理）" if self._use_proxy else ""
 
@@ -850,27 +1109,28 @@ class CnlangSigninV3(_PluginBase):
         logger.info(f"步骤1：获取签到页面信息{proxy_hint}")
         page, status, cf_blocked = self._request(SIGN_PAGE_URL, headers=headers)
         if cf_blocked:
-            return self._handle_cloudflare_block()
+            # 人机验证靠重新登录修不好（登录接口不会下发 cf_clearance），走原有兜底
+            return self._handle_cloudflare_block(), None
         if page is None:
             detail = (
                 f"获取签到页面失败，状态码：{status}"
                 if status is not None
                 else "获取签到页面失败，请检查网络或代理设置"
             )
-            return self._record_failure(detail)
+            return self._record_failure(detail), None
 
         user_name = self._search(r'title="访问我的空间">(.*?)</a>', page)
         if not user_name:
-            return self._record_failure("未获取到用户名，Cookie 可能已失效")
+            return None, "Cookie 已失效（签到页未显示用户名）"
         logger.info(f"登录用户名：{user_name}")
 
         if re.search(r"您今天已经签到过了或者签到时间还未开始", page):
             logger.info("今日已完成签到，跳过提交")
-            return self._record_already_signed(user_name)
+            return self._record_already_signed(user_name), None
 
         formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', page)
         if not formhash:
-            return self._record_failure("未获取到 formhash，站点页面结构可能已变化")
+            return self._record_failure("未获取到 formhash，站点页面结构可能已变化"), None
         logger.info(f"formhash：{formhash}")
 
         month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", page)
@@ -891,18 +1151,18 @@ class CnlangSigninV3(_PluginBase):
             },
         )
         if cf_blocked:
-            return self._handle_cloudflare_block()
+            return self._handle_cloudflare_block(), None
         if response is None:
             detail = (
                 f"提交签到请求失败，状态码：{status}"
                 if status is not None
                 else "提交签到请求失败，请检查网络或代理设置"
             )
-            return self._record_failure(detail)
+            return self._record_failure(detail), None
 
         content = self._search(r'<div class="c">(.*?)</div>', response, flags=re.DOTALL)
         if not content:
-            return self._record_failure("未获取到签到响应内容，签到结果未知")
+            return self._record_failure("未获取到签到响应内容，签到结果未知"), None
         content = content.strip()
         logger.info(f"签到响应：{content}")
 
@@ -912,11 +1172,14 @@ class CnlangSigninV3(_PluginBase):
         money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_page) or "未知"
         logger.info(f"当前大洋余额：{money}")
 
-        return self._record_success(
-            username=user_name,
-            total_signs=total_signs,
-            money=money,
-            content=content,
+        return (
+            self._record_success(
+                username=user_name,
+                total_signs=total_signs,
+                money=money,
+                content=content,
+            ),
+            None,
         )
 
     # ------------------------------------------------------------------
@@ -937,6 +1200,426 @@ class CnlangSigninV3(_PluginBase):
         if not result:
             return self._record_failure("浏览器模式未产生签到结果")
         return result
+
+    # ------------------------------------------------------------------
+    # 自动登录：用账号密码换取长期 Cookie
+    #
+    # 背景：用户从浏览器复制的 Cookie 是**会话级**的，Discuz 只有在登录时勾选
+    # 「自动登录」才下发长期凭证，因此「签到一次，第二天就失效」。本模块让插件在
+    # Cookie 失效时自己重新登录，并带上 cookietime=30 天，从而长期免维护。
+    # ------------------------------------------------------------------
+
+    def _auto_login_ready(self) -> bool:
+        """自动登录是否具备执行条件（开关打开且账号密码齐全）。"""
+        return bool(self._auto_login and self._account and self._password)
+
+    def _new_session(self) -> Tuple[Any, Optional[str]]:
+        """创建一个持久会话，用于承载登录过程中的 Cookie。
+
+        登录是多步流程（取表单 -> 取验证码 -> 提交），必须让 Cookie 在步骤之间保持，
+        因此不能用插件快速路径那种「每次请求独立」的方式。
+
+        :return: ``(session, 描述)``；无法创建时返回 ``(None, None)``
+        """
+        curl_requests = _import_curl_cffi() if self._use_curl_cffi else None
+        if curl_requests is not None:
+            target = _resolve_impersonate(
+                self._impersonate, self._effective_user_agent()
+            )
+            if target:
+                try:
+                    return (
+                        curl_requests.Session(impersonate=target),
+                        f"curl_cffi({target})",
+                    )
+                except Exception as err:  # noqa: BLE001 - 回退到 requests
+                    logger.warning(f"创建 curl_cffi 会话失败，回退 requests：{err}")
+        try:
+            import requests  # noqa: PLC0415 - 兜底依赖，仅在需要时导入
+
+            return requests.Session(), "requests"
+        except Exception as err:  # noqa: BLE001 - 无可用会话，自动登录不可用
+            logger.error(f"创建 HTTP 会话失败，自动登录不可用：{err}")
+            return None, None
+
+    def _session_request(self, session: Any, method: str, url: str, **kwargs: Any) -> Any:
+        """在会话上发一次请求，自动补上代理与超时。
+
+        :param session: 持久会话（curl_cffi 或 requests）
+        :param method: ``get`` / ``post``
+        :param url: 目标地址
+        :param kwargs: 透传给会话方法的参数
+        :return: 响应对象
+        """
+        proxies = self._get_proxies()
+        proxy_map = {key: value for key, value in (proxies or {}).items() if value}
+        if proxy_map:
+            kwargs["proxies"] = proxy_map
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        kwargs.setdefault("allow_redirects", True)
+        return getattr(session, method)(url, **kwargs)
+
+    def _session_get_text(
+        self, session: Any, url: str, headers: Optional[Dict[str, str]] = None
+    ) -> Optional[str]:
+        """会话 GET，返回正文文本；失败返回 None。"""
+        try:
+            response = self._session_request(session, "get", url, headers=headers)
+            return getattr(response, "text", None)
+        except Exception as err:  # noqa: BLE001 - 网络异常按失败处理
+            logger.warning(f"自动登录：请求 {url} 失败：{err}")
+            return None
+
+    def _session_get_bytes(
+        self, session: Any, url: str, headers: Optional[Dict[str, str]] = None
+    ) -> Optional[bytes]:
+        """会话 GET，返回二进制内容（用于验证码图片）；失败返回 None。"""
+        try:
+            response = self._session_request(session, "get", url, headers=headers)
+            return getattr(response, "content", None)
+        except Exception as err:  # noqa: BLE001 - 网络异常按失败处理
+            logger.warning(f"自动登录：下载 {url} 失败：{err}")
+            return None
+
+    def _session_post_text(
+        self,
+        session: Any,
+        url: str,
+        data: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """会话 POST，返回正文文本；失败返回 None。"""
+        try:
+            response = self._session_request(session, "post", url, data=data, headers=headers)
+            return getattr(response, "text", None)
+        except Exception as err:  # noqa: BLE001 - 网络异常按失败处理
+            logger.warning(f"自动登录：提交 {url} 失败：{err}")
+            return None
+
+    # ---- 验证码识别 ----
+
+    @staticmethod
+    def _normalize_captcha(text: Any) -> Optional[str]:
+        """规范化验证码识别结果：去掉噪声字符并校验长度。
+
+        Discuz 的验证码固定 4 位字母数字；长度不符说明识别跑偏，宁可判失败重试，
+        也不要把明显错误的答案提交上去浪费一次登录机会。
+
+        :param text: 识别引擎的原始输出
+        :return: 4 位验证码；不符合时返回 None
+        """
+        cleaned = re.sub(r"[^0-9A-Za-z]", "", str(text or ""))
+        if len(cleaned) != CAPTCHA_LENGTH:
+            return None
+        return cleaned
+
+    def _solve_captcha_local(self, image: bytes) -> Optional[str]:
+        """用本地 ddddocr 识别验证码；未安装或识别失败返回 None。
+
+        引擎在模块级缓存：加载 onnxruntime 模型要数秒和数十 MB，同一进程只应加载一次。
+
+        :param image: 验证码图片字节
+        :return: 4 位验证码；失败返回 None
+        """
+        global _DDDDOCR_ENGINE, _DDDDOCR_UNAVAILABLE  # noqa: PLW0603 - 引擎需要跨实例复用
+        if _DDDDOCR_UNAVAILABLE:
+            return None
+        if _DDDDOCR_ENGINE is None:
+            try:
+                import ddddocr  # noqa: PLC0415 - 可选依赖，懒加载
+
+                _DDDDOCR_ENGINE = ddddocr.DdddOcr(show_ad=False)
+                logger.info("本地验证码识别引擎 ddddocr 已就绪")
+            except Exception as err:  # noqa: BLE001 - 未安装按不可用处理，不再重试
+                _DDDDOCR_UNAVAILABLE = True
+                logger.warning(f"本地验证码识别不可用（ddddocr 未安装或加载失败）：{err}")
+                return None
+        try:
+            return self._normalize_captcha(_DDDDOCR_ENGINE.classification(image))
+        except Exception as err:  # noqa: BLE001 - 单次识别失败不影响后续重试
+            logger.warning(f"ddddocr 识别异常：{err}")
+            return None
+
+    def _captcha_post(self, url: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """向打码服务 POST 一次并解析 JSON；失败返回 None。"""
+        curl_requests = _import_curl_cffi() if self._use_curl_cffi else None
+        proxies = self._get_proxies()
+        proxy_map = {key: value for key, value in (proxies or {}).items() if value} or None
+        if curl_requests is not None:
+            kwargs: Dict[str, Any] = {"timeout": REQUEST_TIMEOUT, "json": payload}
+            target = _resolve_impersonate(
+                self._impersonate, self._effective_user_agent()
+            )
+            if target:
+                kwargs[CURL_CFFI_IMPERSONATE_ARG] = target
+            if proxy_map:
+                kwargs["proxies"] = proxy_map
+            return curl_requests.post(url, **kwargs).json()
+        try:
+            import requests  # noqa: PLC0415 - 兜底依赖
+
+            response = requests.post(
+                url, json=payload, timeout=REQUEST_TIMEOUT, proxies=proxy_map
+            )
+            return response.json()
+        except Exception as err:  # noqa: BLE001 - 网络异常按失败处理
+            logger.warning(f"打码服务请求失败：{err}")
+            return None
+
+    def _solve_captcha_service(self, image: bytes) -> Optional[str]:
+        """调用打码服务识别验证码（YesCaptcha / 2Captcha 兼容接口）。
+
+        :param image: 验证码图片字节
+        :return: 4 位验证码；失败返回 None
+        """
+        if not self._captcha_key:
+            logger.warning("未配置打码服务密钥，跳过在线识别")
+            return None
+        base = self._captcha_base_url or CAPTCHA_SERVICE_BASES.get(
+            self._captcha_service, CAPTCHA_SERVICE_BASES[CAPTCHA_SERVICE_YESCAPTCHA]
+        ).rstrip("/")
+        payload: Dict[str, Any] = {
+            "clientKey": self._captcha_key,
+            "task": {
+                "type": "ImageToTextTask",
+                "body": base64.b64encode(image).decode("ascii"),
+            },
+        }
+        # YesCaptcha 用 softID 统计来源；2Captcha 不接受该字段
+        if self._captcha_service == CAPTCHA_SERVICE_YESCAPTCHA:
+            payload["softID"] = CAPTCHA_SOFT_ID
+        created = self._captcha_post(f"{base}/createTask", payload)
+        if not created or created.get("errorId"):
+            logger.warning(f"打码服务创建任务失败：{(created or {}).get('errorCode', '无响应')}")
+            return None
+        task_id = created.get("taskId")
+        if not task_id:
+            logger.warning("打码服务未返回 taskId")
+            return None
+        for _ in range(CAPTCHA_POLL_RETRIES):
+            time.sleep(CAPTCHA_POLL_INTERVAL)
+            result = self._captcha_post(
+                f"{base}/getTaskResult",
+                {"clientKey": self._captcha_key, "taskId": task_id},
+            )
+            if not result:
+                continue
+            if result.get("errorId"):
+                logger.warning(f"打码服务返回错误：{result.get('errorCode')}")
+                return None
+            if result.get("status") == "ready":
+                solution = result.get("solution") or {}
+                return self._normalize_captcha(solution.get("text"))
+        logger.warning("打码服务轮询超时")
+        return None
+
+    def _solve_captcha(self, image: bytes) -> Optional[str]:
+        """按配置识别验证码。
+
+        ``auto`` 模式下本地优先、失败回退在线服务——本地识别免费且不依赖外网，
+        但需要额外依赖；在线服务按次计费却零依赖，两者互为补充。
+
+        注意「失败」有两种：本地**识别不出**（返回 None，这里自然会去试在线服务），
+        以及本地**认错了**（返回一个格式合法但内容错误的 4 位串，只有站点会知道错了）。
+        后者无法在这一层发现，由 ``_perform_login`` 在收到「验证码填写错误」后把
+        ``_captcha_escalated`` 置位，下一轮改成在线服务优先。
+
+        :param image: 验证码图片字节
+        :return: 4 位验证码；全部方式都失败时返回 None
+        """
+        if not image:
+            return None
+        if self._captcha_mode == CAPTCHA_MODE_LOCAL:
+            order = (CAPTCHA_MODE_LOCAL,)
+        elif self._captcha_mode == CAPTCHA_MODE_SERVICE:
+            order = (CAPTCHA_MODE_SERVICE,)
+        elif self._captcha_escalated:
+            # auto 且本地已被站点拒绝过：把在线服务提到前面
+            order = (CAPTCHA_MODE_SERVICE, CAPTCHA_MODE_LOCAL)
+        else:
+            order = (CAPTCHA_MODE_LOCAL, CAPTCHA_MODE_SERVICE)
+
+        for step in order:
+            if step == CAPTCHA_MODE_LOCAL:
+                text = self._solve_captcha_local(image)
+                if text:
+                    logger.info("验证码已由本地 ddddocr 识别")
+                    return text
+            else:
+                text = self._solve_captcha_service(image)
+                if text:
+                    logger.info("验证码已由在线打码服务识别")
+                    return text
+        return None
+
+    # ---- 登录流程 ----
+
+    def _fetch_captcha(self, session: Any, idhash: str) -> Optional[str]:
+        """取验证码图片并识别。
+
+        Discuz 的验证码分两步：``action=update`` 返回一段脚本，脚本里才有真正的图片
+        地址；直接拼图片地址是取不到的。
+
+        :param session: 持久会话
+        :param idhash: 登录页给出的验证码 idhash
+        :return: 4 位验证码；页面不需要验证码时返回空串；失败返回 None
+        """
+        if not idhash:
+            logger.info("自动登录：登录页未给出验证码 idhash，按无需验证码处理")
+            return ""
+        script = self._session_get_text(
+            session,
+            f"{SECCODE_UPDATE_URL}&idhash={idhash}&{time.time():.3f}&mobile=no",
+            headers={"Referer": LOGIN_PAGE_URL},
+        )
+        image_url = _parse_seccode_image_url(script or "")
+        if not image_url:
+            logger.warning("自动登录：未从验证码接口取到图片地址")
+            return None
+        full_url = (
+            image_url
+            if image_url.startswith("http")
+            else f"https://{SITE_HOST}/{image_url.lstrip('/')}"
+        )
+        image = self._session_get_bytes(session, full_url, headers={"Referer": LOGIN_PAGE_URL})
+        if not image:
+            logger.warning("自动登录：验证码图片下载失败")
+            return None
+        logger.info(f"自动登录：已取得验证码图片（{len(image)} 字节），开始识别")
+        return self._solve_captcha(image)
+
+    def _perform_login(self, session: Any) -> Optional[Dict[str, str]]:
+        """在给定会话上完成一次 Discuz 登录，返回新得到的 Cookie。
+
+        验证码识别难免出错，因此最多重试 ``LOGIN_MAX_ATTEMPTS`` 次；每次重试都重新
+        拉取登录页，因为 ``loginhash`` 与验证码 ``idhash`` 都会变。
+
+        如果某一轮被站点以「验证码填写错误」拒绝，说明识别结果虽然格式合法但内容
+        是错的——这在 ``auto`` 模式下要升级为在线服务优先，否则本地模型一旦对不准
+        这个站点，重试多少次都只是在重复同一个错误答案。
+
+        :param session: 持久会话
+        :return: ``{name: value}``；失败返回 None
+        """
+        self._captcha_escalated = False
+        for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+            page = self._session_get_text(session, LOGIN_PAGE_URL)
+            form = _parse_login_form(page or "")
+            if not form:
+                logger.error("自动登录：无法解析登录页表单，站点结构可能已变化")
+                return None
+            captcha = self._fetch_captcha(session, form["seccodehash"])
+            if captcha is None:
+                logger.error("自动登录：验证码识别失败")
+                return None
+            data: Dict[str, Any] = {
+                "formhash": form["formhash"],
+                "referer": "https://cnlang.org/",
+                "loginfield": "username",
+                "username": self._account,
+                # 登录页用 pwmd5() 把密码字段替换成 md5(明文)，这里手工完成同一步
+                "password": _md5_hex(self._password or ""),
+                "questionid": self._question_id,
+                "answer": self._answer or "",
+                # 关键：勾选「自动登录」等价于 cookietime=30 天，这正是长期有效的来源
+                "cookietime": LOGIN_COOKIE_LIFETIME,
+                "seccodehash": form["seccodehash"],
+                "seccodemodid": SECCODE_MODID,
+                "seccodeverify": captcha,
+            }
+            body = self._session_post_text(
+                session,
+                f"{LOGIN_SUBMIT_URL}&loginhash={form['loginhash']}",
+                data,
+                headers={
+                    "Referer": LOGIN_PAGE_URL,
+                    "Origin": "https://cnlang.org",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            error = _login_error_message(body or "")
+            if error:
+                logger.warning(f"自动登录第 {attempt} 次未成功：{error}")
+                if _is_captcha_error(error) and not self._captcha_escalated:
+                    if self._captcha_mode == CAPTCHA_MODE_AUTO:
+                        self._captcha_escalated = True
+                        logger.info("自动登录：验证码被站点拒绝，后续改用在线打码服务优先")
+                if attempt >= LOGIN_MAX_ATTEMPTS:
+                    return None
+                continue
+            cookies = _cookies_to_dict(getattr(session, "cookies", None))
+            if _is_logged_in_cookies(cookies) or "succeedhandle_" in (body or ""):
+                logger.info("自动登录成功，已取得站点登录凭证")
+                return cookies
+            logger.warning(f"自动登录第 {attempt} 次未取得登录凭证（响应无明确错误）")
+        return None
+
+    def _verify_cookie(self, cookie: str) -> Optional[str]:
+        """用候选 Cookie 访问签到页，返回用户名；未登录或被拦截返回 None。
+
+        这是自动登录的**最终判定**：只有新 Cookie 真的能打开签到页并识别出用户名，
+        才算自愈成功，避免把一次「看似成功」的登录结果写进配置。
+
+        :param cookie: 候选 Cookie 串
+        :return: 用户名；校验不通过返回 None
+        """
+        page, _status, cf_blocked = self._request(
+            SIGN_PAGE_URL, headers=self._build_headers(cookie=cookie)
+        )
+        if cf_blocked or not page:
+            return None
+        return self._search(r'title="访问我的空间">(.*?)</a>', page)
+
+    def _auto_login_now(self, reason: str) -> bool:
+        """用账号密码登录站点换取长期 Cookie，成功返回 True。
+
+        成功后新 Cookie 会同时写入插件数据与（按配置）配置字段；写入配置是为了让用户
+        在界面上能直接看到当前生效的 Cookie，便于排查。
+
+        :param reason: 触发自动登录的原因，仅用于日志
+        :return: 是否成功取得可用的新 Cookie
+        """
+        if not self._auto_login_ready():
+            return False
+        logger.info(f"检测到 {reason}，尝试使用账号密码自动登录…")
+        session, kind = self._new_session()
+        if session is None:
+            return False
+        logger.info(f"自动登录使用会话：{kind}")
+        try:
+            cookies = self._perform_login(session)
+        except Exception as err:  # noqa: BLE001 - 登录异常不得中断签到主流程
+            logger.error(f"自动登录过程异常：{err}")
+            return False
+        finally:
+            closer = getattr(session, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as err:  # noqa: BLE001 - 关闭失败无关紧要
+                    logger.debug(f"关闭自动登录会话失败：{err}")
+        if not cookies:
+            logger.error("自动登录未取得任何 Cookie")
+            return False
+        merged = _merge_cookie_header(self._cookie, cookies)
+        user_name = self._verify_cookie(merged)
+        if not user_name:
+            logger.error("自动登录取得 Cookie 后仍无法通过签到页校验，放弃本次自愈")
+            return False
+        logger.info(f"自动登录成功，账号：{user_name}")
+        self._cookie = merged
+        try:
+            self.save_data(KEY_LOGIN_COOKIE, merged)
+        except Exception as err:  # noqa: BLE001 - 落库失败不影响本次签到
+            logger.warning(f"保存自动登录 Cookie 到插件数据失败：{err}")
+        if self._save_login_cookie:
+            if self._save_config(cookie=merged):
+                logger.info("新 Cookie 已回写配置字段")
+            else:
+                logger.warning("新 Cookie 回写配置失败，本次仍会使用内存中的新 Cookie")
+        else:
+            logger.info("按配置未回写配置字段，新 Cookie 仅保存在插件数据中")
+        return True
 
     def _signin_by_browser(self) -> bool:
         """在真实浏览器中完成整轮签到。
@@ -2049,6 +2732,18 @@ class CnlangSigninV3(_PluginBase):
             "force_browser": self._force_browser,
             "use_curl_cffi": self._use_curl_cffi,
             "impersonate": self._impersonate,
+            # 自动登录相关字段必须在这里回写，否则下次保存配置时会被前端表单整体覆盖、
+            # 静默清空（保存流程是 save_config() 之后紧接 initialize()）。
+            "auto_login": self._auto_login,
+            "account": self._account or "",
+            "password": self._password or "",
+            "question_id": self._question_id,
+            "answer": self._answer or "",
+            "captcha_mode": self._captcha_mode,
+            "captcha_service": self._captcha_service,
+            "captcha_key": self._captcha_key or "",
+            "captcha_base_url": self._captcha_base_url or "",
+            "save_login_cookie": self._save_login_cookie,
             "onlyonce": False,
             "clear": False,
         }
@@ -2154,8 +2849,12 @@ class CnlangSigninV3(_PluginBase):
         logger.warning("未获取到符合长度要求的签到寄语，使用默认文案")
         return SAY_FALLBACK
 
-    def _build_headers(self) -> Dict[str, str]:
-        """构造站点请求头，Cookie 取自插件配置。"""
+    def _build_headers(self, cookie: Optional[str] = None) -> Dict[str, str]:
+        """构造站点请求头。
+
+        :param cookie: 指定 Cookie 串；None 表示使用插件配置里的 Cookie。
+            自动登录校验新 Cookie 时需要传入候选值，而不是尚未生效的配置值。
+        """
         return {
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -2168,7 +2867,7 @@ class CnlangSigninV3(_PluginBase):
             "cache-control": "max-age=0",
             "Upgrade-Insecure-Requests": "1",
             "Host": SITE_HOST,
-            "Cookie": self._cookie or "",
+            "Cookie": self._cookie if cookie is None else cookie,
             # Cloudflare 签发的 cf_clearance 与 UA 绑定，配置了自定义 UA 时必须原样发送
             "User-Agent": self._effective_user_agent() or DEFAULT_USER_AGENT,
         }
@@ -2853,6 +3552,261 @@ class CnlangSigninV3(_PluginBase):
                             }
                         ]
                     },
+                    # 自动登录设置卡片
+                    {
+                        'component': 'VCard',
+                        'props': {
+                            'title': '自动登录设置',
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
+                        'content': [
+                            {
+                                'component': 'VCardText',
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'class': 'mb-3',
+                                            'text': '浏览器里复制的 Cookie 是会话级的，Discuz 只有在登录时勾选「自动登录」才下发长期凭证——这就是「签到一次、第二天就失效」的原因。填好账号密码后，插件会在 Cookie 失效时自己重新登录换取 30 天有效的 Cookie，从此无需手动更新。'
+                                        }
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'auto_login',
+                                                            'label': 'Cookie 失效时自动登录',
+                                                            'color': 'success',
+                                                            'prepend-icon': 'mdi-login'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'save_login_cookie',
+                                                            'label': '回写新 Cookie 到配置',
+                                                            'color': 'info',
+                                                            'prepend-icon': 'mdi-content-save'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'account',
+                                                            'label': '登录账号',
+                                                            'placeholder': '国语视界的用户名',
+                                                            'prepend-inner-icon': 'mdi-account',
+                                                            'hint': '仅用于 Cookie 失效时自动登录'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'password',
+                                                            'label': '登录密码',
+                                                            'type': 'password',
+                                                            'placeholder': '国语视界的登录密码',
+                                                            'prepend-inner-icon': 'mdi-lock',
+                                                            'hint': '保存在 MoviePilot 插件配置中，运行日志不会输出密码'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSelect',
+                                                        'props': {
+                                                            'model': 'question_id',
+                                                            'label': '安全提问',
+                                                            'items': [
+                                                                {'title': '未设置（默认）', 'value': '0'},
+                                                                {'title': '母亲的名字', 'value': '1'},
+                                                                {'title': '爷爷的名字', 'value': '2'},
+                                                                {'title': '父亲出生的城市', 'value': '3'},
+                                                                {'title': '其中一位老师的名字', 'value': '4'},
+                                                                {'title': '个人计算机的型号', 'value': '5'},
+                                                                {'title': '最喜欢的餐馆名称', 'value': '6'},
+                                                                {'title': '驾驶执照最后四位数字', 'value': '7'}
+                                                            ],
+                                                            'prepend-inner-icon': 'mdi-help-circle',
+                                                            'hint': '账号未设置安全提问时保持默认'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 6
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'answer',
+                                                            'label': '安全提问答案',
+                                                            'placeholder': '未设置安全提问时留空',
+                                                            'prepend-inner-icon': 'mdi-comment-question',
+                                                            'hint': '只有选择了安全提问才需要填写'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSelect',
+                                                        'props': {
+                                                            'model': 'captcha_mode',
+                                                            'label': '验证码识别方式',
+                                                            'items': [
+                                                                {'title': '本地优先，失败回退在线', 'value': 'auto'},
+                                                                {'title': '仅本地 ddddocr', 'value': 'local'},
+                                                                {'title': '仅在线打码服务', 'value': 'service'}
+                                                            ],
+                                                            'prepend-inner-icon': 'mdi-eye-check',
+                                                            'hint': '登录需要识别 4 位图形验证码'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSelect',
+                                                        'props': {
+                                                            'model': 'captcha_service',
+                                                            'label': '在线打码服务',
+                                                            'items': [
+                                                                {'title': 'YesCaptcha', 'value': 'yescaptcha'},
+                                                                {'title': '2Captcha', 'value': '2captcha'}
+                                                            ],
+                                                            'prepend-inner-icon': 'mdi-cloud-search',
+                                                            'hint': '仅在需要在线识别时使用'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'captcha_key',
+                                                            'label': '打码服务密钥',
+                                                            'type': 'password',
+                                                            'placeholder': '使用在线打码时必填',
+                                                            'prepend-inner-icon': 'mdi-key',
+                                                            'hint': '按次计费，日志不会输出密钥'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'captcha_base_url',
+                                                            'label': '打码服务地址（可选）',
+                                                            'placeholder': '留空使用所选服务的默认地址',
+                                                            'prepend-inner-icon': 'mdi-server-network',
+                                                            'hint': '只有使用兼容的自建节点时才需要填写'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # 反爬设置卡片
                     {
                         'component': 'VCard',
@@ -3313,7 +4267,18 @@ class CnlangSigninV3(_PluginBase):
             "force_browser": False,
             "use_curl_cffi": True,
             "impersonate": "auto",
-            "user_agent": ""
+            "user_agent": "",
+            # 自动登录（默认关闭：需要用户显式提供账号密码才会生效）
+            "auto_login": False,
+            "account": "",
+            "password": "",
+            "question_id": "0",
+            "answer": "",
+            "captcha_mode": "auto",
+            "captcha_service": "yescaptcha",
+            "captcha_key": "",
+            "captcha_base_url": "",
+            "save_login_cookie": True
         }
 
     # ------------------------------------------------------------------

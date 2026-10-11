@@ -2612,3 +2612,967 @@ def test_record_failure_leaves_other_reasons_untouched(host):
     result = plugin._record_failure("未配置Cookie")
 
     assert result["content"] == "未配置Cookie"
+
+
+# ---------------------------------------------------------------------------
+# 自动登录：Discuz 登录页解析与 Cookie 合并
+# ---------------------------------------------------------------------------
+
+# 取自 cnlang.org 登录页的真实结构（已按测试需要精简）
+LOGIN_PAGE_SNIPPET = (
+    '<form method="post" autocomplete="off" name="login" id="loginform_LDr3Z" class="cl" '
+    "onsubmit=\"pwmd5('password3_LDr3Z');pwdclear = 1;\" "
+    'action="member.php?mod=logging&amp;action=login&amp;loginsubmit=yes&amp;loginhash=LDr3Z">'
+    '<input type="hidden" name="formhash" value="1cdb3aa6" />'
+    '<input type="hidden" name="referer" value="https://cnlang.org/./" />'
+    '<input type="text" name="username" id="username_LDr3Z" />'
+    '<input type="password" id="password3_LDr3Z" name="password" />'
+    '<span id="seccode_cSB1R7X1"></span>'
+    '<script type="text/javascript" reload="1">'
+    "updateseccode('cSB1R7X1', '<div class=\"rfm\">...</div>');</script>"
+    "</form>"
+)
+
+# misc.php?mod=seccode&action=update 返回的脚本片段（真实结构）
+SECCODE_UPDATE_SNIPPET = (
+    "if($('seccode_cSDb5rzV')) { var sectpl = seccheck_tpl['cSDb5rzV']; "
+    "var string = '<input name=\"seccodehash\" type=\"hidden\" value=\"cSDb5rzV\" />' + "
+    "'<img id=\"seccodeimg\" src=\"misc.php?mod=seccode&update=72232&idhash=cSDb5rzV\" />'; }"
+)
+
+
+class _FakeCookies:
+    """模拟会话 Cookie 容器（提供 get_dict）。"""
+
+    def __init__(self, data=None):
+        self._data = dict(data or {})
+
+    def get_dict(self):
+        return dict(self._data)
+
+    def update(self, data):
+        self._data.update(data)
+
+
+class _FakeHttpResponse:
+    """模拟会话请求返回的响应对象（带 text / content）。"""
+
+    def __init__(self, text="", content=b"", status_code=200):
+        self.text = text
+        self.content = content
+        self.status_code = status_code
+        self.headers = {}
+
+
+class _FakeSession:
+    """按 URL 关键字返回预置响应的假会话，并记录每次调用。"""
+
+    def __init__(self, routes=None):
+        self.routes = dict(routes or {})
+        self.calls = []
+        self.cookies = _FakeCookies()
+        self.closed = False
+
+    def _dispatch(self, method, url, kwargs):
+        self.calls.append({"method": method, "url": url, "kwargs": kwargs})
+        for (want_method, key), value in self.routes.items():
+            if want_method == method and key in url:
+                return value(url, kwargs) if callable(value) else value
+        return None
+
+    def get(self, url, **kwargs):
+        return self._dispatch("get", url, kwargs)
+
+    def post(self, url, **kwargs):
+        return self._dispatch("post", url, kwargs)
+
+    def close(self):
+        self.closed = True
+
+
+def test_md5_hex_matches_discuz_pwmd5(host):
+    """Discuz 用 pwmd5() 提交密码，插件必须算出同样的摘要。"""
+    module = host.module
+
+    assert module._md5_hex("secret") == "5ebe2294ecd0e0f08eab7690d2a6ee69"
+    assert module._md5_hex("") == "d41d8cd98f00b204e9800998ecf8427e"
+
+
+def test_parse_login_form_extracts_hashes(host):
+    """从登录页提取 formhash / loginhash / 验证码 idhash。"""
+    module = host.module
+
+    parsed = module._parse_login_form(LOGIN_PAGE_SNIPPET)
+
+    assert parsed == {
+        "formhash": "1cdb3aa6",
+        "loginhash": "LDr3Z",
+        "seccodehash": "cSB1R7X1",
+    }
+
+
+@pytest.mark.parametrize(
+    "html",
+    ["", "<html>没有登录表单</html>", '<form id="loginform_X"></form>'],
+)
+def test_parse_login_form_returns_none_when_structure_missing(host, html):
+    """页面结构不符合预期时必须返回 None，而不是抛出或返回半个结果。"""
+    assert host.module._parse_login_form(html) is None
+
+
+def test_parse_seccode_image_url_extracts_src(host):
+    """验证码图片地址藏在 action=update 返回的脚本里。"""
+    module = host.module
+
+    url = module._parse_seccode_image_url(SECCODE_UPDATE_SNIPPET)
+
+    assert url == "misc.php?mod=seccode&update=72232&idhash=cSDb5rzV"
+
+
+def test_parse_seccode_image_url_returns_none_for_empty(host):
+    """空脚本不应崩溃。"""
+    assert host.module._parse_seccode_image_url("") is None
+
+
+def test_login_error_message_extracts_discuz_error(host):
+    """Discuz 用 errorhandle_ 回传失败文案。"""
+    module = host.module
+
+    body = "<root><![CDATA[抱歉，验证码填写错误<script>errorhandle_('抱歉，验证码填写错误', {})</script>]]></root>"
+
+    assert module._login_error_message(body) == "抱歉，验证码填写错误"
+
+
+def test_login_error_message_is_none_on_success(host):
+    """成功响应里没有 errorhandle_。"""
+    module = host.module
+
+    assert module._login_error_message("<root><![CDATA[succeedhandle_login('...')]]></root>") is None
+    assert module._login_error_message("") is None
+
+
+def test_cookies_to_dict_prefers_get_dict(host):
+    """会话 Cookie 优先用 get_dict() 读取。"""
+    module = host.module
+
+    assert module._cookies_to_dict(_FakeCookies({"a": "1", "b": "2"})) == {"a": "1", "b": "2"}
+
+
+def test_cookies_to_dict_falls_back_to_jar(host):
+    """没有 get_dict 时退回遍历 jar，兼容不同客户端。"""
+    module = host.module
+
+    class _Item:
+        def __init__(self, name, value):
+            self.name = name
+            self.value = value
+
+    class _JarOnly:
+        jar = [_Item("sid", "abc"), _Item("auth", "xyz")]
+
+    assert module._cookies_to_dict(_JarOnly()) == {"sid": "abc", "auth": "xyz"}
+    assert module._cookies_to_dict(None) == {}
+
+
+def test_is_logged_in_cookies_detects_auth_suffix(host):
+    """Discuz 的登录凭证是 <表前缀>_auth，前缀随站点变化，因此只认后缀。"""
+    module = host.module
+
+    assert module._is_logged_in_cookies({"3rir_2132_auth": "x"})
+    assert not module._is_logged_in_cookies({"3rir_2132_sid": "x"})
+    assert not module._is_logged_in_cookies({})
+
+
+def test_merge_cookie_header_preserves_cf_clearance(host):
+    """合并新 Cookie 时必须保住 cf_clearance——登录接口不会重新下发它。
+
+    丢掉它等于把已经通过的 Cloudflare 验证一并丢弃，是这版最容易踩的坑。
+    """
+    module = host.module
+    existing = "cf_clearance=ABC123; 3rir_2132_sid=old; 3rir_2132_saltkey=oldkey"
+
+    merged = module._merge_cookie_header(existing, {"3rir_2132_auth": "newauth"})
+
+    assert "cf_clearance=ABC123" in merged
+    assert "3rir_2132_auth=newauth" in merged
+    assert "3rir_2132_sid=old" in merged
+
+
+def test_merge_cookie_header_overrides_same_name(host):
+    """同名项以新登录结果为准。"""
+    module = host.module
+
+    merged = module._merge_cookie_header(
+        "3rir_2132_sid=old; other=keep", {"3rir_2132_sid": "new"}
+    )
+
+    assert "3rir_2132_sid=new" in merged
+    assert "3rir_2132_sid=old" not in merged
+    assert "other=keep" in merged
+
+
+def test_merge_cookie_header_handles_empty_existing(host):
+    """没有旧 Cookie 时也能正常工作。"""
+    module = host.module
+
+    assert module._merge_cookie_header(None, {"a": "1"}) == "a=1"
+    assert module._merge_cookie_header("", {}) == ""
+
+
+# ---------------------------------------------------------------------------
+# 自动登录：验证码识别
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("eBG4", "eBG4"),
+        (" eBG4 ", "eBG4"),
+        ("eB-G4", "eBG4"),
+        ("eBG4\n", "eBG4"),
+    ],
+)
+def test_normalize_captcha_accepts_four_chars(host, raw, expected):
+    """识别结果去掉噪声后仍是 4 位即可用。"""
+    assert host.module.CnlangSigninV3._normalize_captcha(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "abcde", "------", None])
+def test_normalize_captcha_rejects_wrong_length(host, raw):
+    """长度不对宁可判失败重试，也不要把明显错误的答案提交上去。"""
+    assert host.module.CnlangSigninV3._normalize_captcha(raw) is None
+
+
+def test_solve_captcha_auto_prefers_local_then_service(host, monkeypatch):
+    """auto 模式：本地优先，本地失败才用在线服务。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(plugin, "_solve_captcha_local", lambda image: None)
+    monkeypatch.setattr(plugin, "_solve_captcha_service", lambda image: "SVC1")
+
+    assert plugin._solve_captcha(b"img") == "SVC1"
+
+
+def test_solve_captcha_auto_uses_local_when_it_works(host, monkeypatch):
+    """auto 模式：本地成功就不该再花钱调在线服务。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(plugin, "_solve_captcha_local", lambda image: "LOC1")
+    called = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_service", lambda image: called.append(1) or "SVC1"
+    )
+
+    assert plugin._solve_captcha(b"img") == "LOC1"
+    assert called == []
+
+
+def test_solve_captcha_local_only_never_calls_service(host, monkeypatch):
+    """local 模式：本地失败直接放弃，不碰在线服务。"""
+    plugin = _enabled_plugin(host, captcha_mode="local")
+    monkeypatch.setattr(plugin, "_solve_captcha_local", lambda image: None)
+    called = []
+    monkeypatch.setattr(plugin, "_solve_captcha_service", lambda image: called.append(1))
+
+    assert plugin._solve_captcha(b"img") is None
+    assert called == []
+
+
+def test_solve_captcha_service_only_skips_local(host, monkeypatch):
+    """service 模式：不加载本地引擎。"""
+    plugin = _enabled_plugin(host, captcha_mode="service")
+    called = []
+    monkeypatch.setattr(plugin, "_solve_captcha_local", lambda image: called.append(1))
+    monkeypatch.setattr(plugin, "_solve_captcha_service", lambda image: "SVC1")
+
+    assert plugin._solve_captcha(b"img") == "SVC1"
+    assert called == []
+
+
+def test_solve_captcha_returns_none_for_empty_image(host):
+    """没有图片就没有识别。"""
+    assert _enabled_plugin(host)._solve_captcha(b"") is None
+
+
+def test_solve_captcha_auto_escalates_to_service_after_rejection(host, monkeypatch):
+    """auto 模式：本地答案被站点拒过之后，在线服务应当被优先尝试。
+
+    本地模型可能给出「格式合法但内容错误」的答案，这一层看不出来；只有站点会说错。
+    若不升级，重试只是在重复同一个错误答案，付费兜底永远走不到。
+    """
+    plugin = _enabled_plugin(host)
+    plugin._captcha_escalated = True
+    order = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_local", lambda image: order.append("local") or "LOC1"
+    )
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_service", lambda image: order.append("service") or "SVC1"
+    )
+
+    assert plugin._solve_captcha(b"img") == "SVC1"
+    assert order == ["service"]
+
+
+def test_solve_captcha_auto_escalated_falls_back_to_local_without_key(host, monkeypatch):
+    """升级后若在线服务不可用（无密钥），仍要回到本地，不能直接放弃。"""
+    plugin = _enabled_plugin(host)
+    plugin._captcha_escalated = True
+    order = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_local", lambda image: order.append("local") or "LOC1"
+    )
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_service", lambda image: order.append("service") or None
+    )
+
+    assert plugin._solve_captcha(b"img") == "LOC1"
+    assert order == ["service", "local"]
+
+
+def test_solve_captcha_local_mode_ignores_escalation(host, monkeypatch):
+    """local 模式是用户明确「只用本地」，升级标记不该让它去调在线服务。"""
+    plugin = _enabled_plugin(host, captcha_mode="local")
+    plugin._captcha_escalated = True
+    called = []
+    monkeypatch.setattr(plugin, "_solve_captcha_local", lambda image: "LOC1")
+    monkeypatch.setattr(
+        plugin, "_solve_captcha_service", lambda image: called.append(1) or "SVC1"
+    )
+
+    assert plugin._solve_captcha(b"img") == "LOC1"
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("抱歉，验证码填写错误", True),
+        ("验证码错误", True),
+        ("seccode invalid", True),
+        ("抱歉，密码错误", False),
+        ("您所在的用户组不允许登录", False),
+        ("", False),
+    ],
+)
+def test_is_captcha_error_classification(host, message, expected):
+    """只有验证码类错误才值得换识别方式重试，账号密码错重试没有意义。"""
+    assert host.module._is_captcha_error(message) is expected
+
+
+def test_solve_captcha_service_requires_key(host):
+    """未配置密钥时不应发起在线请求。"""
+    plugin = _enabled_plugin(host, captcha_mode="service", captcha_key="")
+
+    assert plugin._solve_captcha_service(b"img") is None
+
+
+def test_solve_captcha_service_returns_solution_text(host, monkeypatch):
+    """在线打码：createTask -> getTaskResult(status=ready) -> solution.text。"""
+    plugin = _enabled_plugin(
+        host, captcha_mode="service", captcha_key="KEY", captcha_service="yescaptcha"
+    )
+    responses = [
+        {"errorId": 0, "taskId": 12345},
+        {"errorId": 0, "status": "processing"},
+        {"errorId": 0, "status": "ready", "solution": {"text": "eBG4"}},
+    ]
+    seen = []
+
+    def fake_post(url, payload):
+        seen.append((url, payload))
+        return responses[min(len(seen) - 1, len(responses) - 1)]
+
+    monkeypatch.setattr(plugin, "_captcha_post", fake_post)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _s: None)
+
+    assert plugin._solve_captcha_service(b"img") == "eBG4"
+    assert seen[0][0].endswith("/createTask")
+    assert seen[0][1]["task"]["type"] == "ImageToTextTask"
+    assert seen[0][1]["softID"] == host.module.CAPTCHA_SOFT_ID
+    assert seen[1][0].endswith("/getTaskResult")
+
+
+def test_solve_captcha_service_reports_error_code(host, monkeypatch):
+    """打码服务返回 errorId 时直接放弃，不无限轮询。"""
+    plugin = _enabled_plugin(host, captcha_mode="service", captcha_key="KEY")
+    monkeypatch.setattr(plugin, "_captcha_post", lambda url, payload: {"errorId": 12, "errorCode": "ERROR_ZERO_BALANCE"})
+
+    assert plugin._solve_captcha_service(b"img") is None
+
+
+def test_solve_captcha_service_omits_soft_id_for_2captcha(host, monkeypatch):
+    """2Captcha 不接受 softID 字段，必须不带。"""
+    plugin = _enabled_plugin(
+        host, captcha_mode="service", captcha_key="KEY", captcha_service="2captcha"
+    )
+    seen = []
+
+    def fake_post(url, payload):
+        seen.append((url, payload))
+        return {"errorId": 0, "taskId": 1}
+
+    monkeypatch.setattr(plugin, "_captcha_post", fake_post)
+    monkeypatch.setattr(host.module.time, "sleep", lambda _s: None)
+
+    plugin._solve_captcha_service(b"img")
+
+    assert seen[0][0].startswith("https://api.2captcha.com")
+    assert "softID" not in seen[0][1]
+
+
+# ---------------------------------------------------------------------------
+# 自动登录：登录流程
+# ---------------------------------------------------------------------------
+
+
+def _login_routes(login_body='<root><![CDATA[succeedhandle_login("ok")]]></root>'):
+    """构造一套覆盖登录流程的假路由。"""
+
+    def on_post(url, kwargs):
+        return _FakeHttpResponse(text=login_body)
+
+    return {
+        ("get", "member.php?mod=logging&action=login"): _FakeHttpResponse(
+            text=LOGIN_PAGE_SNIPPET
+        ),
+        ("get", "action=update"): _FakeHttpResponse(text=SECCODE_UPDATE_SNIPPET),
+        ("get", "update=72232"): _FakeHttpResponse(content=b"\x89PNG-fake-image"),
+        ("post", "loginsubmit=yes"): on_post,
+    }
+
+
+def _session_with_cookies(routes, cookie):
+    """构造假会话，并在 POST 登录后写入登录凭证 Cookie。"""
+    session = _FakeSession(routes)
+    original_post = session.post
+
+    def post(url, **kwargs):
+        response = original_post(url, **kwargs)
+        session.cookies.update(cookie)
+        return response
+
+    session.post = post
+    return session
+
+
+def test_perform_login_sends_md5_password_and_30day_cookietime(host, monkeypatch):
+    """登录请求必须带 md5(密码) 与 cookietime=30 天——后者是长期有效的关键。"""
+    module = host.module
+    plugin = _enabled_plugin(host, account="luobop", password="p@ss word")
+    session = _session_with_cookies(
+        _login_routes(), {"3rir_2132_auth": "tok", "3rir_2132_sid": "sid"}
+    )
+    monkeypatch.setattr(plugin, "_solve_captcha", lambda image: "eBG4")
+
+    cookies = plugin._perform_login(session)
+
+    assert cookies == {"3rir_2132_auth": "tok", "3rir_2132_sid": "sid"}
+    posted = [c for c in session.calls if c["method"] == "post"][0]
+    data = posted["kwargs"]["data"]
+    assert data["username"] == "luobop"
+    assert data["password"] == module._md5_hex("p@ss word")
+    assert data["password"] != "p@ss word"
+    assert data["cookietime"] == module.LOGIN_COOKIE_LIFETIME
+    assert data["seccodehash"] == "cSB1R7X1"
+    assert data["seccodemodid"] == module.SECCODE_MODID
+    assert data["seccodeverify"] == "eBG4"
+    assert data["formhash"] == "1cdb3aa6"
+    assert "loginhash=LDr3Z" in posted["url"]
+
+
+def test_perform_login_retries_after_wrong_captcha(host, monkeypatch):
+    """验证码识别错时应当重新拉登录页并重试，而不是直接失败。"""
+    module = host.module
+    plugin = _enabled_plugin(host, account="u", password="p")
+    attempts = []
+
+    def on_post(url, kwargs):
+        attempts.append(kwargs["data"]["seccodeverify"])
+        if len(attempts) == 1:
+            return _FakeHttpResponse(
+                text="<root><![CDATA[errorhandle_('抱歉，验证码填写错误', {})]]></root>"
+            )
+        return _FakeHttpResponse(text="<root><![CDATA[succeedhandle_login('ok')]]></root>")
+
+    routes = _login_routes()
+    routes[("post", "loginsubmit=yes")] = on_post
+    session = _session_with_cookies(routes, {"3rir_2132_auth": "tok"})
+    monkeypatch.setattr(plugin, "_solve_captcha", lambda image: "eBG4")
+
+    cookies = plugin._perform_login(session)
+
+    assert len(attempts) == 2
+    assert cookies["3rir_2132_auth"] == "tok"
+    assert module.LOGIN_MAX_ATTEMPTS == 3
+
+
+def test_perform_login_gives_up_after_max_attempts(host, monkeypatch):
+    """连续失败达到上限后返回 None，不无限重试。"""
+    module = host.module
+    plugin = _enabled_plugin(host, account="u", password="p")
+    routes = _login_routes(
+        login_body="<root><![CDATA[errorhandle_('抱歉，验证码填写错误', {})]]></root>"
+    )
+    session = _session_with_cookies(routes, {"3rir_2132_auth": "tok"})
+    monkeypatch.setattr(plugin, "_solve_captcha", lambda image: "eBG4")
+
+    assert plugin._perform_login(session) is None
+    posts = [c for c in session.calls if c["method"] == "post"]
+    assert len(posts) == module.LOGIN_MAX_ATTEMPTS
+
+
+def test_perform_login_stops_when_captcha_unreadable(host, monkeypatch):
+    """验证码识别不出来时不提交登录请求，避免白白消耗一次失败计数。"""
+    plugin = _enabled_plugin(host, account="u", password="p")
+    session = _FakeSession(_login_routes())
+    monkeypatch.setattr(plugin, "_solve_captcha", lambda image: None)
+
+    assert plugin._perform_login(session) is None
+    assert not [c for c in session.calls if c["method"] == "post"]
+
+
+def test_perform_login_escalates_to_service_after_captcha_rejection(host, monkeypatch):
+    """第一轮被站点以「验证码填写错误」拒绝后，第二轮必须换成在线打码。
+
+    否则本地模型一旦对不准这个站点，三次重试都只是在重复同一个错误答案。
+    """
+    plugin = _enabled_plugin(host, account="u", password="p")
+    seen_modes = []
+
+    def fake_solve(image):
+        seen_modes.append(plugin._captcha_escalated)
+        return "eBG4"
+
+    monkeypatch.setattr(plugin, "_solve_captcha", fake_solve)
+
+    attempts = []
+
+    def on_post(url, kwargs):
+        attempts.append(kwargs["data"]["seccodeverify"])
+        if len(attempts) == 1:
+            return _FakeHttpResponse(
+                text="<root><![CDATA[errorhandle_('抱歉，验证码填写错误', {})]]></root>"
+            )
+        return _FakeHttpResponse(text="<root><![CDATA[succeedhandle_login('ok')]]></root>")
+
+    routes = _login_routes()
+    routes[("post", "loginsubmit=yes")] = on_post
+    session = _session_with_cookies(routes, {"3rir_2132_auth": "tok"})
+
+    cookies = plugin._perform_login(session)
+
+    assert cookies["3rir_2132_auth"] == "tok"
+    # 第一轮未升级，第二轮已升级
+    assert seen_modes == [False, True]
+
+
+def test_perform_login_does_not_escalate_on_password_error(host, monkeypatch):
+    """账号密码错属于「再试也没用」，不该升级到在线打码，避免无谓消耗。"""
+    plugin = _enabled_plugin(host, account="u", password="p")
+    seen_modes = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha", lambda image: seen_modes.append(plugin._captcha_escalated) or "eBG4"
+    )
+    routes = _login_routes(
+        login_body="<root><![CDATA[errorhandle_('抱歉，密码错误', {})]]></root>"
+    )
+    session = _session_with_cookies(routes, {"3rir_2132_auth": "tok"})
+
+    assert plugin._perform_login(session) is None
+    assert seen_modes == [False] * host.module.LOGIN_MAX_ATTEMPTS
+
+
+def test_perform_login_resets_escalation_between_calls(host, monkeypatch):
+    """升级标记是「本轮登录」的状态，下一轮必须重置，不能污染后续登录。"""
+    plugin = _enabled_plugin(host, account="u", password="p")
+    plugin._captcha_escalated = True
+    seen = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha", lambda image: seen.append(plugin._captcha_escalated) or "eBG4"
+    )
+    session = _session_with_cookies(_login_routes(), {"3rir_2132_auth": "tok"})
+
+    plugin._perform_login(session)
+
+    assert seen == [False]
+
+
+def test_fetch_captcha_returns_empty_when_page_has_no_seccode(host, monkeypatch):
+    """登录页没有验证码时返回空串，表示「无需验证码」。"""
+    plugin = _enabled_plugin(host)
+    monkeypatch.setattr(plugin, "_solve_captcha", lambda image: "XXXX")
+
+    assert plugin._fetch_captcha(_FakeSession(), "") == ""
+
+
+def test_fetch_captcha_follows_update_script_to_image(host, monkeypatch):
+    """验证码分两步：先 action=update 拿脚本，再从脚本里取图片地址。"""
+    plugin = _enabled_plugin(host)
+    session = _FakeSession(
+        {
+            ("get", "action=update"): _FakeHttpResponse(text=SECCODE_UPDATE_SNIPPET),
+            ("get", "update=72232"): _FakeHttpResponse(content=b"png-bytes"),
+        }
+    )
+    seen = []
+    monkeypatch.setattr(
+        plugin, "_solve_captcha", lambda image: seen.append(image) or "eBG4"
+    )
+
+    assert plugin._fetch_captcha(session, "cSDb5rzV") == "eBG4"
+    assert seen == [b"png-bytes"]
+
+
+def test_fetch_captcha_returns_none_when_image_missing(host):
+    """取不到图片地址时返回 None，由调用方按失败处理。"""
+    plugin = _enabled_plugin(host)
+    session = _FakeSession({("get", "action=update"): _FakeHttpResponse(text="<html></html>")})
+
+    assert plugin._fetch_captcha(session, "cSDb5rzV") is None
+
+
+# ---------------------------------------------------------------------------
+# 自动登录：整体编排
+# ---------------------------------------------------------------------------
+
+
+def test_auto_login_ready_requires_credentials(host):
+    """开关打开但缺账号或缺密码时都不算就绪。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    assert not plugin._auto_login_ready()
+
+    plugin = _enabled_plugin(host, auto_login=True, account="u")
+    assert not plugin._auto_login_ready()
+
+    plugin = _enabled_plugin(host, auto_login=True, account="u", password="p")
+    assert plugin._auto_login_ready()
+
+    plugin = _enabled_plugin(host, auto_login=False, account="u", password="p")
+    assert not plugin._auto_login_ready()
+    assert module.CAPTCHA_MODE_AUTO in module.CAPTCHA_MODES
+
+
+def test_auto_login_now_skips_without_credentials(host):
+    """没配账号密码时不应创建会话，更不该发请求。"""
+    plugin = _enabled_plugin(host)
+    called = []
+    plugin._new_session = lambda: called.append(1) or (None, None)
+
+    assert plugin._auto_login_now("测试") is False
+    assert called == []
+
+
+def test_auto_login_now_saves_cookie_and_writes_config(host, monkeypatch):
+    """登录成功且校验通过后：Cookie 写入插件数据，并按配置回写配置字段。"""
+    module = host.module
+    plugin = _enabled_plugin(
+        host,
+        cookie="cf_clearance=KEEP; 3rir_2132_sid=old",
+        auto_login=True,
+        account="u",
+        password="p",
+        save_login_cookie=True,
+    )
+    session = _FakeSession()
+    monkeypatch.setattr(plugin, "_new_session", lambda: (session, "fake"))
+    monkeypatch.setattr(plugin, "_perform_login", lambda s: {"3rir_2132_auth": "new"})
+    monkeypatch.setattr(plugin, "_verify_cookie", lambda cookie: "luobop")
+
+    assert plugin._auto_login_now("Cookie 已失效") is True
+    assert session.closed is True
+    # cf_clearance 必须被保住
+    assert "cf_clearance=KEEP" in plugin._cookie
+    assert "3rir_2132_auth=new" in plugin._cookie
+    assert plugin.store[module.KEY_LOGIN_COOKIE] == plugin._cookie
+    assert plugin.saved_config["cookie"] == plugin._cookie
+
+
+def test_auto_login_now_keeps_config_when_writeback_disabled(host, monkeypatch):
+    """关掉回写时只写插件数据，配置字段保持用户原值。"""
+    module = host.module
+    plugin = _enabled_plugin(
+        host,
+        cookie="cf_clearance=KEEP",
+        auto_login=True,
+        account="u",
+        password="p",
+        save_login_cookie=False,
+    )
+    monkeypatch.setattr(plugin, "_new_session", lambda: (_FakeSession(), "fake"))
+    monkeypatch.setattr(plugin, "_perform_login", lambda s: {"3rir_2132_auth": "new"})
+    monkeypatch.setattr(plugin, "_verify_cookie", lambda cookie: "luobop")
+
+    assert plugin._auto_login_now("Cookie 已失效") is True
+    assert plugin.store[module.KEY_LOGIN_COOKIE] == plugin._cookie
+    assert "cookie" not in plugin.saved_config
+
+
+def test_auto_login_now_rejects_cookie_that_fails_verification(host, monkeypatch):
+    """登录看似成功但新 Cookie 打不开签到页时，不能污染现有配置。"""
+    module = host.module
+    plugin = _enabled_plugin(
+        host,
+        cookie="cf_clearance=KEEP",
+        auto_login=True,
+        account="u",
+        password="p",
+    )
+    monkeypatch.setattr(plugin, "_new_session", lambda: (_FakeSession(), "fake"))
+    monkeypatch.setattr(plugin, "_perform_login", lambda s: {"3rir_2132_auth": "new"})
+    monkeypatch.setattr(plugin, "_verify_cookie", lambda cookie: None)
+
+    assert plugin._auto_login_now("Cookie 已失效") is False
+    assert plugin._cookie == "cf_clearance=KEEP"
+    assert module.KEY_LOGIN_COOKIE not in plugin.store
+
+
+def test_auto_login_now_survives_login_exception(host, monkeypatch):
+    """登录过程抛异常时不得中断签到主流程。"""
+    plugin = _enabled_plugin(host, auto_login=True, account="u", password="p")
+    session = _FakeSession()
+    monkeypatch.setattr(plugin, "_new_session", lambda: (session, "fake"))
+
+    def boom(_session):
+        raise RuntimeError("网络炸了")
+
+    monkeypatch.setattr(plugin, "_perform_login", boom)
+
+    assert plugin._auto_login_now("Cookie 已失效") is False
+    assert session.closed is True
+
+
+def test_verify_cookie_reads_username_from_sign_page(host):
+    """校验新 Cookie 的方式是直接访问签到页并读用户名。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: _StubResponse(
+            text='<a href="home.php?mod=space&uid=1" title="访问我的空间">luobop</a>'
+        )
+    }
+
+    assert plugin._verify_cookie("a=1") == "luobop"
+
+
+def test_verify_cookie_returns_none_when_not_logged_in(host):
+    """签到页显示「请先登录」时应判定校验失败。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: _StubResponse(
+            text="<p>您需要先登录才能继续本操作</p>"
+        )
+    }
+
+    assert plugin._verify_cookie("a=1") is None
+
+
+def test_verify_cookie_returns_none_on_cloudflare(host):
+    """被 Cloudflare 拦截时不能把候选 Cookie 判为可用。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: _StubResponse(
+            status_code=403, text=CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    assert plugin._verify_cookie("a=1") is None
+
+
+# ---------------------------------------------------------------------------
+# 签到主流程：Cookie 失效时自动登录并重试
+# ---------------------------------------------------------------------------
+
+
+def test_execute_signin_retries_after_auto_login(host, monkeypatch):
+    """Cookie 失效 -> 自动登录成功 -> 重跑一轮并返回成功结果。"""
+    plugin = _enabled_plugin(host, auto_login=True, account="u", password="p")
+    calls = {"signin": 0, "login": 0}
+
+    def fake_signin_once():
+        calls["signin"] += 1
+        if calls["signin"] == 1:
+            return None, "Cookie 已失效（签到页未显示用户名）"
+        return {"success": True, "message": "ok"}, None
+
+    def fake_login(reason):
+        calls["login"] += 1
+        return True
+
+    monkeypatch.setattr(plugin, "_signin_once", fake_signin_once)
+    monkeypatch.setattr(plugin, "_auto_login_now", fake_login)
+
+    result = plugin._execute_signin()
+
+    assert result == {"success": True, "message": "ok"}
+    assert calls == {"signin": 2, "login": 1}
+
+
+def test_execute_signin_reports_failure_when_relogin_fails(host, monkeypatch):
+    """自动登录失败时仍要如实报告失败，并保留原始原因。"""
+    plugin = _enabled_plugin(host, auto_login=True, account="u", password="p")
+    monkeypatch.setattr(
+        plugin, "_signin_once", lambda: (None, "Cookie 已失效（签到页未显示用户名）")
+    )
+    monkeypatch.setattr(plugin, "_auto_login_now", lambda reason: False)
+
+    result = plugin._execute_signin()
+
+    assert result["success"] is False
+    assert "Cookie 已失效" in result["content"]
+
+
+def test_execute_signin_does_not_relogin_without_credentials(host, monkeypatch):
+    """未配置账号密码时不应尝试自动登录。"""
+    plugin = _enabled_plugin(host, cookie="a=1")
+    monkeypatch.setattr(
+        plugin, "_signin_once", lambda: (None, "Cookie 已失效（签到页未显示用户名）")
+    )
+    called = []
+    monkeypatch.setattr(plugin, "_auto_login_now", lambda reason: called.append(1))
+
+    result = plugin._execute_signin()
+
+    assert result["success"] is False
+    assert called == []
+
+
+def test_execute_signin_does_not_relogin_on_cloudflare(host, monkeypatch):
+    """Cloudflare 拦截不是重新登录能修的，不应触发自动登录。"""
+    plugin = _enabled_plugin(host, auto_login=True, account="u", password="p")
+    monkeypatch.setattr(plugin, "_signin_once", lambda: ({"success": False}, None))
+    called = []
+    monkeypatch.setattr(plugin, "_auto_login_now", lambda reason: called.append(1))
+
+    plugin._execute_signin()
+
+    assert called == []
+
+
+def test_execute_signin_allows_empty_cookie_when_auto_login_configured(host, monkeypatch):
+    """只要配了自动登录，没填 Cookie 也能开跑（由自动登录取回）。"""
+    plugin = _enabled_plugin(host, cookie="", auto_login=True, account="u", password="p")
+    monkeypatch.setattr(plugin, "_signin_once", lambda: ({"success": True}, None))
+
+    assert plugin._execute_signin() == {"success": True}
+
+
+def test_execute_signin_requires_cookie_without_auto_login(host):
+    """既没 Cookie 也没自动登录时，直接报「未配置Cookie」。"""
+    plugin = _enabled_plugin(host, cookie="")
+
+    result = plugin._execute_signin()
+
+    assert result["success"] is False
+    assert result["content"] == "未配置Cookie"
+
+
+# ---------------------------------------------------------------------------
+# 自动登录：配置三处同步
+# ---------------------------------------------------------------------------
+
+
+def test_init_plugin_reads_auto_login_config(host):
+    """配置应被完整读入运行状态。"""
+    plugin = _enabled_plugin(
+        host,
+        auto_login=True,
+        account=" luobop ",
+        password="pw",
+        question_id="3",
+        answer="北京",
+        captcha_mode="service",
+        captcha_service="2captcha",
+        captcha_key="KEY",
+        captcha_base_url="https://my.node/",
+        save_login_cookie=False,
+    )
+
+    assert plugin._auto_login is True
+    assert plugin._account == "luobop"
+    assert plugin._password == "pw"
+    assert plugin._question_id == "3"
+    assert plugin._answer == "北京"
+    assert plugin._captcha_mode == "service"
+    assert plugin._captcha_service == "2captcha"
+    assert plugin._captcha_key == "KEY"
+    assert plugin._captcha_base_url == "https://my.node/"
+    assert plugin._save_login_cookie is False
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_mode,expected_service",
+    [
+        ({"captcha_mode": "bogus"}, "auto", "yescaptcha"),
+        ({"captcha_service": "bogus"}, "auto", "yescaptcha"),
+        ({"captcha_mode": ""}, "auto", "yescaptcha"),
+    ],
+)
+def test_init_plugin_falls_back_on_invalid_captcha_options(
+    host, overrides, expected_mode, expected_service
+):
+    """非法的验证码选项要回落到默认值，不能让自动登录整体不可用。"""
+    plugin = _enabled_plugin(host, **overrides)
+
+    assert plugin._captcha_mode == expected_mode
+    assert plugin._captcha_service == expected_service
+
+
+def test_save_config_persists_auto_login_fields(host):
+    """保存配置时必须把新字段一起写回，否则下次保存会被前端表单静默清空。"""
+    plugin = _enabled_plugin(
+        host,
+        auto_login=True,
+        account="luobop",
+        password="pw",
+        question_id="2",
+        answer="x",
+        captcha_mode="service",
+        captcha_service="2captcha",
+        captcha_key="KEY",
+        captcha_base_url="https://node/",
+        save_login_cookie=False,
+    )
+
+    plugin._save_config()
+
+    saved = plugin.saved_config
+    assert saved["auto_login"] is True
+    assert saved["account"] == "luobop"
+    assert saved["password"] == "pw"
+    assert saved["question_id"] == "2"
+    assert saved["answer"] == "x"
+    assert saved["captcha_mode"] == "service"
+    assert saved["captcha_service"] == "2captcha"
+    assert saved["captcha_key"] == "KEY"
+    assert saved["captcha_base_url"] == "https://node/"
+    assert saved["save_login_cookie"] is False
+
+
+def test_get_form_declares_every_auto_login_field(host):
+    """表单必须声明全部新字段——没声明的字段会在保存时被静默清空。"""
+    plugin = _enabled_plugin(host)
+
+    form, defaults = plugin.get_form()
+    rendered = json.dumps(form, ensure_ascii=False)
+
+    for field in (
+        "auto_login",
+        "account",
+        "password",
+        "question_id",
+        "answer",
+        "captcha_mode",
+        "captcha_service",
+        "captcha_key",
+        "captcha_base_url",
+        "save_login_cookie",
+    ):
+        assert f'"{field}"' in rendered, f"表单缺少字段 {field}"
+        assert field in defaults, f"默认值缺少字段 {field}"
+
+    assert defaults["captcha_mode"] == "auto"
+    assert defaults["save_login_cookie"] is True
+    assert defaults["auto_login"] is False

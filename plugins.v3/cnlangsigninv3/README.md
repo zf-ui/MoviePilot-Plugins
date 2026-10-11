@@ -5,9 +5,18 @@
 
 - 插件 ID：`CnlangSigninV3`
 - 插件目录：`plugins.v3/cnlangsigninv3/`
-- 插件版本：`3.7.0`
+- 插件版本：`3.8.0`
 - 主系统要求：`>=3.0.0`
 
+> **v3.8.0 新增「自动登录」，修复 Cookie 只能签到一次、第二天就失效的问题。**
+> 根因是**浏览器里复制出来的 Cookie 多为会话级**——Discuz 只有在登录时带上
+> `cookietime`（登录页的「自动登录」）才会签发长期凭据。现在插件能在 Cookie 失效时
+> 自己登录、取回 30 天有效期的长期 Cookie 并自动存好。详见 [自动登录](#自动登录)。
+>
+> 实测确认：登录页 `member.php?mod=logging&action=login` 是标准 Discuz 表单，
+> **没有 Cloudflare 质询、没有 Turnstile、没有 Geetest**，只需要一个 4 位图片验证码
+> （被 Cloudflare 质询的只有**签到**路径，登录路径不受影响）。
+>
 > **v3.7.0 起插件改用独立 ID `CnlangSigninV3`，不再占用上游的 `CnlangSigninV2`。**
 > 此前为了让已安装用户的配置与签到数据不被孤立，本插件刻意沿用了上游
 > [xijin285/MoviePilot-Plugins](https://github.com/xijin285/MoviePilot-Plugins) 的插件 ID，
@@ -45,6 +54,8 @@
 | curl_cffi 指纹 | 快速路径可改用 curl_cffi，以真实 Chrome TLS/JA3 + HTTP/2 指纹发请求（默认开启，未安装时自动回退宿主网络组件） |
 | 浏览器模式 | 被 Cloudflare 拦截时用宿主内置浏览器完成验证并签到（默认开启，仅作兜底：交互式挑战实测无法自动通过） |
 | 强制浏览器模式 | 跳过快速路径直接走浏览器模式，用于主动验证浏览器模式是否可用（默认关闭） |
+| **自动登录** | **Cookie 失效时自动重新登录，取回 30 天有效期的长期 Cookie（默认关闭，需填账号密码）** |
+| 验证码识别 | 自动登录时识别 4 位图片验证码：本地 ddddocr 优先，失败自动回退打码平台 |
 | 通知样式 | 5 套通知模板（简约 / 清新 / 科技 / 商务 / 优雅），Cookie 失效时给出专门提示 |
 | 签到寄语 | 自动从一言接口获取 6~50 字的签到寄语，取不到时使用兜底文案 |
 | 历史与统计 | 按天保留签到历史，统计成功率、大洋收益、连续签到天数与最佳签到时段 |
@@ -69,7 +80,15 @@
 | 随机延迟(秒) | 空 | 形如 `100-200`，留空表示不延迟 |
 | 保留历史天数 | `30` | 超期记录在写入时被裁剪 |
 | 通知样式 | `style1` | `style1`~`style5` |
-| Cnlang Cookie | 空 | 国语视界站点 Cookie，必需。**插件不会改写该字段**（浏览器模式的 Cookie 存在插件数据里） |
+| Cnlang Cookie | 空 | 国语视界站点 Cookie，必需。**插件不会改写该字段**（浏览器模式的 Cookie 存在插件数据里）；开启自动登录后由插件自动续期 |
+| 自动登录 | 关 | Cookie 失效时自动重新登录。开启后需填「用户名」「密码」 |
+| 用户名 / 密码 | 空 | 登录用。密码以 Discuz 的 `pwmd5` 形式提交（客户端 MD5），不会明文传输 |
+| 安全提问 / 答案 | `0` / 空 | 账号设置了安全提问时才需要填，`0` 表示未设置 |
+| 验证码方案 | `auto` | `auto` 本地优先、失败回退打码平台；`local` 只用 ddddocr；`service` 只用打码平台 |
+| 打码平台 | `yescaptcha` | `yescaptcha` 或 `2captcha` |
+| 打码平台 Key | 空 | 所选平台的 API Key；`service` 方案下必需 |
+| 打码接口地址 | 空 | 留空用平台默认地址；自建 / 中转服务可覆盖 |
+| 回写 Cookie | 开 | 登录成功后把新 Cookie 同时写进「Cnlang Cookie」配置，重启后无需重填。关掉则只存插件内部数据 |
 
 ### 获取 Cookie
 
@@ -79,7 +98,12 @@
    `Cookie:` 开头的行。
 4. 复制整行 Cookie 值（不含 `Cookie:` 前缀），粘贴到插件配置中。
 
-> Cookie 会周期性失效。签到失败并提示 Cookie 失效时，请重新获取并更新。
+> **v3.8.0 起，第 1 步里「勾选自动登录」这件事可以交给插件做**：开启「自动登录」后，
+> 插件会在 Cookie 失效时自己重新登录并取回 30 天有效期的长期 Cookie。手工复制的
+> Cookie 多为**会话级**，这正是「只能签到一次、第二天就失效」的根因。
+>
+> Cookie 会周期性失效。**首选方案是开启「自动登录」**（见下一节）；没开自动登录时，
+> 签到失败并提示 Cookie 失效就只能手工重新获取。
 >
 > 站点受 Cloudflare 保护，签到路径要求 Cookie 中含有效的 `cf_clearance`。
 > **`cf_clearance` 与 User-Agent 绑定**（实测：与 TLS 指纹**无关**——用 Python
@@ -87,6 +111,78 @@
 > 「浏览器UA」填成与导出 Cookie 时**完全一致**的 `navigator.userAgent`，否则会被立即拒绝。
 >
 > `cf_clearance` 的有效期有限，签到失败时**首选操作就是重新复制一份 Cookie**。
+
+## 自动登录
+
+### 为什么 Cookie 第二天就失效
+
+从浏览器开发者工具里复制的 Cookie，**大多是会话级 Cookie**——站点只在登录时带上
+`cookietime`（登录页的「自动登录」复选框）才会下发长期凭据。手工复制的那一份没有
+走过这条路径，所以服务端一过期就没了。
+
+换句话说：这不是插件 bug，而是**缺少「自己登录拿长期 Cookie」的能力**。
+
+实测确认登录页可以自动化：
+
+| 项目 | 实测结果 |
+| --- | --- |
+| 登录页 `member.php?mod=logging&action=login` | **200**，无 Cloudflare 质询 |
+| 页面结构 | 标准 Discuz 表单：`formhash` / `loginhash` / `seccodehash` |
+| 密码字段 | 客户端 `pwmd5()` 提交，即 `md5(密码)` |
+| 人机验证 | 仅 **4 位图片验证码**，无 Turnstile、无 Geetest |
+| 验证码取图 | 两步：`misc.php?mod=seccode&action=update&idhash=…` 返回的 JS 里带真实图片地址，该地址返回 `image/png`（约 800~1200 字节） |
+| 长期凭据 | 表单里的 `cookietime=2592000`，即 **30 天** |
+
+> 被 Cloudflare 质询的只有**签到**路径，登录路径不受影响——这是自动登录可行的前提。
+
+### 工作方式
+
+1. 正常签到。**只有在签到失败、且判定为 Cookie 失效时**才会触发登录（默认不主动登录）。
+2. 打开登录页，解析 `formhash` / `loginhash` / `seccodehash`。
+3. 取验证码图片并识别：
+   - `auto`（默认）：先用本地 `ddddocr`；识别不出、**或被站点判定填错**，改用打码平台；
+   - `local`：只用 `ddddocr`；
+   - `service`：只用打码平台（需填 Key）。
+4. 提交登录表单，带上 `cookietime=2592000`，拿到 30 天有效期的长期 Cookie。
+5. **先验证再采纳**：用新 Cookie 访问签到页确认确实已登录。验证不过就丢弃并如实报错，
+   绝不假装成功。
+6. 合并新旧 Cookie：**同名覆盖，但保留 `cf_clearance`**——避免登录把已经拿到的
+   Cloudflare 通行证冲掉。
+7. 保存：写入插件内部数据，并按「回写 Cookie」开关决定是否同步写进配置。
+8. 用新 Cookie 重试一次签到。验证码识别错会换一张重试，最多 3 次。
+
+> **为什么是 3 次而不是 2 次**：本地识别失败有两种——「识别不出」（返回空，自然会去试
+> 打码平台）和「认错了」（给出一个格式合法但内容错误的答案，只有站点知道错）。后者在
+> `auto` 模式下会在收到「验证码填写错误」后**升级为打码平台优先**，所以要多留一次机会。
+> 如果报错不是验证码问题（例如密码错误），则不会升级——那种情况重试没有意义。
+
+### 依赖与降级
+
+自动登录的本地识别需要 `ddddocr`，由插件自带的 `pyproject.toml` 声明
+（MoviePilot V3 只从 `plugins.v3/<id>/pyproject.toml` 读取 `[project].dependencies`，
+不读 `requirements.txt`，也不读 `[dependency-groups]`）。
+
+```toml
+dependencies = [
+    "ddddocr>=1.5.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
+```
+
+- 宿主会在安装插件时自动安装；首次需要下载 `onnxruntime` 等轮子（数十 MB），
+  可能要等一会儿。**安装超时上限是 5 分钟**，网速慢时可能失败——重试一次
+  （uv 有缓存，第二次通常很快）即可。
+- **Intel Mac 被刻意排除**：`onnxruntime` 自 1.20 起不再发布 macOS x86_64 构建，
+  在 Intel Mac 上安装 `ddddocr` 必然失败。由于**插件依赖安装失败会导致整个插件安装
+  失败**，这里用环境标记跳过，让 Intel Mac 自动退化为「只用打码平台」。
+- 没装成功也不影响使用：`auto` 方案会自动跳过本地识别、直接走打码平台；
+  `local` 方案则会明确报「本地识别不可用」，而不是静默失败。
+
+### 安全说明
+
+- 密码只存在 MoviePilot 的插件配置里，登录时以 `md5` 形式提交（Discuz 的 `pwmd5`）。
+- 打码平台 Key 只在调用打码接口时使用；`auto` 方案下若本地识别成功，**不会**把图片
+  发到第三方。
+- 若不想把密码交给插件，可以只用「打码平台」方案 + 手工更新 Cookie。
 
 ## 插件 API
 
@@ -107,11 +203,85 @@
 1. 在插件商店里更新本仓库，安装「国语视界签到**V3**」。
 2. 按 [获取 Cookie](#获取-cookie) 重新复制一份**完整**的 Cookie（必须含 `cf_clearance`），
    并把「浏览器UA」填成与导出 Cookie 时**完全一致**的 `navigator.userAgent`。
-3. 按需重新设置签到周期、通知样式等。
-4. 卸载或停用旧的「国语视界签到V2」（若它来自上游仓库，留着不用即可）。
+3. **（v3.8.0 推荐）开启「自动登录」并填入用户名与密码**，这样 Cookie 失效时插件会自己
+   续期，不必再手工复制。详见 [自动登录](#自动登录)。
+4. 按需重新设置签到周期、通知样式等。
+5. 卸载或停用旧的「国语视界签到V2」（若它来自上游仓库，留着不用即可）。
 
 > 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
 > 版本行为不一致，风险高于让用户重填一次。
+
+## v3.8.0 变更说明
+
+### 修复：Cookie 只能签到一次，第二天就失效
+
+**症状**：按 README 复制了一份 Cookie，第一次签到成功，第二天再跑就报 Cookie 失效。
+
+**根因**：从浏览器开发者工具里复制的 Cookie **大多是会话级 Cookie**。Discuz 只在
+登录请求带上 `cookietime`（登录页的「自动登录」复选框）时才签发长期凭据，手工复制的
+那一份没有走过这条路径，所以服务端一过期就没了。**这不是插件 bug**，而是插件缺少
+「自己登录拿长期 Cookie」的能力。
+
+**实测依据**（全部为真实请求）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 登录页 `member.php?mod=logging&action=login` | **200**，`Cf-Mitigated: None`，无挑战 |
+| 表单结构 | `formhash` / `loginhash`（`id="loginform_XXXXX"`）/ `seccodehash` |
+| 密码字段 | `onsubmit="pwmd5('password3_XXXXX')…"`，即 `md5(密码)` |
+| 人机验证 | 仅 4 位图片验证码；**无 Turnstile、无 Geetest** |
+| 验证码取图 | 两步：`misc.php?mod=seccode&action=update&idhash=…` 的 JS 里带真实图片地址，该地址返回 `image/png`（约 800~1200 字节） |
+| 长期凭据 | 表单里的 `cookietime=2592000`（**30 天**） |
+
+> 关键结论：**被 Cloudflare 质询的只有签到路径**，登录路径不受影响。
+> 因此「自动登录」在原理上是可行的，此前认为「必须人工过验证」只适用于签到路径。
+
+### 新增：自动登录
+
+| 项 | 说明 |
+| --- | --- |
+| 触发时机 | **仅当签到失败且判定 Cookie 失效时**，默认不主动登录 |
+| 验证码 | `auto`（本地 ddddocr 优先，被拒后升级为打码平台优先）/ `local` / `service` |
+| 打码平台 | `yescaptcha`、`2captcha`，支持自定义接口地址 |
+| 重试 | 验证码识别错会换一张重试，最多 3 次；非验证码类错误不重试 |
+| 采纳前校验 | 用新 Cookie 访问签到页确认确实已登录，验证不过则丢弃并如实报错 |
+| Cookie 合并 | 同名覆盖，但**保留 `cf_clearance`**，避免登录把已拿到的通行证冲掉 |
+| 保存 | 写入插件内部数据，并按「回写 Cookie」开关决定是否同步写进配置 |
+
+### 新增：pyproject.toml
+
+自动登录的本地识别需要 `ddddocr`。MoviePilot V3 **只**从
+`plugins.v3/<id>/pyproject.toml` 读取 `[project].dependencies`，不读 `requirements.txt`，
+因此本版新增该文件：
+
+```toml
+[project]
+name = "moviepilot-plugin-cnlangsigninv3"
+dynamic = ["version"]
+requires-python = ">=3.14"
+dependencies = [
+    "ddddocr>=1.5.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
+```
+
+`requires-python = ">=3.14"` 与官方 V3 插件一致（MoviePilot v3 自身就是 `>=3.14`）。
+环境标记排除 Intel Mac：`onnxruntime` 没有 macOS x86_64 的 cp314 轮子，在 Intel Mac 上
+安装必然失败，而**插件依赖安装失败会导致整个插件安装失败**（宿主会还原备份或删除插件
+目录），所以宁可让 Intel Mac 退化为「只用打码平台」。
+
+> 注意 PEP 508 标记语法里**没有 `not` 运算符**，只能写成等价的 `!= ... or != ...`。
+>
+> `[tool.moviepilot.dependency-gate]` 这类表**不被当前版本消费**——官方文档明确写着
+> 宿主「只读取 `[project].dependencies`」，所以不要指望它来兜底。
+
+未安装成功时 `auto` 方案会自动降级为打码平台，`local` 方案会明确报错，不会静默失败。
+
+### 其他
+
+- 配置页新增「自动登录设置」卡片；开启自动登录但账号或密码为空时会在日志里明确告警。
+- 回归测试 164 -> **237**（新增登录表单解析、验证码取图与识别、MD5 密码、登录重试、
+  验证码升级兜底、Cookie 合并保留 `cf_clearance`、自动登录编排、配置三方同步等 73 项）。
+- 版本 3.7.0 -> 3.8.0。
 
 ## v3.7.0 变更说明
 
@@ -563,7 +733,15 @@ Content-Type: text/html; charset=UTF-8
 ```
 
 测试使用轻量桩模块提供宿主接口，不访问真实站点，可在任意 Python 3.12+ 环境运行
-（需要 `pytest` 与 `apscheduler>=3.10,<4`）。
+（需要 `pytest` 与 `apscheduler>=3.10,<4`）。当前共 **237 项**回归测试，覆盖 Cookie
+解析与到期判定、签到流程、自动登录（表单解析 / 验证码取图与识别 / 验证码升级兜底 /
+MD5 密码 / 登录重试 / Cookie 合并保留 `cf_clearance`）以及配置三方同步。
+
+自动登录相关的依赖声明在 `plugins.v3/cnlangsigninv3/pyproject.toml`。本地跑测试
+**不需要**安装 `ddddocr`——测试用的是打桩的识别器，只验证编排逻辑。
+
+> 依赖提示：MoviePilot V3 **只**读取 `plugins.v3/<id>/pyproject.toml` 里的
+> `dependencies`，不会读 `requirements.txt`。改动依赖时请只改这个文件。
 
 ## 致谢
 

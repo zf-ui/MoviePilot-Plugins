@@ -1,0 +1,24 @@
+# 插件依赖清单。
+#
+# MoviePilot V3 **只**读取 ``[project].dependencies``（见官方 docs/development-setup.md
+# 「3.1 插件依赖清单」）。``[dependency-groups]``、``uv.lock`` 一律不会被宿主消费。
+#
+# 为什么需要这个文件：自动登录要识别 Discuz 的 4 位图片验证码，本地识别依赖 ddddocr。
+# 不声明的话用户必须自己进容器装，声明了宿主会在安装插件时自动装好。
+#
+# ⚠️ 依赖安装失败会让**整个插件安装失败**（app/adapters/system/plugin/package.py：
+#    失败时还原备份或删除插件目录）。因此下面用环境标记把「装了必然失败」的平台排除掉，
+#    而不是让它去撞墙——那些平台会自动退化为「只用在线打码平台」。
+[project]
+name = "moviepilot-plugin-cnlangsigninv3"
+dynamic = ["version"]
+requires-python = ">=3.14"
+dependencies = [
+    # onnxruntime（ddddocr 的推理后端）自 1.20 起不再发布 macOS x86_64 构建，
+    # cp314 更是只有 arm64 / x86_64-Linux / Windows 轮子。在 Intel Mac 上安装 ddddocr
+    # 必然失败，故排除；Apple Silicon 与其它平台不受影响。
+    #
+    # 注意：PEP 508 标记语法里**没有 `not` 运算符**（只有 and/or/比较），
+    # 所以这里按德摩根律写成等价的 `!= ... or != ...`，不能写 `not (...)`。
+    "ddddocr>=1.5.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
