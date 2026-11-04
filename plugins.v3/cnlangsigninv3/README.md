@@ -295,6 +295,39 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 > 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
 > 版本行为不一致，风险高于让用户重填一次。
 
+## v3.9.3 变更说明
+
+### 修复：「还在挑战页」的误判，把已经解出来的 token 丢掉了
+
+3.9.1 实战日志：
+
+```text
+Browserless solve 结果：found=True solved=True 耗时=1884
+Browserless 页面诊断：token 来源=无，页面有验证组件=False，找到表单=False，表单字段数=0，solve token 长度=730
+云端浏览器仍停在 Cloudflare 验证页（solve 未放行），页面标题：每日签到 - 国语视界
+```
+
+三个信号凑在一起就说明判错了：`solve` 成功了、token 拿到了 730 字节、页面标题是
+「每日签到」而不是「Just a moment」。根因是判据里写了 `challenge-platform`——
+Cloudflare 会给**每一个**页面注入 `/cdn-cgi/challenge-platform/scripts/jsd/main.js`
+做 JSD 检测，正常页面也带这段。于是签到页被判成挑战页，带着刚拿到的 token 直接返回。
+
+现在只认真正的挑战页特征：标题是「Just a moment / Attention Required」，或页面里有
+`#challenge-form` / `#cf-chl-widget` / `#cf-error-details`，或正文前 200 字就是
+「Checking your browser」。同时把「页面有验证组件」的判断提到所有提前返回之前——
+诊断里那句 `有验证组件=False` 之前是假的。
+
+### 修复：本地浏览器把「请先完成人机验证」记成签到成功
+
+回退到本地浏览器后，它拿到了真实页面、也提交了，但站点回的还是那句话。旧逻辑只要求
+解析到 `<div class="c">` 里的文案就落库成功，于是通知写着「签到成功」而实际没签到。
+现在命中人机验证文案一律判失败，并说明「本地浏览器产不出 Turnstile token」。
+
+## v3.9.2 变更说明
+
+作者信息归位本仓库：`author` 从上游 `xijin285` 改为 `zf-ui`，插件市场卡片上显示的名字
+与作者主页都指向本仓库维护者。功能无改动。
+
 ## v3.9.1 变更说明
 
 ### 修复：提交被站点人机验证挡回，云端浏览器一次都没被调用

@@ -273,9 +273,25 @@ BQL_SUBMIT_SCRIPT = r"""
   out.url = location.href;
   const root = document.documentElement ? document.documentElement.innerHTML : "";
 
-  // A) 还停在 Cloudflare 挑战页：solve 没解出来，或节点 IP 被拦
-  if (/just a moment|请稍候|安全验证|checking your browser|attention required/i.test(out.title)
-      || /cf-chl|_cf_chl_opt|challenge-platform/i.test(root)) {
+  // 页面上的验证组件：Turnstile widget 可能在 data-sitekey 上，也可能只是个 iframe。
+  // 先算出来，后面任何一次提前返回，诊断日志里都能看到它。
+  out.widget = !!document.querySelector(
+    "[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']");
+
+  // A) 是否还停在「整页挑战」。
+  //
+  // 只认真正的挑战页特征，**绝对不能**用「HTML 里有没有 challenge-platform」来判断：
+  // Cloudflare 会给每一个页面注入 /cdn-cgi/challenge-platform/scripts/jsd/main.js
+  // 做 JSD 检测，正常的签到页也带这段。v3.9.1 就是栽在这里——页面标题明明是
+  // 「每日签到 - 国语视界」，却因为这段脚本被判成挑战页，握着 solve 刚返回的
+  // 730 字节 token 直接返回，签到自然没成。
+  const interstitial =
+      /just a moment|attention required|checking your browser|请稍候/i.test(out.title)
+      || !!document.querySelector(
+           "#challenge-form, #cf-chl-widget, .cf-browser-verification, #cf-error-details")
+      || /checking your browser|verify you are human|请稍候\.\.\./i.test(
+           ((document.body && document.body.innerText) || "").slice(0, 200));
+  if (interstitial) {
     out.why = "challenge";
     return JSON.stringify(out);
   }
@@ -323,8 +339,6 @@ BQL_SUBMIT_SCRIPT = r"""
   };
   let token = (solveToken || "").trim();
   out.tokenFrom = token ? "solve" : "";
-  out.widget = !!document.querySelector(
-    "[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']");
   if (!token) {
     const deadline = Date.now() + 15000;
     while (!token && Date.now() < deadline) {
@@ -1124,7 +1138,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.2"
+    plugin_version = "3.9.3"
     # 插件作者（本仓库维护者；不再沿用上游 xijin285）
     plugin_author = "zf-ui"
     # 作者主页
@@ -3274,6 +3288,15 @@ class CnlangSigninV3(_PluginBase):
             return True
         content = content.strip()
         logger.info(f"签到响应：{content}")
+        if _looks_like_human_check(content):
+            # 本地浏览器即便拿到了真实页面，也产不出 Turnstile token（验证组件由页面
+            # 自绘的 widget 承载，且需要被判定为非自动化）。这种情况必须如实报失败——
+            # 之前把这句话当成成功文案落库，通知里写着「签到成功」而实际没签到。
+            self._record_failure(
+                f"站点要求先通过人机验证，签到未完成（站点原文：{content}）。"
+                "本地浏览器无法产出 Turnstile token，请确认已配置 Browserless 且云端签到可用。"
+            )
+            return True
 
         credit_html = self._browser_fetch(page, CREDIT_URL) or ""
         money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_html) or "未知"

@@ -4415,3 +4415,62 @@ def test_signin_by_browserless_falls_back_when_session_missing(host, monkeypatch
     assert plugin._signin_by_browserless() is None
     assert len(calls["requests"]) == 1
     assert "人机验证" in plugin._browserless_error
+
+
+# ---------------------------------------------------------------------------
+# 3.9.2 / 3.9.3：两个把「云端已通过」误判成失败、把「失败」误判成成功的坑
+# ---------------------------------------------------------------------------
+
+
+def test_bql_submit_script_does_not_use_challenge_platform_as_challenge_marker(host):
+    """页面元素里带 challenge-platform 不代表还在挑战页。
+
+    Cloudflare 会给**每一个**页面注入 /cdn-cgi/challenge-platform/scripts/jsd/main.js
+    做 JSD 检测。3.9.1 用它当挑战判据，结果正常的签到页（标题「每日签到」）被判成挑战页，
+    握着 solve 刚返回的 730 字节 token 直接返回，签到必然失败。
+    """
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错")
+
+    # 判据里不能出现 challenge-platform（注释里提到它是可以的，代码里不能拿它做判定）
+    assert "challenge-platform/i.test" not in script
+    assert '"challenge-platform"' not in script
+    # 只认真正的挑战页特征
+    assert "#challenge-form" in script
+    assert "cf-browser-verification" in script
+
+
+def test_bql_submit_script_computes_widget_before_challenge_check(host):
+    """验证组件必须在任何提前返回之前算出来，否则诊断永远是「有验证组件=False」。"""
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错")
+
+    widget_at = script.index("out.widget = !!document.querySelector")
+    challenge_at = script.index("const interstitial =")
+    assert widget_at < challenge_at
+
+
+def test_finish_browser_signin_reports_human_check_as_failure(host):
+    """本地浏览器被 Turnstile 挡回时必须报失败，不能把这句话当成功文案落库。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    page = _FakePage()
+    page.fetch_map = {
+        module.SIGN_SUBMIT_URL: '<div class="c">请先完成人机安全验证后再签到！</div>',
+        module.CREDIT_URL: '<span id="hcredit_2">262</span>',
+    }
+    html = (
+        '<input name="formhash" value="ff00" />'
+        '<a title="访问我的空间">luobop</a>'
+        "<p>您本月已累计签到:<b>1</b>"
+    )
+
+    plugin._finish_browser_signin(page, html)
+
+    last = plugin.get_data(module.KEY_LAST_RESULT)
+    assert last["success"] is False
+    assert "人机验证" in last["content"]
+    # 不能悄悄写成「签到成功」
+    assert "签到成功" not in last["content"]
