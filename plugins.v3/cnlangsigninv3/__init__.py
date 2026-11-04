@@ -145,6 +145,39 @@ CF_ADVICE = (
     "若发现该值与你的真实浏览器不符，请**覆盖掉它**，否则新 Cookie 同样会被拒绝；\n"
     "4）cf_clearance 有效期有限，失效后重复上述步骤即可。"
 )
+
+# 站点在**提交**阶段给出的「人机验证未通过」文案。
+#
+# 这是本插件最容易误判的一类失败：签到页 GET 是正常 200（用户名、formhash 都能解析），
+# 只有 POST 提交被服务端挡回一句「请先完成人机安全验证后再签到！」。它既不是 403、
+# 也没有 Cf-Mitigated 头，因此云端的拦截判定（_request 里的 cf_blocked）不会触发，
+# 旧版本会把整轮签到记成普通失败，而**不会**去调 Browserless。
+#
+# 实测（截图 + 抓包）确认：cnlang 的签到表单里嵌了一个 Cloudflare Turnstile 组件，
+# 服务端会校验 POST 里的 cf-turnstile-response。纯 HTTP 提交永远拿不到该 token，
+# 必须由浏览器里解验证产出，因此这里必须把它当作「人机验证」而不是普通失败处理。
+HUMAN_CHECK_HINTS = (
+    "人机安全验证",
+    "人机验证",
+    "安全验证未通过",
+    "请先完成验证",
+)
+
+
+def _looks_like_human_check(text: Optional[str]) -> bool:
+    """判断一段响应文案是不是「站点要求先过人工/人机验证」。
+
+    只看提交响应，不看页面：页面本身可能正常加载（甚至已经渲染出验证组件），
+    因此不能用「页面里有没有 turnstile」来判定，只能认站点回给我们的那句话。
+
+    :param text: 提交签到后解析出的结果文案
+    :return: 命中任一人机验证提示词时为 True
+    """
+    value = str(text or "")
+    if not value:
+        return False
+    return any(hint in value for hint in HUMAN_CHECK_HINTS)
+
 # Cloudflare 自管 Cookie（cf_clearance / __cf_bm / cf_chl_* …）。
 # 早期版本以为「把旧通行证注入浏览器会让 CF 不信任会话」而把它们剔除，实测不成立：
 # cf_clearance 是**域级**的，只要还在有效期内，注入后首页与签到页都能直接放行。
@@ -219,17 +252,21 @@ BROWSERLESS_ADVICE = (
 # 脚本职责（全部在云端浏览器里执行，不发起任何本机请求）：
 # 1. 先判断当前是不是还停在挑战页（solve 超时 / 被拦），是就原样返回诊断；
 # 2. 读用户名判断登录态，读 formhash，判断「今日已签到」；
-# 3. 从 ``window.turnstile`` 或页面输入框取 Turnstile token（站点若在签到表单里
-#    嵌了 widget，这一步是必需的；没有 widget 时取到空串，不影响提交）；
-# 4. 同源 POST 签到接口，解析 ``<div class="c">`` 里的结果文案；
-# 5. 顺手读一次积分（大洋）余额，省掉一次额外导航。
+# 3. 取 Turnstile token：优先用 ``solve`` 返回的那一枚（Browserless 只产 token、
+#    不触发站点回调，所以必须由脚本显式回填），取不到再等页面 widget 自己产出；
+# 4. 把真实表单整体序列化后补上 token，同源 POST 签到接口——手工拼字段名会漏掉
+#    站点新加的隐藏字段，这是「看起来提交了却被人机验证挡回」的常见根因；
+# 5. 解析 ``<div class="c">`` 里的结果文案；若仍被人机验证拒绝，带上 token 来源
+#    与表单信息返回 ``why="human-check"``，供上层给出可执行的排查结论；
+# 6. 顺手读一次积分（大洋）余额，省掉一次额外导航。
 BQL_SUBMIT_SCRIPT = r"""
 (async () => {
   const SAY = __SAY__;
   const SUBMIT_URL = "__SUBMIT_URL__";
   const CREDIT_URL = "__CREDIT_URL__";
   const out = {ok: false, why: "", title: "", url: "", username: "", already: false,
-               content: "", money: "未知", month: "", status: 0};
+               content: "", money: "未知", month: "", status: 0,
+               tokenFrom: "", widget: false, form: false, fields: 0};
   const strip = (html) => (html || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 
   out.title = document.title || "";
@@ -265,10 +302,12 @@ BQL_SUBMIT_SCRIPT = r"""
     return JSON.stringify(out);
   }
 
-  // D) Turnstile token：站点若在签到表单里嵌了 widget，提交必须带上它。
-  //    widget 是异步渲染、异步解出的，因此先读一次，读不到就轮询等一会
-  //    （solve 把整页挑战放行后，页面自己的 widget 通常几秒内就会产出 token）。
-  const readToken = () => {
+  // D) Turnstile token：站点把验证结果放在 cf-turnstile-response 里，服务端会校验。
+  //    来源优先级：solve 直接返回的 token > 页面 widget 自己产出的 token。
+  //    Browserless 的 solve 只负责产出 token，**不会**触发站点挂在 widget 上的回调，
+  //    所以必须由我们把 token 显式回填进表单，页面不会自己写进去。
+  const solveToken = __TOKEN__;
+  const readPageToken = () => {
     try {
       if (window.turnstile && typeof window.turnstile.getResponse === "function") {
         const value = window.turnstile.getResponse();
@@ -282,24 +321,38 @@ BQL_SUBMIT_SCRIPT = r"""
     }
     return "";
   };
-  let token = readToken();
+  let token = (solveToken || "").trim();
+  out.tokenFrom = token ? "solve" : "";
+  out.widget = !!document.querySelector(
+    "[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']");
   if (!token) {
-    const hasWidget = !!document.querySelector("[data-sitekey], .cf-turnstile");
-    const tokenDeadline = Date.now() + 8000;
-    while (!token && hasWidget && Date.now() < tokenDeadline) {
+    const deadline = Date.now() + 15000;
+    while (!token && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 300));
-      token = readToken();
+      token = readPageToken();
     }
+    if (token) out.tokenFrom = "page";
   }
 
-  const body = new URLSearchParams();
+  // E) 用真实表单的字段提交：站点可能在表单里塞了额外隐藏字段，手工拼字段名迟早会漏。
+  //    先整体序列化表单，再用我们的值覆盖关键字段。
+  const form = fh.form || document.querySelector("form");
+  out.form = !!form;
+  const body = new FormData();
+  if (form) {
+    try {
+      new FormData(form).forEach((value, key) => { body.set(key, value); });
+    } catch (err) {}
+  }
+  out.fields = Array.from(body.keys()).length;
   body.set("formhash", fh.value);
   body.set("qdxq", "kx");
   body.set("qdmode", "1");
   body.set("todaysay", SAY);
   body.set("fastreply", "0");
   if (token) {
-    // 字段名两边都写：Discuz 插件作者可能自定义了字段名，多写一个不影响校验
+    // 字段名两边都写：站点可能在服务端读 cf-turnstile-response，也可能自定义成 turnstile，
+    // 多写一个不影响校验。
     body.set("cf-turnstile-response", token);
     body.set("turnstile", token);
   }
@@ -308,14 +361,20 @@ BQL_SUBMIT_SCRIPT = r"""
     method: "POST",
     body: body,
     credentials: "include",
-    headers: {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-              "X-Requested-With": "XMLHttpRequest"}
+    headers: {"X-Requested-With": "XMLHttpRequest"}
   });
   out.status = res.status;
   const text = await res.text();
   const box = text.match(/<div class="c">([\s\S]*?)<\/div>/);
   out.content = box ? strip(box[1]) : "";
   if (!out.content && text.length < 600) out.content = strip(text);
+
+  // 站点仍然拒绝人机验证：把 token 来源与表单情况一起带回，才能分清是
+  // 「压根没拿到 token」还是「token 被服务端判废（IP 不一致 / 已被用过）」。
+  if (__HUMAN_HINTS__.some((hint) => out.content.indexOf(hint) >= 0)) {
+    out.why = "human-check";
+    return JSON.stringify(out);
+  }
 
   const month = root.match(/您本月已累计签到:\s*<b>(\d+)<\/b>/);
   if (month) out.month = month[1];
@@ -333,21 +392,50 @@ BQL_SUBMIT_SCRIPT = r"""
 
 # BrowserQL mutation。
 #
-# 只做一次请求就够：cnlang 的签到提交只需要 ``formhash`` + 会话（cf_clearance），
-# 不像某些 NexusPHP 站点要先把 Turnstile token 交回服务端校验再提交，因此不需要
-# qingyukb 项目里那套 ``solve -> reconnect -> 第二段注入 token`` 的两段式。
-# 单请求既省一半额度，也少了「会话接不回来」的失败面。
+# 只做一次请求就够：``solve`` 会把 Turnstile token 一起返回（GraphQL 的 ``token``
+# 字段），同一个会话里紧接着用 ``evaluate`` 把 token 回填进表单并提交即可，不需要
+# qingyukb 项目里 ``solve -> reconnect -> 第二段注入`` 的两段式。单请求既省一半额度，
+# 也少了「会话接不回来」的失败面。
+#
+# 注意 ``token`` 字段不能省：站点（cnlang）在签到表单里嵌了 Turnstile widget，服务端
+# 会校验 POST 里的 cf-turnstile-response。solve 只负责产出 token，**不会**触发站点
+# 挂在 widget 上的回调，页面自己不会把值写进表单——不取回来这一轮必然失败。
 BQL_SIGN_MUTATION = """
 mutation CnlangSign($cookies: [CookieInput!]!, $url: String!, $beforeWait: Float!,
-                    $solveTimeout: Float!, $afterWait: Float!, $submit: String!) {
+                    $solveTimeout: Float!, $afterWait: Float!, $submit: String!,
+                    $reconnectTimeout: Float!) {
   cookies(cookies: $cookies) { cookies { name } }
   goto(url: $url, waitUntil: domContentLoaded) { status }
   waitBefore: waitForTimeout(time: $beforeWait) { time }
-  solve: solve(timeout: $solveTimeout) { found solved time }
+  solve: solve(timeout: $solveTimeout) { found solved time token }
   waitAfter: waitForTimeout(time: $afterWait) { time }
   submit: evaluate(content: $submit) { value }
+  session: reconnect(timeout: $reconnectTimeout) { browserQLEndpoint }
 }
 """
+
+# 第二段：把第一段 solve 拿到的 token 回填页面并提交。
+#
+# 为什么需要它：``solve`` 的 token 只在响应里，而 ``evaluate`` 的脚本内容必须在请求
+# 发出前就确定——单次请求里没法「用后一步的产物去填前一步的参数」。若第一段提交后
+# 站点仍判「人机验证未通过」，就带着 token 回到同一会话（``reconnect``）再提交一次。
+#
+# 复用会话必须重新 ``goto``：实测 ``reconnect`` 只保住浏览器与 cookie / cf_clearance，
+# 页面本身是新的，第一段那个页面不会保留。
+BQL_INJECT_MUTATION = """
+mutation CnlangInject($cookies: [CookieInput!]!, $url: String!, $beforeWait: Float!,
+                      $afterWait: Float!, $submit: String!) {
+  cookies(cookies: $cookies) { cookies { name } }
+  goto(url: $url, waitUntil: domContentLoaded) { status }
+  waitBefore: waitForTimeout(time: $beforeWait) { time }
+  submit: evaluate(content: $submit) { value }
+  waitAfter: waitForTimeout(time: $afterWait) { time }
+}
+"""
+
+# 会话空闲保留时长（毫秒）。两段请求之间插件还要做 JSON 解析、日志与一次网络往返，
+# 留 120 秒足够，太长会让云端把浏览器空占着。
+BQL_RECONNECT_TIMEOUT = 120000
 
 
 def _is_cloudflare_cookie(name: str) -> bool:
@@ -831,18 +919,24 @@ def _bql_error_text(payload: Any) -> str:
     return f"{message}（步骤：{path}）" if path else message
 
 
-def _bql_submit_script(say: str) -> str:
+def _bql_submit_script(say: str, token: str = "") -> str:
     """生成页面内提交脚本（替换占位符）。
 
     寄语用 ``json.dumps`` 序列化成 JS 字符串字面量再替换，而不是手工拼引号：
     一言接口返回的文案可能带引号、反斜杠或换行，手工拼接会把脚本整段截断。
 
     :param say: 签到寄语，必须已满足站点 6~50 字的要求
+    :param token: ``solve`` 返回的 Turnstile token，会被回填进签到表单；
+        为空时脚本会尝试从页面 widget 自己读一次
     :return: 可直接作为 ``evaluate(content:)`` 参数的脚本
     """
     literal = json.dumps(str(say or SAY_FALLBACK), ensure_ascii=False)
+    token_literal = json.dumps(str(token or "").strip())
+    hints_literal = json.dumps(list(HUMAN_CHECK_HINTS), ensure_ascii=False)
     return (
         BQL_SUBMIT_SCRIPT.replace("__SAY__", literal)
+        .replace("__TOKEN__", token_literal)
+        .replace("__HUMAN_HINTS__", hints_literal)
         .replace("__SUBMIT_URL__", SIGN_SUBMIT_URL)
         .replace("__CREDIT_URL__", CREDIT_URL)
     )
@@ -1030,7 +1124,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.0"
+    plugin_version = "3.9.1"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -1407,7 +1501,7 @@ class CnlangSigninV3(_PluginBase):
 
         if self._force_browser:
             logger.info("已开启「强制浏览器模式」，跳过 HTTP 快速路径")
-            result = self._handle_cloudflare_block()
+            result = self._handle_human_check()
             if result is not None:
                 return result
             # 走到这里说明云端浏览器确认 Cookie 已失效：交给自动登录自愈，
@@ -1449,7 +1543,7 @@ class CnlangSigninV3(_PluginBase):
         if cf_blocked:
             # 人机验证靠重新登录修不好（登录接口不会下发 cf_clearance），走云端浏览器兜底；
             # 若云端浏览器确认是 Cookie 失效，则返回原因交给上层触发自动登录。
-            result = self._handle_cloudflare_block()
+            result = self._handle_human_check()
             if result is None:
                 return None, self._cookie_invalid_hint or "Cookie 已失效"
             return result, None
@@ -1493,7 +1587,7 @@ class CnlangSigninV3(_PluginBase):
             },
         )
         if cf_blocked:
-            result = self._handle_cloudflare_block()
+            result = self._handle_human_check()
             if result is None:
                 return None, self._cookie_invalid_hint or "Cookie 已失效"
             return result, None
@@ -1510,6 +1604,17 @@ class CnlangSigninV3(_PluginBase):
             return self._record_failure("未获取到签到响应内容，签到结果未知"), None
         content = content.strip()
         logger.info(f"签到响应：{content}")
+
+        # 站点在**提交**阶段挡回「请先完成人机安全验证后再签到！」：
+        # 签到表单里嵌了 Turnstile，服务端校验 POST 里的 cf-turnstile-response，
+        # 纯 HTTP 永远拿不到这个 token。这类失败既不是 403 也没有 Cf-Mitigated 头，
+        # 因此上面的 cf_blocked 判定不会命中，必须在这里转给浏览器模式。
+        if _looks_like_human_check(content):
+            logger.warning("站点要求先通过人机验证，改用浏览器完成签到")
+            result = self._handle_human_check()
+            if result is None:
+                return None, self._cookie_invalid_hint or "Cookie 已失效"
+            return result, None
 
         # 步骤 3：读取积分（大洋）余额
         logger.info(f"步骤3：获取积分信息{proxy_hint}")
@@ -1531,16 +1636,24 @@ class CnlangSigninV3(_PluginBase):
     # Cloudflare 拦截与浏览器模式
     # ------------------------------------------------------------------
 
-    def _handle_cloudflare_block(self) -> Optional[Dict[str, Any]]:
-        """处理 Cloudflare 人机验证拦截。
+    def _handle_human_check(self) -> Optional[Dict[str, Any]]:
+        """处理站点的人机验证拦截。
+
+        站点目前有两种表现，本方法都覆盖：
+
+        1. **整页质询**：签到页 GET 直接被 Cloudflare 挡成「Just a moment」，
+           由 ``_request`` 判定 ``cf_blocked`` 后进来；
+        2. **表单内嵌 Turnstile**：页面正常加载，只有提交被服务端挡回一句
+           「请先完成人机安全验证后再签到！」。这种情况 GET 完全正常，靠
+           ``_looks_like_human_check`` 认文案后进来。
 
         优先级：**Browserless 云端浏览器** > 本地浏览器模式 > 给出可执行建议。
 
-        云端优先的理由：站点的挑战是 interactive Turnstile，判定依据是出口 IP 信誉
-        与浏览器指纹。本地（尤其是容器内）浏览器在这两项上都天然劣势，实测跑满
-        150 秒也拿不到 cf_clearance；Browserless 的 stealth Chromium + ``solve``
-        是目前唯一稳定的自动化方案。本地浏览器模式保留为兜底，因为用户若把
-        MoviePilot 跑在有真实显示的桌面环境上，它偶尔也能过。
+        云端优先的理由：这两种表现都要求一个真实浏览器里解出来的 Turnstile token，
+        而判定依据是出口 IP 信誉与浏览器指纹。本地（尤其是容器内）浏览器在这两项上
+        都天然劣势，实测跑满 150 秒也拿不到 cf_clearance；Browserless 的 stealth
+        Chromium + ``solve`` 是目前唯一稳定的自动化方案。本地浏览器模式保留为兜底，
+        因为用户若把 MoviePilot 跑在有真实显示的桌面环境上，它偶尔也能过。
 
         :return: 已落库的签到结果；返回 None 表示「Cookie 已确认失效」，
                  原因见 ``self._cookie_invalid_hint``，调用方应触发自动登录而不是落库
@@ -1548,7 +1661,7 @@ class CnlangSigninV3(_PluginBase):
         self._cookie_invalid_hint = None
         reasons: List[str] = []
         if self._browserless_ready():
-            logger.warning("检测到 Cloudflare 人机验证，改用 Browserless 云端浏览器执行签到")
+            logger.warning("检测到人机验证，改用 Browserless 云端浏览器执行签到")
             result = self._signin_by_browserless()
             if result is not None:
                 return result
@@ -1563,12 +1676,12 @@ class CnlangSigninV3(_PluginBase):
                 )
             logger.warning("Browserless 未完成签到，回退本地浏览器模式")
         elif not self._browser_mode:
-            logger.error("未配置 Browserless 且未开启浏览器模式，无法通过 Cloudflare 人机验证")
+            logger.error("未配置 Browserless 且未开启浏览器模式，无法通过站点的机验证")
             return self._record_failure(CF_ADVICE)
         else:
             logger.warning(
                 "未配置 Browserless Token，只能使用本地浏览器模式"
-                "（容器环境下基本过不了 interactive Turnstile）"
+                "（容器环境下基本过不了站点内嵌的 Turnstile）"
             )
 
         if not self._signin_by_browser():
@@ -2273,7 +2386,13 @@ class CnlangSigninV3(_PluginBase):
                 logger.info("Browserless：API 请求经系统代理发出")
         return urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map))
 
-    def _bql_post(self, endpoint: str, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _bql_post(
+        self,
+        endpoint: str,
+        variables: Dict[str, Any],
+        query: str = BQL_SIGN_MUTATION,
+        operation: str = "CnlangSign",
+    ) -> Optional[Dict[str, Any]]:
         """向 BrowserQL 发一次 GraphQL 请求并返回 ``data``。
 
         失败时不抛异常，只把原因写进 ``self._browserless_error`` 并返回 None——
@@ -2284,13 +2403,15 @@ class CnlangSigninV3(_PluginBase):
 
         :param endpoint: 已附加 Token 的 BrowserQL 地址
         :param variables: GraphQL 变量
+        :param query: mutation 文本（第一段解验证 / 第二段回填 token 用不同的 mutation）
+        :param operation: ``operationName``，必须与 mutation 名一致
         :return: 响应里的 ``data``；任何失败返回 None
         """
         read_timeout = self._browserless_solve_timeout + BQL_READ_MARGIN
         payload = json.dumps(
             {
-                "operationName": "CnlangSign",
-                "query": BQL_SIGN_MUTATION,
+                "operationName": operation,
+                "query": query,
                 "variables": variables,
             }
         ).encode("utf-8")
@@ -2355,12 +2476,88 @@ class CnlangSigninV3(_PluginBase):
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _bql_page_of(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """从一次 BrowserQL 响应里取出页面脚本结果。
+
+        :param data: ``_bql_post`` 返回的 ``data``
+        :return: 脚本返回的字典；取不到或解析失败时返回空字典
+        """
+        if not isinstance(data, dict):
+            return {}
+        submit = data.get("submit")
+        submit = submit if isinstance(submit, dict) else {}
+        return self._parse_bql_page(submit.get("value"))
+
+    @staticmethod
+    def _log_bql_diag(page: Dict[str, Any], token: str) -> None:
+        """把「token 从哪来、页面上有没有 widget、表单有几个字段」打进日志。
+
+        这几项决定了失败时该往哪个方向查：没有 widget 说明站点换了验证方式；
+        有 widget 但 token 来源为空说明 solve 没产 token 或页面没被放行；
+        表单字段数为 0 说明脚本没找到 form，提交的字段可能不全。
+        """
+        logger.info(
+            f"Browserless 页面诊断：token 来源={page.get('tokenFrom') or '无'}，"
+            f"页面有验证组件={page.get('widget')}，找到表单={page.get('form')}，"
+            f"表单字段数={page.get('fields')}，solve token 长度={len(token)}"
+        )
+
+    def _bql_inject_token(
+        self,
+        data: Dict[str, Any],
+        cookies: List[Dict[str, Any]],
+        token: str,
+        say: str,
+    ) -> Optional[Dict[str, Any]]:
+        """第二段：回到第一段 solve 所在的会话，回填 token 后再提交一次。
+
+        ``solve`` 产出的 token 只在响应里，而 ``evaluate`` 的脚本必须在请求发出前就
+        确定，所以单次请求没法把自己的产物喂给自己的参数——被站点判「人机验证未通过」
+        时只能开第二段。会话由第一段的 ``reconnect`` 保住；页面本身不会保留，因此
+        第二段必须重新 ``goto``。
+
+        :param data: 第一段的响应（从中取 ``session.browserQLEndpoint``）
+        :param cookies: 第一段注入的 Cookie，第二段要重新注入
+        :param token: ``solve`` 返回的 Turnstile token
+        :param say: 签到寄语
+        :return: 页面脚本结果；无法复用会话或请求失败时返回 None
+        """
+        session = data.get("session")
+        session = session if isinstance(session, dict) else {}
+        raw_endpoint = str(session.get("browserQLEndpoint") or "").strip()
+        if not raw_endpoint:
+            logger.warning("Browserless 未返回可复用的会话地址，无法执行 token 回填")
+            return None
+        try:
+            endpoint = _bql_endpoint(raw_endpoint, self._browserless_token or "")
+        except ValueError as err:
+            logger.warning(f"Browserless 会话地址无效，跳过 token 回填：{err}")
+            return None
+
+        logger.info("Browserless：复用 solve 会话，回填 Turnstile token 后重新提交")
+        variables = {
+            "cookies": cookies,
+            "url": SIGN_PAGE_URL,
+            "beforeWait": float(BQL_NAV_WAIT),
+            "afterWait": float(BQL_AFTER_WAIT),
+            "submit": _bql_submit_script(say, token),
+        }
+        second = self._bql_post(
+            endpoint, variables, query=BQL_INJECT_MUTATION, operation="CnlangInject"
+        )
+        if second is None:
+            return None
+        page = self._bql_page_of(second)
+        return page or None
+
     def _signin_by_browserless(self) -> Optional[Dict[str, Any]]:
         """用 Browserless 云端 stealth 浏览器完成整轮签到。
 
-        一次 GraphQL 请求里做完：注入 Cookie → 打开签到页 → ``solve`` 解挑战 →
-        页面内 POST 签到接口 → 顺手读积分。全程不离开那个浏览器会话，因此
-        ``cf_clearance`` 与 IP / UA 自洽。
+        第一段一次请求做完：注入 Cookie → 打开签到页 → ``solve`` 解挑战 →
+        页面内提交签到 → 顺手读积分。若站点仍判定「人机验证未通过」（cnlang 的签到
+        表单嵌了 Turnstile widget，服务端会校验 POST 里的 ``cf-turnstile-response``），
+        且 ``solve`` 已经产出了 token，则用 ``reconnect`` 保住会话、带上 token 再提交
+        一次——这一步是「纯 HTTP 永远过不去」与「云端浏览器能过」的分水岭。
 
         **不回传 Cookie 是刻意设计**：``cf_clearance`` 与签发时的 IP 绑定，云端节点
         拿到的通行证在本机必然失效，存下来只会造成「有 Cookie 却依然 403」的假象。
@@ -2386,16 +2583,18 @@ class CnlangSigninV3(_PluginBase):
             logger.error(self._browserless_error)
             return None
 
+        say = self._build_say()
         variables = {
             "cookies": cookies,
             "url": SIGN_PAGE_URL,
             "beforeWait": float(BQL_NAV_WAIT),
             "solveTimeout": float(self._browserless_solve_timeout * 1000),
             "afterWait": float(BQL_AFTER_WAIT),
-            "submit": _bql_submit_script(self._build_say()),
+            "submit": _bql_submit_script(say),
+            "reconnectTimeout": float(BQL_RECONNECT_TIMEOUT),
         }
         logger.info(
-            f"Browserless：打开签到页并解 Cloudflare 验证"
+            f"Browserless：打开签到页并解人机验证"
             f"（节点 {self._browserless_url}，solve 预算 {self._browserless_solve_timeout} 秒）"
         )
         data = self._bql_post(endpoint, variables)
@@ -2408,10 +2607,9 @@ class CnlangSigninV3(_PluginBase):
                 f"Browserless solve 结果：found={solve.get('found')} "
                 f"solved={solve.get('solved')} 耗时={solve.get('time')}"
             )
+        token = str(solve.get("token") or "").strip()
 
-        submit = data.get("submit")
-        submit = submit if isinstance(submit, dict) else {}
-        page = self._parse_bql_page(submit.get("value"))
+        page = self._bql_page_of(data)
         if not page:
             self._browserless_error = (
                 "Browserless 未返回可解析的签到页结果（页面脚本执行失败）"
@@ -2419,8 +2617,23 @@ class CnlangSigninV3(_PluginBase):
             )
             logger.error(self._browserless_error)
             return None
-
         why = str(page.get("why") or "")
+        self._log_bql_diag(page, token)
+
+        # 站点仍判人机验证未通过：只有 solve 真的产出了 token 才值得开第二段
+        if why == "human-check" and token:
+            logger.warning("云端浏览器首次提交仍被人机验证拒绝，改用 solve token 回填后重试")
+            second = self._bql_inject_token(data, cookies, token, say)
+            if second is not None:
+                page = second
+                why = str(page.get("why") or "")
+                self._log_bql_diag(page, token)
+        elif why == "human-check" and not token:
+            logger.warning(
+                "云端浏览器首次提交被人机验证拒绝，且 solve 未返回 token"
+                f"（页面上的验证组件：{page.get('widget')}）"
+            )
+
         if page.get("already"):
             logger.info("Browserless：今日已完成签到")
             self._browserless_error = None
@@ -2440,6 +2653,17 @@ class CnlangSigninV3(_PluginBase):
             return None
         if why == "no-formhash":
             self._browserless_error = "云端浏览器已进入签到页但未找到 formhash，页面结构可能已变化"
+            logger.error(self._browserless_error)
+            return None
+        if why == "human-check":
+            self._browserless_error = (
+                "云端浏览器已提交签到，但站点仍判定未完成人机验证"
+                f"（token 来源={page.get('tokenFrom') or '无'}，"
+                f"页面有验证组件={page.get('widget')}，表单字段数={page.get('fields')}）。"
+                "若「token 来源=无」，说明 solve 没能在页面上解出验证，"
+                "可把「解验证超时」调大到 120 秒后重试；"
+                "若 token 已取到仍被拒绝，多为节点出口 IP 与该 token 不匹配，换节点再试。"
+            )
             logger.error(self._browserless_error)
             return None
         if not page.get("ok"):
@@ -4589,7 +4813,7 @@ class CnlangSigninV3(_PluginBase):
                                         'props': {
                                             'class': 'font-weight-bold'
                                         },
-                                        'text': 'Cloudflare 验证（Browserless）'
+                                        'text': '人机验证（Browserless）'
                                     }
                                 ]
                             },

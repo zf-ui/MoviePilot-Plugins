@@ -191,11 +191,23 @@ dependencies = [
   发到第三方。
 - 若不想把密码交给插件，可以只用「打码平台」方案 + 手工更新 Cookie。
 
-## Cloudflare 验证（Browserless）
+## 人机验证（Browserless）
+
+站点的验证有两种表现，插件都覆盖：
+
+| 表现 | 特征 | 插件怎么处理 |
+| --- | --- | --- |
+| 整页质询 | 签到页 GET 直接返回 403 + `Cf-Mitigated: challenge` | 拦截判定命中，直接走云端浏览器 |
+| 表单内嵌 Turnstile | 页面正常加载，**只有提交**被挡回「请先完成人机安全验证后再签到！」 | 识别这句文案后转给云端浏览器 |
+
+第二种是 3.9.0 之前一直漏掉的：GET 完全正常（用户名、`formhash`、累计天数都能解析），
+失败只发生在 POST，而且既不是 403 也没有 `Cf-Mitigated` 头。日志里能看到
+「签到响应：请先完成人机安全验证后再签到！」——那说明签到表单里嵌了 Cloudflare
+Turnstile 组件，服务端会校验 POST 里的 `cf-turnstile-response`，纯 HTTP 永远拿不到。
 
 ### 为什么本机浏览器过不去
 
-站点对签到路径下发的是 **interactive Turnstile**。它判定的是「出口 IP 信誉 + 浏览器指纹 +
+站点下发的是 **interactive Turnstile**。它判定的是「出口 IP 信誉 + 浏览器指纹 +
 自动化特征」，而不是「有没有点那个勾选框」。因此本机怎么调都没用，实测结论：
 
 | 客户端 | 结果 |
@@ -209,12 +221,17 @@ dependencies = [
 
 ### 工作方式
 
-插件用 [Browserless](https://browserless.io) 的云端 stealth Chromium，通过 BrowserQL 一次
-请求完成整轮签到：
+插件用 [Browserless](https://browserless.io) 的云端 stealth Chromium，通过 BrowserQL 完成整轮签到：
 
 ```text
-注入 Cookie → goto 签到页 → solve（服务端解挑战）→ 页面内 POST 签到接口 → 读大洋余额
+第一段：注入 Cookie → goto 签到页 → solve（解验证，返回 token）→ 页面内提交 → 读诊断
+第二段（仅当第一段被站点判「人机验证未通过」）：reconnect 回同一会话 → goto → 回填 token → 再提交
 ```
+
+为什么需要两段：`solve` 产出的 token 只在**响应里**，而 `evaluate` 的脚本内容必须在请求
+发出前就确定——单次请求没法拿自己的产物去填自己的参数。所以第一段先尽力提交一次，
+被拒且确实拿到了 token 时，才回同一个浏览器会话把 token 回填后重来。会话由
+`session: reconnect` 保住；页面本身不保留，第二段必须重新 `goto`。
 
 `solve` 是 Browserless 的服务端验证码求解步骤，支持 Turnstile / reCAPTCHA / hCaptcha /
 Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口——**开源自建的 browserless
@@ -224,10 +241,10 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 
 - **不回传 `cf_clearance`**。通行证与签发时的 IP 绑定，云端拿到的搬到本机必然失效，存下来
   只会造成「有 Cookie 却依然 403」的假象。所以插件不存、不回写。
-- **只在真的撞上 Cloudflare 时消耗额度**。正常轮次走 HTTP 直连，免费额度（1000 次/月）足够
-  一天一次跑满一年。
-- **签到表单若内嵌 Turnstile widget**，脚本会先读 `window.turnstile.getResponse()`，读不到
-  就轮询等 8 秒，再退到 `input[name*=turnstile]`，把 token 一起提交。
+- **只在真的撞上人机验证时消耗额度**。正常轮次走 HTTP 直连，免费额度（1000 次/月）足够
+  一天一次跑满一年。提交没被人机验证挡回时，第二段不会执行。
+- **提交真实表单而不是拼字段**。脚本把页面上那个 form 整体序列化成 `FormData`，再覆盖
+  `formhash` / `qdxq` / `todaysay` 与 token——站点以后加隐藏字段也不会漏。
 - **失败不硬扛**：云端失败会带着原因回退本地浏览器模式；两边都失败时，失败通知里会同时给出
   两段原因，再附排查建议。
 
@@ -235,7 +252,7 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 
 1. 打开 <https://browserless.io/signup/email?plan=free> 注册免费账号。
 2. 在 <https://browserless.io/account/> 复制 Token。
-3. 插件配置 →「Cloudflare 验证（Browserless）」→ 粘贴 Token，地址保持默认即可。
+3. 插件配置 →「人机验证（Browserless）」→ 粘贴 Token，地址保持默认即可。
 4. 国内网络直连 `browserless.io` 经常超时：**打开「使用代理」**，让 API 请求走宿主系统代理。
 
 ### 排查
@@ -246,6 +263,9 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 | 「额度不足（HTTP 429）」 | 当月免费额度用完 | 等下月，或换付费计划 |
 | 「无响应 … 读超时」 | 国内直连超时 | 开启「使用代理」 |
 | 「仍停在 Cloudflare 验证页」 | 节点出口 IP 被站点拉黑 | 换 `production-ams` / `production-lon` 节点；或把解验证超时调到 120 秒 |
+| 「站点仍判定未完成人机验证（token 来源=无）」 | `solve` 没在页面上解出验证 | 把「解验证超时」调到 120 秒；确认节点没被站点拉黑 |
+| 「站点仍判定未完成人机验证」但 token 已取到 | 节点出口 IP 与该 token 不匹配 | 换节点重试；顺带确认 Cookie 是**最近**从同一浏览器导出的 |
+| 「未返回可复用的会话地址」 | 自建 / 旧版 Browserless 没有 `reconnect` | 第二段被跳过（只尝试一次提交），换官方云端节点或升级实例 |
 | 「Cookie 已失效（未显示用户名）」 | 登录态过期 | 开启「自动登录」，插件会自己续期后重跑 |
 
 ## 插件 API
@@ -275,6 +295,40 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 > 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
 > 版本行为不一致，风险高于让用户重填一次。
 
+## v3.9.1 变更说明
+
+### 修复：提交被站点人机验证挡回，云端浏览器一次都没被调用
+
+线上日志是这样的：
+
+```text
+登录用户名：luobop
+formhash：da148957
+本月累计签到（含本次）：1
+签到响应：请先完成人机安全验证后再签到！
+```
+
+也就是说 GET 一路正常，**只有 POST 被拒**，而且既不是 403 也没有 `Cf-Mitigated` 头。
+v3.9.0 的拦截判定只认这两样，于是这一轮被记成普通失败——Browserless 完全没被触发。
+
+截图与抓包确认了根因：cnlang 的签到表单里嵌了一个 **Cloudflare Turnstile 组件**
+（页面上那个「成功! / CLOUDFLARE」的小方框），服务端会校验 POST 里的
+`cf-turnstile-response`。纯 HTTP 请求永远拿不到这个 token。
+
+本版改动：
+
+- **提交阶段识别**：`_looks_like_human_check` 认站点那句文案，命中即转浏览器链路；
+  其它失败文案原样保留，不会白白消耗云端额度。
+- **两段式提交**：`solve` 返回的 token 只在响应里，`evaluate` 的脚本却必须在请求
+  发出前确定，单请求无法自产自销。第一段解验证并尽力提交；被拒且拿到 token 时，
+  用 `reconnect` 回同一会话、重新 `goto`、回填 token 再提交一次。
+- **提交真实表单**：脚本把页面上的 form 整体序列化成 `FormData` 再覆盖关键字段，
+  站点加隐藏字段也不会漏。
+- **诊断可定位**：日志新增「token 来源 / 页面有无验证组件 / 是否找到表单 / 字段数」，
+  失败通知能直接分清「没拿到 token」还是「token 被判废」。
+
+详见 [人机验证（Browserless）](#人机验证browserless)。
+
 ## v3.9.0 变更说明
 
 ### 新增：Browserless 云端浏览器，真正过掉 Cloudflare
@@ -290,7 +344,7 @@ stealth 浏览器解决：
 - 日志里记录 `solve` 的 `found / solved / time`，失败通知能直接指出是「验证没解出来」
   「Cookie 失效」还是「页面结构变了」。
 
-详见 [Cloudflare 验证（Browserless）](#cloudflare-验证browserless)。
+详见 [人机验证（Browserless）](#人机验证browserless)。
 
 ### 修正：一个与时钟相关的测试假失败
 

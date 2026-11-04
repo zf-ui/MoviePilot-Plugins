@@ -3618,23 +3618,39 @@ class _FakeHTTPResponse:
         return False
 
 
-def _install_bql(plugin, monkeypatch, payload=None, solve=None, error=None):
-    """把 _bql_post 换成直接返回构造好的 data，并记录调用参数。"""
-    calls = {}
+def _install_bql(plugin, monkeypatch, payload=None, solve=None, error=None, session=True):
+    """把 _bql_post 换成直接返回构造好的 data，并记录调用参数。
 
-    def fake_post(endpoint, variables):
+    必须接受 ``query`` / ``operation`` 两个关键字参数：第二段（回填 token）用的是
+    另一个 mutation，忽略它们会让「第二段有没有真的发出去」变得不可观测。
+    """
+    calls = {"requests": []}
+
+    def fake_post(endpoint, variables, query=None, operation="CnlangSign"):
         calls["endpoint"] = endpoint
         calls["variables"] = variables
+        calls["requests"].append(
+            {"endpoint": endpoint, "variables": variables, "operation": operation}
+        )
         if error:
             plugin._browserless_error = error
             return None
-        return {
+        data = {
             "solve": solve if solve is not None else {"found": True, "solved": True, "time": 4},
             "submit": {"value": json.dumps(payload or {}, ensure_ascii=False)},
         }
+        if session:
+            data["session"] = {
+                "browserQLEndpoint": "https://production-sfo.browserless.io/stealth/bql?sessionId=abc"
+            }
+        return data
 
     monkeypatch.setattr(
-        plugin.__class__, "_bql_post", lambda self, endpoint, variables: fake_post(endpoint, variables)
+        plugin.__class__,
+        "_bql_post",
+        lambda self, endpoint, variables, query=None, operation="CnlangSign": fake_post(
+            endpoint, variables, query, operation
+        ),
     )
     monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
     return calls
@@ -3879,7 +3895,7 @@ def test_cloudflare_block_returns_none_when_cookie_invalid(host, monkeypatch):
         lambda self: pytest.fail("Cookie 失效时不该再去本地浏览器白等"),
     )
 
-    assert plugin._handle_cloudflare_block() is None
+    assert plugin._handle_human_check() is None
     assert "Cookie 已失效" in plugin._cookie_invalid_hint
     assert plugin.get_data(module.KEY_LAST_RESULT) is None
 
@@ -4173,3 +4189,229 @@ def test_execute_signin_auto_logins_after_browserless_reports_cookie_invalid(hos
     assert login_reasons == ["Cookie 已失效（云端浏览器打开签到页未显示用户名）"]
     assert result["success"] is True
     assert result["content"] == "自动登录后云端签到成功"
+
+
+# ---------------------------------------------------------------------------
+# 提交阶段的人机验证（签到表单内嵌 Turnstile）
+#
+# 站点的签到页 GET 完全正常（用户名 / formhash / 累计天数都能解析），只有 POST 被
+# 服务端挡回一句「请先完成人机安全验证后再签到！」。这不是 403、也没有 Cf-Mitigated
+# 头，因此走不到 cf_blocked 分支——必须靠识别这句话转给云端浏览器。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("请先完成人机安全验证后再签到！", True),
+        ("抱歉，人机验证未通过", True),
+        ("安全验证未通过，请重试", True),
+        ("请先完成验证", True),
+        ("恭喜，签到成功", False),
+        ("您今天已经签到过了", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_looks_like_human_check_matches_site_wording(host, text, expected):
+    """只认站点自己那句话，不能把「签到成功」之类误判成人机验证。"""
+    module = host.module
+
+    assert module._looks_like_human_check(text) is expected
+
+
+def test_signin_once_routes_submit_human_check_to_cloud(host, monkeypatch):
+    """提交被人机验证挡回时应转给云端浏览器，而不是记成普通失败。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            200,
+            '<input name="formhash" value="ff00" />'
+            '<a title="访问我的空间">luobop</a>'
+            "<p>您本月已累计签到:<b>1</b>",
+        ),
+        module.SIGN_SUBMIT_URL: host.response_cls(
+            200, '<div class="c">请先完成人机安全验证后再签到！</div>'
+        ),
+    }
+    called = []
+
+    def fake_cloud(self):
+        called.append(True)
+        result = {
+            "time": "2026-11-04 22:40:00",
+            "success": True,
+            "username": "luobop",
+            "money": "263",
+            "content": "恭喜你签到成功",
+            "total_signs": 2,
+        }
+        self.save_data(module.KEY_LAST_RESULT, result)
+        return result
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_cloud)
+    # 关键：不走本地浏览器，说明确实是从「提交被拒」直接转到云端
+    monkeypatch.setattr(
+        module.CnlangSigninV3,
+        "_signin_by_browser",
+        lambda self: pytest.fail("应优先走云端浏览器"),
+    )
+
+    result = plugin.signin()
+
+    assert called == [True]
+    assert result["success"] is True
+    assert result["content"] == "恭喜你签到成功"
+
+
+def test_signin_once_keeps_normal_failure_for_other_messages(host, monkeypatch):
+    """不是人机验证的失败文案不能被误转给云端（那会白白消耗额度）。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            200,
+            '<input name="formhash" value="ff00" />'
+            '<a title="访问我的空间">tester</a>'
+            "<p>您本月已累计签到:<b>1</b>",
+        ),
+        module.SIGN_SUBMIT_URL: host.response_cls(200, '<div class="c">签到失败，请稍后再试</div>'),
+    }
+    monkeypatch.setattr(
+        module.CnlangSigninV3,
+        "_signin_by_browserless",
+        lambda self: pytest.fail("非人机验证的失败不该动云端浏览器"),
+    )
+
+    result = plugin.signin()
+
+    assert result["success"] is True  # 旧行为：只要拿到文案就算签到完成
+    assert result["content"] == "签到失败，请稍后再试"
+
+
+def test_bql_submit_script_injects_solve_token(host):
+    """solve 返回的 token 必须被写进脚本，否则服务端一定判人机验证未通过。"""
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错", "0.AbCdEf-token")
+
+    assert "__TOKEN__" not in script
+    assert '"0.AbCdEf-token"' in script
+    assert "cf-turnstile-response" in script
+    # 人机验证的提示词也要注入，用于让页面脚本自己判定「又被拒了」
+    assert "人机安全验证" in script
+
+
+def test_bql_submit_script_defaults_to_empty_token(host):
+    """拿不到 token 时脚本必须能用空串跑（回落到读页面 widget）。"""
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错")
+
+    assert 'const solveToken = "";' in script
+
+
+def test_signin_by_browserless_passes_reconnect_timeout(host, monkeypatch):
+    """第一段必须申请会话复用，否则第二段没有浏览器可回。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    calls = _install_bql(plugin, monkeypatch, payload={"ok": True, "username": "tester",
+                                                       "content": "恭喜你签到成功"})
+
+    plugin._signin_by_browserless()
+
+    assert calls["variables"]["reconnectTimeout"] == host.module.BQL_RECONNECT_TIMEOUT
+
+
+def test_signin_by_browserless_retries_with_solve_token_after_human_check(host, monkeypatch):
+    """首次提交被人机验证拒绝时，应带 solve token 回同一会话再提交一次。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browserless_token="T")
+    requests = []
+    first_page = {
+        "ok": True,
+        "why": "human-check",
+        "username": "luobop",
+        "content": "请先完成人机安全验证后再签到！",
+        "tokenFrom": "",
+        "widget": True,
+        "form": True,
+        "fields": 5,
+    }
+    second_page = {
+        "ok": True,
+        "why": "",
+        "username": "luobop",
+        "content": "恭喜你签到成功，获得 10 大洋",
+        "month": "1",
+        "money": "272",
+        "tokenFrom": "solve",
+    }
+
+    def fake_post(endpoint, variables, query=None, operation="CnlangSign"):
+        requests.append({"endpoint": endpoint, "variables": variables, "operation": operation})
+        if operation == "CnlangSign":
+            return {
+                "solve": {"found": True, "solved": True, "time": 6, "token": "0.TOKEN"},
+                "submit": {"value": json.dumps(first_page, ensure_ascii=False)},
+                "session": {
+                    "browserQLEndpoint": "https://production-sfo.browserless.io/stealth/bql?sessionId=abc"
+                },
+            }
+        return {"submit": {"value": json.dumps(second_page, ensure_ascii=False)}}
+
+    monkeypatch.setattr(
+        plugin.__class__,
+        "_bql_post",
+        lambda self, endpoint, variables, query=None, operation="CnlangSign": fake_post(
+            endpoint, variables, query, operation
+        ),
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+
+    result = plugin._signin_by_browserless()
+
+    assert len(requests) == 2
+    assert requests[1]["operation"] == "CnlangInject"
+    # 第二段必须打到 session 地址，并且带上 token、重新注入 Cookie 与 URL
+    assert "sessionId=abc" in requests[1]["endpoint"]
+    assert '"0.TOKEN"' in requests[1]["variables"]["submit"]
+    assert requests[1]["variables"]["url"] == module.SIGN_PAGE_URL
+    assert requests[1]["variables"]["cookies"]
+    assert result["success"] is True
+    assert result["money"] == "272"
+    assert result["total_signs"] == 2
+
+
+def test_signin_by_browserless_human_check_without_token_reports_diagnosis(host, monkeypatch):
+    """solve 没产 token 时不该白开第二段，失败原因要指出「token 来源=无」。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    calls = _install_bql(
+        plugin,
+        monkeypatch,
+        payload={"ok": True, "why": "human-check", "username": "luobop",
+                 "content": "请先完成人机安全验证后再签到！", "tokenFrom": "", "widget": False},
+        solve={"found": True, "solved": False, "time": 30},
+    )
+
+    assert plugin._signin_by_browserless() is None
+    assert len(calls["requests"]) == 1  # 没有 token 就别开第二段
+    assert "人机验证" in plugin._browserless_error
+    assert "token 来源=无" in plugin._browserless_error
+
+
+def test_signin_by_browserless_falls_back_when_session_missing(host, monkeypatch):
+    """自建实例不返回会话地址时，第二段跳过并如实报错，而不是抛异常。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    calls = _install_bql(
+        plugin,
+        monkeypatch,
+        payload={"ok": True, "why": "human-check", "username": "luobop",
+                 "content": "请先完成人机安全验证后再签到！"},
+        solve={"found": True, "solved": True, "time": 5, "token": "0.TOKEN"},
+        session=False,
+    )
+
+    assert plugin._signin_by_browserless() is None
+    assert len(calls["requests"]) == 1
+    assert "人机验证" in plugin._browserless_error
