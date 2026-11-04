@@ -266,6 +266,7 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 | 「站点仍判定未完成人机验证（token 来源=无）」 | `solve` 没在页面上解出验证 | 把「解验证超时」调到 120 秒；确认节点没被站点拉黑 |
 | 「站点仍判定未完成人机验证」但 token 已取到 | 节点出口 IP 与该 token 不匹配 | 换节点重试；顺带确认 Cookie 是**最近**从同一浏览器导出的 |
 | 「未返回可复用的会话地址」 | 自建 / 旧版 Browserless 没有 `reconnect` | 第二段被跳过（只尝试一次提交），换官方云端节点或升级实例 |
+| 「回填 solve token 重试也没跑成（HTTP 404）」 | 会话地址不能用（自建实例不支持 `reconnect` 或路径不同） | 不影响签到：第一段就能成功，日志里看到这句可以不管；连续出现再换官方节点 |
 | 「Cookie 已失效（未显示用户名）」 | 登录态过期 | 开启「自动登录」，插件会自己续期后重跑 |
 
 ## 插件 API
@@ -294,6 +295,52 @@ Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口
 
 > 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
 > 版本行为不一致，风险高于让用户重填一次。
+
+## v3.9.4 变更说明
+
+### 首次跑通：换节点 + 开代理，第一段就签到成功
+
+```text
+Browserless：打开签到页并解人机验证（节点 https://production-lon.browserless.io，solve 预算 90 秒）
+Browserless solve 结果：found=True solved=True 耗时=1740
+Browserless 页面诊断（第 1 段）：token 来源=page，页面有验证组件=False，找到表单=True，表单字段数=6
+Browserless 签到响应：恭喜你签到成功!获得随机奖励 大洋 7 .
+```
+
+对照实验很明确（同一个 Cookie、同一份代码）：
+
+| 节点 | 代理 | solve 耗时 | 结果 |
+| --- | --- | --- | --- |
+| `production-sfo` | 关 | 34.8 秒 | 站点拒绝人机验证 |
+| `production-lon` | 开 | 1.7 秒 | 签到成功，+7 大洋 |
+
+`solve` 本身都能解（`found=True solved=True`），差别在**节点出口 IP 的信誉**：sfo 那个
+出口被站点判废，token 发出去也是白搭。所以这类失败先换节点，不用急着调超时。
+
+### 修复：回填 token 重试的 404（这段其实一次都没跑过）
+
+`solve` 拿到 token 后若仍被拒，会走第二段「回 `reconnect` 会话回填 token 再提交」。日志里它
+只回一句 `Browserless 请求失败（HTTP 404）`，根因是 `reconnect` 返回的会话地址**已经是完整
+端点**，插件又按「根地址补 `/stealth/bql`」的规则处理了一遍：
+
+```text
+返回：https://…/stealth/bql/abc123?sessionId=abc
+拼成：https://…/stealth/bql/abc123/stealth/bql?sessionId=abc   ← 404
+```
+
+现在用 `_bql_session_endpoint`：会话地址的协议/主机/路径原样保留，只补 Token 和保住
+`sessionId`；只回相对路径时（自建实例偶发）用配置节点的主机补回。
+
+顺带把失败原因分开了——第二段没跑成报「回填 solve token 重试也没跑成：<原因>」，不再被后一句
+「站点仍判定未完成人机验证」盖掉。这两件事的排查方向完全不同：前者是会话复用不行（不影响签到），
+后者是 token 被判废（该换节点）。
+
+### 诊断与安全
+
+- 诊断行加上「第 N 段」，能分清首次提交与回填重试。
+- `window.turnstile` 也算作验证组件存在的证据：widget 渲染在 shadow DOM 或跨域 iframe 里时
+  选择器抓不到，旧判据会给出「token 来源=page 但验证组件=False」这种自相矛盾的组合。
+- 日志里的端点统一给 Token 打码（`_mask_token`）。
 
 ## v3.9.3 变更说明
 

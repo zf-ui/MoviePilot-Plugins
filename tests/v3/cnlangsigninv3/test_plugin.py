@@ -11,6 +11,7 @@ import json
 import sys
 import time
 import types
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -4447,9 +4448,23 @@ def test_bql_submit_script_computes_widget_before_challenge_check(host):
 
     script = module._bql_submit_script("今天心情不错")
 
-    widget_at = script.index("out.widget = !!document.querySelector")
+    widget_at = script.index("out.widget = !!(")
     challenge_at = script.index("const interstitial =")
     assert widget_at < challenge_at
+
+
+def test_bql_submit_script_uses_turnstile_api_as_widget_signal(host):
+    """widget 渲染在 shadow DOM / 跨域 iframe 里时选择器抓不到，window.turnstile 一定在。
+
+    实战日志出现过「token 来源=page 但页面有验证组件=False」的矛盾组合，诊断会把人
+    误导成「站点换了验证方式」，因此把 turnstile API 也算作组件存在的证据。
+    """
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错")
+
+    assert "window.turnstile && typeof window.turnstile.getResponse" in script
+    assert "out.widget = !!(" in script
 
 
 def test_finish_browser_signin_reports_human_check_as_failure(host):
@@ -4474,3 +4489,176 @@ def test_finish_browser_signin_reports_human_check_as_failure(host):
     assert "人机验证" in last["content"]
     # 不能悄悄写成「签到成功」
     assert "签到成功" not in last["content"]
+
+
+# ---------------------------------------------------------------------------
+# 3.9.4：会话地址（reconnect）被二次规范化导致 404
+#
+# 实战日志：第一段被判人机验证拒绝、solve 也有 token，第二段却回一句
+# 「Browserless 请求失败（HTTP 404）」——会话端点被当成「根地址」又补了一遍
+# /stealth/bql，拼成 …/stealth/bql/<sid>/stealth/bql。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://production-sfo.browserless.io/stealth/bql/abc123?sessionId=abc",
+        "https://production-sfo.browserless.io/stealth/bql?sessionId=abc",
+        "http://192.168.1.10:3000/chromium/bql/s1?sessionId=s1",
+    ],
+)
+def test_bql_session_endpoint_keeps_path_verbatim(host, raw):
+    """会话地址已是完整端点，路径必须原样保留，不能再补 /stealth/bql。"""
+    module = host.module
+
+    endpoint = module._bql_session_endpoint(raw, "T", "https://production-sfo.browserless.io")
+
+    assert endpoint.split("?")[0] == raw.split("?")[0]
+    assert endpoint.count("/bql") == 1
+
+
+def test_bql_session_endpoint_keeps_session_id_and_adds_token(host):
+    """sessionId 必须保住（否则接不回那个浏览器），Token 补上且不重复。"""
+    module = host.module
+
+    endpoint = module._bql_session_endpoint(
+        "https://production-sfo.browserless.io/stealth/bql?sessionId=abc", "T2", ""
+    )
+
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(endpoint).query))
+    assert query["sessionId"] == "abc"
+    assert query["token"] == "T2"
+
+
+def test_bql_session_endpoint_resolves_relative_path_with_base(host):
+    """自建实例偶尔只回相对路径，用配置节点的主机补回。"""
+    module = host.module
+
+    endpoint = module._bql_session_endpoint("/stealth/bql?sessionId=s1", "T", "http://192.168.1.10:3000")
+
+    assert endpoint.startswith("http://192.168.1.10:3000/stealth/bql?")
+    assert "sessionId=s1" in endpoint
+
+
+@pytest.mark.parametrize("raw", ["", "   ", None])
+def test_bql_session_endpoint_rejects_empty(host, raw):
+    """空地址要抛 ValueError，由调用方转成可读原因。"""
+    module = host.module
+
+    with pytest.raises(ValueError):
+        module._bql_session_endpoint(raw, "T")
+
+
+def test_bql_session_endpoint_rejects_relative_without_base(host):
+    """相对路径 + 配置地址不可解析时要报错，不能拼出个半截 URL。"""
+    module = host.module
+
+    with pytest.raises(ValueError):
+        module._bql_session_endpoint("/stealth/bql?sessionId=s1", "T", "")
+
+
+def test_mask_token_hides_credentials(host):
+    """日志里的端点必须给 Token 打码，凭据不能进日志。"""
+    module = host.module
+
+    masked = module._mask_token(
+        "https://production-sfo.browserless.io/stealth/bql?token=SECRET&sessionId=abc"
+    )
+
+    assert "SECRET" not in masked
+    assert "sessionId=abc" in masked
+    assert "REDACTED" in masked
+
+
+@pytest.mark.parametrize("raw", ["", None, "https://x/y"])
+def test_mask_token_passthrough_without_query(host, raw):
+    """没有查询串时原样返回，不打码也不报错。"""
+    module = host.module
+
+    assert module._mask_token(raw) == str(raw or "")
+
+
+def test_signin_by_browserless_second_stage_uses_session_endpoint(host, monkeypatch):
+    """第二段必须打到会话地址本身，不能带重复路径（404 的根因）。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    sessions = []
+    first = {
+        "ok": True,
+        "why": "human-check",
+        "username": "luobop",
+        "content": "请先完成人机安全验证后再签到！",
+    }
+
+    def fake_post(endpoint, variables, query=None, operation="CnlangSign"):
+        if operation == "CnlangSign":
+            return {
+                "solve": {"found": True, "solved": True, "time": 6, "token": "0.TOKEN"},
+                "submit": {"value": json.dumps(first, ensure_ascii=False)},
+                "session": {
+                    "browserQLEndpoint": "https://production-sfo.browserless.io/stealth/bql/abc123?sessionId=abc"
+                },
+            }
+        sessions.append(endpoint)
+        return {"submit": {"value": json.dumps(
+            {"ok": True, "username": "luobop", "content": "恭喜你签到成功"}, ensure_ascii=False)}}
+
+    monkeypatch.setattr(
+        plugin.__class__,
+        "_bql_post",
+        lambda self, endpoint, variables, query=None, operation="CnlangSign": fake_post(
+            endpoint, variables, query, operation
+        ),
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+
+    result = plugin._signin_by_browserless()
+
+    assert len(sessions) == 1
+    assert sessions[0].split("?")[0] == "https://production-sfo.browserless.io/stealth/bql/abc123"
+    assert "sessionId=abc" in sessions[0]
+    assert result["success"] is True
+
+
+def test_signin_by_browserless_second_stage_failure_keeps_its_own_reason(host, monkeypatch):
+    """第二段没跑成时，失败原因要指向「会话复用失败」，不能被「站点仍判定人机验证」盖掉。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    calls = {"n": 0}
+
+    def fake_post(endpoint, variables, query=None, operation="CnlangSign"):
+        calls["n"] += 1
+        if operation == "CnlangSign":
+            return {
+                "solve": {"found": True, "solved": True, "time": 6, "token": "0.TOKEN"},
+                "submit": {
+                    "value": json.dumps(
+                        {
+                            "ok": True,
+                            "why": "human-check",
+                            "username": "luobop",
+                            "content": "请先完成人机安全验证后再签到！",
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+                "session": {"browserQLEndpoint": "https://x.io/stealth/bql?sessionId=abc"},
+            }
+        plugin._browserless_error = "Browserless 请求失败（HTTP 404）"
+        return None
+
+    monkeypatch.setattr(
+        plugin.__class__,
+        "_bql_post",
+        lambda self, endpoint, variables, query=None, operation="CnlangSign": fake_post(
+            endpoint, variables, query, operation
+        ),
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+
+    assert plugin._signin_by_browserless() is None
+    assert calls["n"] == 2
+    error = plugin._browserless_error
+    assert "回填 solve token 重试也没跑成" in error
+    assert "HTTP 404" in error
+    # 不能把两件事混成一句「站点仍判定未完成人机验证」，那会误导排查方向
+    assert "站点仍判定未完成人机验证" not in error

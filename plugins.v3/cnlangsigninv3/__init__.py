@@ -275,8 +275,12 @@ BQL_SUBMIT_SCRIPT = r"""
 
   // 页面上的验证组件：Turnstile widget 可能在 data-sitekey 上，也可能只是个 iframe。
   // 先算出来，后面任何一次提前返回，诊断日志里都能看到它。
-  out.widget = !!document.querySelector(
-    "[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']");
+  // 实战日志里出现过「token 来源=page 但 widget=False」的矛盾组合：widget 被渲染在
+  // shadow DOM / 非同源 iframe 里，选择器抓不到，但 window.turnstile 一定在——
+  // 所以补上这一条，否则诊断会把「站点换了验证方式」误报出来。
+  out.widget = !!(
+    document.querySelector("[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']")
+    || (window.turnstile && typeof window.turnstile.getResponse === "function"));
 
   // A) 是否还停在「整页挑战」。
   //
@@ -882,6 +886,69 @@ def _bql_endpoint(address: str, token: str = "") -> str:
     )
 
 
+def _mask_token(url: str) -> str:
+    """把 URL 查询串里的 ``token`` 打码，避免日志泄露凭据。
+
+    :param url: 完整地址
+    :return: 打码后的地址；解析失败时原样返回
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return str(url or "")
+    if not query:
+        return str(url or "")
+    masked = [
+        (
+            key,
+            "REDACTED"
+            if key.lower() in {"token", "apikey", "api_key"} and value
+            else value,
+        )
+        for key, value in query
+    ]
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, "", urllib.parse.urlencode(masked), "")
+    )
+
+
+def _bql_session_endpoint(address: str, token: str = "", base: str = "") -> str:
+    """把 ``reconnect`` 返回的会话地址原样用作 BrowserQL 端点。
+
+    与 :func:`_bql_endpoint` 的区别：会话地址**已经是完整端点**，形如
+    ``https://production-sfo.browserless.io/stealth/bql?token=…&sessionId=…``，
+    也可能带一段 session 路径。若还按「根地址补 /stealth/bql」的规则处理，就会拼成
+    ``…/stealth/bql/<sid>/stealth/bql`` 并被服务端 404——3.9.3 的实战日志里那条
+    ``Browserless 请求失败（HTTP 404）`` 就是它，导致「回填 token 重试」这一段从未真正跑过。
+
+    :param address: ``session.browserQLEndpoint`` 的返回值
+    :param token: Browserless Token，非空时覆盖查询参数里的同名值
+    :param base: 配置里的节点地址，用于补齐相对地址缺失的 scheme + netloc
+    :return: 可直接 POST 的会话端点
+    :raises ValueError: 地址为空或无法解析
+    """
+    address = str(address or "").strip()
+    if not address:
+        raise ValueError("会话地址为空")
+    parsed = urllib.parse.urlparse(address)
+    scheme, netloc = parsed.scheme, parsed.netloc
+    if not netloc:
+        # 自建实例偶尔只回路径，用配置地址的主机补回
+        fallback = urllib.parse.urlparse(str(base or "").strip())
+        if fallback.scheme not in {"http", "https"} or not fallback.netloc:
+            raise ValueError("会话地址是相对路径，且配置地址无法解析")
+        scheme, netloc = fallback.scheme, fallback.netloc
+    if scheme not in {"http", "https"}:
+        raise ValueError("会话地址必须以 http:// 或 https:// 开头")
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    if str(token or "").strip():
+        query["token"] = str(token).strip()
+    return urllib.parse.urlunparse(
+        (scheme, netloc, parsed.path or "/", "", urllib.parse.urlencode(query), "")
+    )
+
+
 def _bql_cookie_objects(cookie_header: Optional[str], host: str) -> List[Dict[str, Any]]:
     """把 ``k=v; k=v`` 形式的 Cookie 头转成 BrowserQL 的 ``CookieInput`` 列表。
 
@@ -1138,7 +1205,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.3"
+    plugin_version = "3.9.4"
     # 插件作者（本仓库维护者；不再沿用上游 xijin285）
     plugin_author = "zf-ui"
     # 作者主页
@@ -2503,15 +2570,19 @@ class CnlangSigninV3(_PluginBase):
         return self._parse_bql_page(submit.get("value"))
 
     @staticmethod
-    def _log_bql_diag(page: Dict[str, Any], token: str) -> None:
+    def _log_bql_diag(page: Dict[str, Any], token: str, stage: int = 1) -> None:
         """把「token 从哪来、页面上有没有 widget、表单有几个字段」打进日志。
 
         这几项决定了失败时该往哪个方向查：没有 widget 说明站点换了验证方式；
         有 widget 但 token 来源为空说明 solve 没产 token 或页面没被放行；
         表单字段数为 0 说明脚本没找到 form，提交的字段可能不全。
+
+        :param page: 页面脚本返回的字典
+        :param token: 该段 ``solve`` 返回的 token（第一段可能为空，属正常）
+        :param stage: 第几段请求，日志里带上是为了区分「首次提交」与「回填重试」
         """
         logger.info(
-            f"Browserless 页面诊断：token 来源={page.get('tokenFrom') or '无'}，"
+            f"Browserless 页面诊断（第 {stage} 段）：token 来源={page.get('tokenFrom') or '无'}，"
             f"页面有验证组件={page.get('widget')}，找到表单={page.get('form')}，"
             f"表单字段数={page.get('fields')}，solve token 长度={len(token)}"
         )
@@ -2541,14 +2612,22 @@ class CnlangSigninV3(_PluginBase):
         raw_endpoint = str(session.get("browserQLEndpoint") or "").strip()
         if not raw_endpoint:
             logger.warning("Browserless 未返回可复用的会话地址，无法执行 token 回填")
+            self._browserless_error = "云端未返回可复用的会话地址（reconnect 未生效）"
             return None
         try:
-            endpoint = _bql_endpoint(raw_endpoint, self._browserless_token or "")
+            # 会话地址已是完整端点，必须原样使用：再补一次 /stealth/bql 会 404
+            endpoint = _bql_session_endpoint(
+                raw_endpoint, self._browserless_token or "", self._browserless_url
+            )
         except ValueError as err:
             logger.warning(f"Browserless 会话地址无效，跳过 token 回填：{err}")
+            self._browserless_error = f"云端会话地址无效：{err}"
             return None
 
-        logger.info("Browserless：复用 solve 会话，回填 Turnstile token 后重新提交")
+        logger.info(
+            "Browserless：复用 solve 会话，回填 Turnstile token 后重新提交"
+            f"（会话端点 {_mask_token(endpoint)}）"
+        )
         variables = {
             "cookies": cookies,
             "url": SIGN_PAGE_URL,
@@ -2635,13 +2714,21 @@ class CnlangSigninV3(_PluginBase):
         self._log_bql_diag(page, token)
 
         # 站点仍判人机验证未通过：只有 solve 真的产出了 token 才值得开第二段
+        second_error = ""
         if why == "human-check" and token:
             logger.warning("云端浏览器首次提交仍被人机验证拒绝，改用 solve token 回填后重试")
+            self._browserless_error = None
             second = self._bql_inject_token(data, cookies, token, say)
             if second is not None:
                 page = second
                 why = str(page.get("why") or "")
-                self._log_bql_diag(page, token)
+                self._log_bql_diag(page, token, stage=2)
+            else:
+                # 第二段整体没跑成（会话接不回来 / 网络失败）：留着原因，别被后面的
+                # 「站点仍判定人机验证」覆盖掉——那是两回事，排查方向完全不同
+                second_error = self._browserless_error or "未知原因"
+                logger.error(f"Browserless 第二段（回填 token 重试）未执行完：{second_error}")
+                self._browserless_error = None
         elif why == "human-check" and not token:
             logger.warning(
                 "云端浏览器首次提交被人机验证拒绝，且 solve 未返回 token"
@@ -2670,6 +2757,15 @@ class CnlangSigninV3(_PluginBase):
             logger.error(self._browserless_error)
             return None
         if why == "human-check":
+            if second_error:
+                self._browserless_error = (
+                    "云端浏览器首次提交被人机验证拒绝，回填 solve token 重试也没跑成："
+                    f"{second_error}。"
+                    "（切会话复用属于加分项，不走它也能签到成功——"
+                    "实战中多数节点第一段就能过；这一段失败通常只是云端不接受会话复用。）"
+                )
+                logger.error(self._browserless_error)
+                return None
             self._browserless_error = (
                 "云端浏览器已提交签到，但站点仍判定未完成人机验证"
                 f"（token 来源={page.get('tokenFrom') or '无'}，"
