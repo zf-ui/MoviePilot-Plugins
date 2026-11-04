@@ -1124,11 +1124,11 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.1"
-    # 插件作者
-    plugin_author = "xijin285"
+    plugin_version = "3.9.2"
+    # 插件作者（本仓库维护者；不再沿用上游 xijin285）
+    plugin_author = "zf-ui"
     # 作者主页
-    author_url = "https://github.com/xijin285"
+    author_url = "https://github.com/zf-ui"
     # 插件配置项ID前缀
     plugin_config_prefix = "cnlangsignin_v3_"
     # 加载顺序
