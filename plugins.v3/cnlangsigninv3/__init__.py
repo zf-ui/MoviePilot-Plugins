@@ -19,10 +19,14 @@
 
 import base64
 import hashlib
+import json
 import random
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -158,6 +162,192 @@ CF_WARMUP_BUDGET = 45
 # 升级到有头模式重试时的等待预算。有头浏览器本身更可信，通常很快就能过，
 # 不需要和无头模式一样长的预算，也避免整轮签到耗时失控。
 CF_HEADED_BUDGET = 45
+
+
+# ---------------------------------------------------------------------------
+# Browserless BrowserQL：云端 stealth 浏览器（过 Cloudflare 的可靠途径）
+#
+# 背景：本机浏览器（无论无头还是有头、无论是否拟人化）在容器里过不了站点的
+# interactive Turnstile，作者实测跑满 150 秒也拿不到 cf_clearance。原因是这类
+# 挑战看的是**出口 IP 信誉 + 浏览器指纹 + 自动化特征**，不是「有没有点勾选框」。
+#
+# 因此改用 Browserless 的云端 stealth Chromium：它预打过反检测补丁，且提供
+# BrowserQL 的 ``solve`` 步骤，可以在服务端把挑战解掉并把页面放行。插件通过一次
+# GraphQL 请求完成「注入 Cookie -> 打开签到页 -> solve -> 页面内提交签到 -> 读取
+# 积分」，全程不离开那个浏览器会话。
+#
+# 为什么不把云端拿到的 cf_clearance 存下来给本机 HTTP 复用：``cf_clearance`` 与
+# **签发时的 IP + UA** 绑定，云端节点的通行证拿到本机必然失效，存下来只会造成
+# 「看起来有 Cookie 但依然 403」的假象。这也是这里不做 Cookie 回传的原因。
+# ---------------------------------------------------------------------------
+
+# 默认节点（美国西海岸）。另有 production-ams / production-lon 可换。
+DEFAULT_BROWSERLESS_URL = "https://production-sfo.browserless.io"
+# 备用节点，写进失败建议里供用户切换：节点出口 IP 被站点拉黑时 solve 会一直超时。
+BROWSERLESS_ALT_URLS = (
+    "https://production-ams.browserless.io",
+    "https://production-lon.browserless.io",
+)
+# solve 步骤的默认等待预算（秒）。Turnstile 交互式挑战通常 10~30 秒出结果，
+# 节点排队时会更久，因此默认给 90 秒；上限 180 秒，避免整轮签到耗时失控。
+BQL_DEFAULT_SOLVE_TIMEOUT = 90
+BQL_MAX_SOLVE_TIMEOUT = 180
+# 导航后等页面把 Turnstile 组件渲染出来的时间（毫秒）
+BQL_NAV_WAIT = 3000
+# solve 返回后等页面自行跳回目标页的时间（毫秒）
+BQL_AFTER_WAIT = 4000
+# HTTP 读超时余量（秒）：BrowserQL 是「整段执行完才返回」的整包请求，
+# 读超时必须覆盖 solve 预算 + 导航 + 浏览器启动，否则插件会自己先掐断连接，
+# 报出 "The read operation timed out" 这种自伤式失败。
+BQL_READ_MARGIN = 60
+
+# Browserless 失败时的排查建议（与 CF_ADVICE 并列，不互相替代）
+BROWSERLESS_ADVICE = (
+    "Browserless 未能通过 Cloudflare 验证。请按顺序排查：\n"
+    "1）Token 是否正确、当月免费额度（1000 次/月）是否用完——额度耗尽会返回 429；\n"
+    "2）节点出口 IP 是否被站点拉黑：换 "
+    + " / ".join(BROWSERLESS_ALT_URLS)
+    + " 再试；\n"
+    "3）国内网络直连 browserless.io 常超时：请开启「使用代理」，让 API 请求走宿主系统代理；\n"
+    "4）签到表单里若嵌了 Turnstile，需要把「解验证超时」调大到 120 秒；\n"
+    "5）以上都无效时退回手工方案：" + CF_ADVICE
+)
+
+# 页面内提交脚本。用 ``__PLACEHOLDER__`` 占位而不是 ``%`` 格式化：脚本里有大量
+# 正则与括号，``%`` 格式化极易踩到转义问题。
+#
+# 脚本职责（全部在云端浏览器里执行，不发起任何本机请求）：
+# 1. 先判断当前是不是还停在挑战页（solve 超时 / 被拦），是就原样返回诊断；
+# 2. 读用户名判断登录态，读 formhash，判断「今日已签到」；
+# 3. 从 ``window.turnstile`` 或页面输入框取 Turnstile token（站点若在签到表单里
+#    嵌了 widget，这一步是必需的；没有 widget 时取到空串，不影响提交）；
+# 4. 同源 POST 签到接口，解析 ``<div class="c">`` 里的结果文案；
+# 5. 顺手读一次积分（大洋）余额，省掉一次额外导航。
+BQL_SUBMIT_SCRIPT = r"""
+(async () => {
+  const SAY = __SAY__;
+  const SUBMIT_URL = "__SUBMIT_URL__";
+  const CREDIT_URL = "__CREDIT_URL__";
+  const out = {ok: false, why: "", title: "", url: "", username: "", already: false,
+               content: "", money: "未知", month: "", status: 0};
+  const strip = (html) => (html || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+
+  out.title = document.title || "";
+  out.url = location.href;
+  const root = document.documentElement ? document.documentElement.innerHTML : "";
+
+  // A) 还停在 Cloudflare 挑战页：solve 没解出来，或节点 IP 被拦
+  if (/just a moment|请稍候|安全验证|checking your browser|attention required/i.test(out.title)
+      || /cf-chl|_cf_chl_opt|challenge-platform/i.test(root)) {
+    out.why = "challenge";
+    return JSON.stringify(out);
+  }
+
+  // B) 登录态：Discuz 把用户名挂在 title="访问我的空间" 的链接上
+  const link = document.querySelector('a[title="访问我的空间"]');
+  out.username = link ? (link.textContent || "").trim() : "";
+  if (!out.username) {
+    out.why = "login";
+    return JSON.stringify(out);
+  }
+
+  // C) 今日是否已签到
+  if (/您今天已经签到过|签到时间还未开始/.test(root)) {
+    out.ok = true;
+    out.already = true;
+    out.why = "already";
+    return JSON.stringify(out);
+  }
+
+  const fh = document.querySelector('input[name="formhash"]');
+  if (!fh || !fh.value) {
+    out.why = "no-formhash";
+    return JSON.stringify(out);
+  }
+
+  // D) Turnstile token：站点若在签到表单里嵌了 widget，提交必须带上它。
+  //    widget 是异步渲染、异步解出的，因此先读一次，读不到就轮询等一会
+  //    （solve 把整页挑战放行后，页面自己的 widget 通常几秒内就会产出 token）。
+  const readToken = () => {
+    try {
+      if (window.turnstile && typeof window.turnstile.getResponse === "function") {
+        const value = window.turnstile.getResponse();
+        if (value) return value;
+      }
+    } catch (err) {}
+    const inputs = Array.prototype.slice.call(
+      document.querySelectorAll('input[name*="turnstile" i], input[name="cf-turnstile-response"]'));
+    for (let i = 0; i < inputs.length; i += 1) {
+      if (inputs[i].value) return inputs[i].value;
+    }
+    return "";
+  };
+  let token = readToken();
+  if (!token) {
+    const hasWidget = !!document.querySelector("[data-sitekey], .cf-turnstile");
+    const tokenDeadline = Date.now() + 8000;
+    while (!token && hasWidget && Date.now() < tokenDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      token = readToken();
+    }
+  }
+
+  const body = new URLSearchParams();
+  body.set("formhash", fh.value);
+  body.set("qdxq", "kx");
+  body.set("qdmode", "1");
+  body.set("todaysay", SAY);
+  body.set("fastreply", "0");
+  if (token) {
+    // 字段名两边都写：Discuz 插件作者可能自定义了字段名，多写一个不影响校验
+    body.set("cf-turnstile-response", token);
+    body.set("turnstile", token);
+  }
+
+  const res = await fetch(SUBMIT_URL, {
+    method: "POST",
+    body: body,
+    credentials: "include",
+    headers: {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest"}
+  });
+  out.status = res.status;
+  const text = await res.text();
+  const box = text.match(/<div class="c">([\s\S]*?)<\/div>/);
+  out.content = box ? strip(box[1]) : "";
+  if (!out.content && text.length < 600) out.content = strip(text);
+
+  const month = root.match(/您本月已累计签到:\s*<b>(\d+)<\/b>/);
+  if (month) out.month = month[1];
+
+  try {
+    const credit = await fetch(CREDIT_URL, {credentials: "include"});
+    const money = (await credit.text()).match(/<span id="hcredit_2">(\d+)<\/span>/);
+    if (money) out.money = money[1];
+  } catch (err) {}
+
+  out.ok = true;
+  return JSON.stringify(out);
+})()
+"""
+
+# BrowserQL mutation。
+#
+# 只做一次请求就够：cnlang 的签到提交只需要 ``formhash`` + 会话（cf_clearance），
+# 不像某些 NexusPHP 站点要先把 Turnstile token 交回服务端校验再提交，因此不需要
+# qingyukb 项目里那套 ``solve -> reconnect -> 第二段注入 token`` 的两段式。
+# 单请求既省一半额度，也少了「会话接不回来」的失败面。
+BQL_SIGN_MUTATION = """
+mutation CnlangSign($cookies: [CookieInput!]!, $url: String!, $beforeWait: Float!,
+                    $solveTimeout: Float!, $afterWait: Float!, $submit: String!) {
+  cookies(cookies: $cookies) { cookies { name } }
+  goto(url: $url, waitUntil: domContentLoaded) { status }
+  waitBefore: waitForTimeout(time: $beforeWait) { time }
+  solve: solve(timeout: $solveTimeout) { found solved time }
+  waitAfter: waitForTimeout(time: $afterWait) { time }
+  submit: evaluate(content: $submit) { value }
+}
+"""
 
 
 def _is_cloudflare_cookie(name: str) -> bool:
@@ -558,6 +748,106 @@ def _merge_cookie_header(existing: Optional[str], fresh: Dict[str, str]) -> str:
     return "; ".join(f"{name}={value}" for name, value in merged.items())
 
 
+def _bql_endpoint(address: str, token: str = "") -> str:
+    """把配置里的地址规范成 BrowserQL 端点。
+
+    与 qingyukb 项目的约定保持一致，方便用户在两套插件之间复用同一份配置：
+
+    - 根地址（``https://production-sfo.browserless.io``）自动补 ``/stealth/bql``；
+    - 已以 ``/bql`` 结尾的完整端点原样保留（自建实例常用 ``/chromium/bql``）；
+    - Token 作为查询参数附加，空 Token 不追加空参数（自建实例常关掉鉴权）。
+
+    :param address: 用户配置的地址，根地址或完整端点
+    :param token: Browserless Token，可为空
+    :return: 可直接 POST 的 BrowserQL 地址
+    :raises ValueError: 地址为空或不带 http(s) 协议
+    """
+    address = str(address or "").strip()
+    token = str(token or "").strip()
+    if not address:
+        raise ValueError("Browserless 地址不能为空")
+    parsed = urllib.parse.urlparse(address)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Browserless 地址必须以 http:// 或 https:// 开头")
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/bql"):
+        path = (path + "/bql") if path.endswith("/stealth") else (path + "/stealth/bql")
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    if token:
+        query["token"] = token
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, path, "", urllib.parse.urlencode(query), "")
+    )
+
+
+def _bql_cookie_objects(cookie_header: Optional[str], host: str) -> List[Dict[str, Any]]:
+    """把 ``k=v; k=v`` 形式的 Cookie 头转成 BrowserQL 的 ``CookieInput`` 列表。
+
+    同时给 ``domain``/``path`` 与 ``url``：Browserless 的 schema 接受两者并存，
+    只写 ``url`` 时 playwright 会把 Cookie 绑到单一路径，跨路径的通行证反而失效。
+
+    :param cookie_header: Cookie 串，可为 None
+    :param host: 站点域名（不带协议）
+    :return: CookieInput 字典列表；没有任何有效字段时返回空列表
+    """
+    cookies: List[Dict[str, Any]] = []
+    for pair in str(cookie_header or "").split(";"):
+        if "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": f".{host}",
+                "path": "/",
+                "secure": True,
+                "url": f"https://{host}/",
+            }
+        )
+    return cookies
+
+
+def _bql_error_text(payload: Any) -> str:
+    """从 BrowserQL 的响应里提取最有用的一条错误文案。
+
+    GraphQL 的错误数组常有多条（每个失败步骤一条），第一条通常是根因；同时把
+    ``path`` 里的步骤名带上，方便判断是 solve 超时还是 evaluate 报错。
+
+    :param payload: ``json.loads`` 后的响应体
+    :return: 错误文案；没有 errors 时返回空串
+    """
+    if not isinstance(payload, dict):
+        return ""
+    errors = payload.get("errors") or []
+    if not isinstance(errors, list) or not errors:
+        return ""
+    first = errors[0] if isinstance(errors[0], dict) else {}
+    message = str(first.get("message") or "未知错误")
+    path = ".".join(str(part) for part in (first.get("path") or []))
+    return f"{message}（步骤：{path}）" if path else message
+
+
+def _bql_submit_script(say: str) -> str:
+    """生成页面内提交脚本（替换占位符）。
+
+    寄语用 ``json.dumps`` 序列化成 JS 字符串字面量再替换，而不是手工拼引号：
+    一言接口返回的文案可能带引号、反斜杠或换行，手工拼接会把脚本整段截断。
+
+    :param say: 签到寄语，必须已满足站点 6~50 字的要求
+    :return: 可直接作为 ``evaluate(content:)`` 参数的脚本
+    """
+    literal = json.dumps(str(say or SAY_FALLBACK), ensure_ascii=False)
+    return (
+        BQL_SUBMIT_SCRIPT.replace("__SAY__", literal)
+        .replace("__SUBMIT_URL__", SIGN_SUBMIT_URL)
+        .replace("__CREDIT_URL__", CREDIT_URL)
+    )
+
+
 # 远程命令动作标识
 ACTION_SIGNIN = "cnlang_signin"
 
@@ -740,7 +1030,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.8.0"
+    plugin_version = "3.9.0"
     # 插件作者
     plugin_author = "xijin285"
     # 作者主页
@@ -787,6 +1077,20 @@ class CnlangSigninV3(_PluginBase):
     # 观测到的 cf_clearance 到期信息（懒加载，见 _stored_cf_expiry）。
     # None 表示「尚未读取」，空字典表示「读过了但没有记录」。
     _cf_expiry: Optional[Dict[str, Any]] = None
+
+    # ---- Browserless（云端 stealth 浏览器）----
+    # 地址：根地址即可，插件会自动补 /stealth/bql
+    _browserless_url: str = DEFAULT_BROWSERLESS_URL
+    # Token：为空表示不启用云端浏览器，仍然只能走本地浏览器模式 / 手贴 Cookie
+    _browserless_token: Optional[str] = None
+    # solve 等待预算（秒）
+    _browserless_solve_timeout: int = BQL_DEFAULT_SOLVE_TIMEOUT
+    # 最近一次云端签到失败的原因。用于回退到本地浏览器后仍能如实汇总两边的结果，
+    # 不落配置、不落插件数据——它只服务于当前这一轮。
+    _browserless_error: Optional[str] = None
+    # 云端浏览器确认「Cookie 已失效」时的原因。置位后本轮不再尝试本地浏览器
+    # （换了浏览器也修不好登录态），由调用方触发自动登录自愈。
+    _cookie_invalid_hint: Optional[str] = None
 
     # ---- 自动登录：Cookie 失效时用账号密码换取长期 Cookie ----
     # 是否启用账号密码自动登录（默认关闭，需要用户显式提供账号密码）
@@ -854,6 +1158,29 @@ class CnlangSigninV3(_PluginBase):
         self._impersonate = (
             "auto" if raw_impersonate is None else str(raw_impersonate).strip()
         )
+
+        # ---- Browserless（云端 stealth 浏览器）----
+        self._browserless_url = (
+            str(config.get("browserless_url") or "").strip() or DEFAULT_BROWSERLESS_URL
+        )
+        self._browserless_token = (
+            str(config.get("browserless_token") or "").strip() or None
+        )
+        try:
+            timeout = int(config.get("browserless_solve_timeout") or BQL_DEFAULT_SOLVE_TIMEOUT)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Browserless 解验证超时配置无效：{config.get('browserless_solve_timeout')}，"
+                f"按 {BQL_DEFAULT_SOLVE_TIMEOUT} 秒处理"
+            )
+            timeout = BQL_DEFAULT_SOLVE_TIMEOUT
+        self._browserless_solve_timeout = max(30, min(timeout, BQL_MAX_SOLVE_TIMEOUT))
+        self._browserless_error = None
+        if self._browserless_token:
+            logger.info(
+                f"已配置 Browserless（{self._browserless_url}），"
+                "遇到 Cloudflare 人机验证时优先用云端浏览器签到"
+            )
 
         # ---- 自动登录配置 ----
         self._auto_login = bool(config.get("auto_login", False))
@@ -1080,7 +1407,18 @@ class CnlangSigninV3(_PluginBase):
 
         if self._force_browser:
             logger.info("已开启「强制浏览器模式」，跳过 HTTP 快速路径")
-            return self._handle_cloudflare_block()
+            result = self._handle_cloudflare_block()
+            if result is not None:
+                return result
+            # 走到这里说明云端浏览器确认 Cookie 已失效：交给自动登录自愈，
+            # 先不落库，避免「先发失败通知、紧接着又发成功通知」。
+            reason = self._cookie_invalid_hint or "Cookie 已失效"
+            if self._auto_login_ready() and self._auto_login_now(reason):
+                result, retry_reason = self._signin_once()
+                if result is not None:
+                    return result
+                reason = retry_reason or reason
+            return self._record_failure(reason)
 
         result, retry_reason = self._signin_once()
         if retry_reason and self._auto_login_ready():
@@ -1109,8 +1447,12 @@ class CnlangSigninV3(_PluginBase):
         logger.info(f"步骤1：获取签到页面信息{proxy_hint}")
         page, status, cf_blocked = self._request(SIGN_PAGE_URL, headers=headers)
         if cf_blocked:
-            # 人机验证靠重新登录修不好（登录接口不会下发 cf_clearance），走原有兜底
-            return self._handle_cloudflare_block(), None
+            # 人机验证靠重新登录修不好（登录接口不会下发 cf_clearance），走云端浏览器兜底；
+            # 若云端浏览器确认是 Cookie 失效，则返回原因交给上层触发自动登录。
+            result = self._handle_cloudflare_block()
+            if result is None:
+                return None, self._cookie_invalid_hint or "Cookie 已失效"
+            return result, None
         if page is None:
             detail = (
                 f"获取签到页面失败，状态码：{status}"
@@ -1151,7 +1493,10 @@ class CnlangSigninV3(_PluginBase):
             },
         )
         if cf_blocked:
-            return self._handle_cloudflare_block(), None
+            result = self._handle_cloudflare_block()
+            if result is None:
+                return None, self._cookie_invalid_hint or "Cookie 已失效"
+            return result, None
         if response is None:
             detail = (
                 f"提交签到请求失败，状态码：{status}"
@@ -1186,16 +1531,51 @@ class CnlangSigninV3(_PluginBase):
     # Cloudflare 拦截与浏览器模式
     # ------------------------------------------------------------------
 
-    def _handle_cloudflare_block(self) -> Dict[str, Any]:
-        """处理 Cloudflare 人机验证拦截：按配置切浏览器模式，否则给出可执行建议。"""
-        if not self._browser_mode:
-            logger.error("未开启浏览器模式，无法通过 Cloudflare 人机验证")
+    def _handle_cloudflare_block(self) -> Optional[Dict[str, Any]]:
+        """处理 Cloudflare 人机验证拦截。
+
+        优先级：**Browserless 云端浏览器** > 本地浏览器模式 > 给出可执行建议。
+
+        云端优先的理由：站点的挑战是 interactive Turnstile，判定依据是出口 IP 信誉
+        与浏览器指纹。本地（尤其是容器内）浏览器在这两项上都天然劣势，实测跑满
+        150 秒也拿不到 cf_clearance；Browserless 的 stealth Chromium + ``solve``
+        是目前唯一稳定的自动化方案。本地浏览器模式保留为兜底，因为用户若把
+        MoviePilot 跑在有真实显示的桌面环境上，它偶尔也能过。
+
+        :return: 已落库的签到结果；返回 None 表示「Cookie 已确认失效」，
+                 原因见 ``self._cookie_invalid_hint``，调用方应触发自动登录而不是落库
+        """
+        self._cookie_invalid_hint = None
+        reasons: List[str] = []
+        if self._browserless_ready():
+            logger.warning("检测到 Cloudflare 人机验证，改用 Browserless 云端浏览器执行签到")
+            result = self._signin_by_browserless()
+            if result is not None:
+                return result
+            if self._cookie_invalid_hint:
+                # 登录态失效换浏览器也修不好，直接交给调用方走自动登录
+                logger.warning(f"云端浏览器判定登录态已失效：{self._cookie_invalid_hint}")
+                return None
+            reasons.append(self._browserless_error or "Browserless 未完成签到")
+            if not self._browser_mode:
+                return self._record_failure(
+                    "；".join(reasons) + "\n\n" + BROWSERLESS_ADVICE
+                )
+            logger.warning("Browserless 未完成签到，回退本地浏览器模式")
+        elif not self._browser_mode:
+            logger.error("未配置 Browserless 且未开启浏览器模式，无法通过 Cloudflare 人机验证")
             return self._record_failure(CF_ADVICE)
-        logger.warning("检测到 Cloudflare 人机验证，切换到浏览器模式执行签到")
-        if not self._signin_by_browser():
-            return self._record_failure(
-                "浏览器模式不可用，请确认宿主机已安装浏览器依赖（cloakbrowser / playwright）"
+        else:
+            logger.warning(
+                "未配置 Browserless Token，只能使用本地浏览器模式"
+                "（容器环境下基本过不了 interactive Turnstile）"
             )
+
+        if not self._signin_by_browser():
+            detail = "浏览器模式不可用，请确认宿主机已安装浏览器依赖（cloakbrowser / playwright）"
+            if reasons:
+                detail = "；".join(reasons) + "\n" + detail
+            return self._record_failure(detail)
         result = self.get_data(KEY_LAST_RESULT) or {}
         if not result:
             return self._record_failure("浏览器模式未产生签到结果")
@@ -1856,6 +2236,238 @@ class CnlangSigninV3(_PluginBase):
         if isinstance(proxy, dict):
             return proxy.get("https") or proxy.get("http") or None
         return proxy or None
+
+    # ------------------------------------------------------------------
+    # Browserless：云端 stealth 浏览器过 Cloudflare
+    #
+    # 与本地浏览器模式的根本区别：本机过不去的原因是「出口 IP 信誉 + 浏览器指纹」，
+    # 这两项在本机都无法改变；云端 stealth Chromium 天生具备，并且提供 ``solve``
+    # 步骤直接在服务端把挑战解掉。因此这条路不是「再优化一次本地自动化」，而是换环境。
+    # ------------------------------------------------------------------
+
+    def _browserless_ready(self) -> bool:
+        """云端浏览器是否可用（有 Token 即视为已启用）。"""
+        return bool(self._browserless_token)
+
+    def _bql_opener(self) -> Any:
+        """构造访问 Browserless API 的 opener。
+
+        必须显式给出代理策略，不能依赖环境变量：
+
+        - 开启「使用代理」时走宿主系统代理——国内直连 browserless.io 经常超时，
+          这也是本插件里唯一「需要代理」而不是「站点需要代理」的场景；
+        - 未开启时用空 ``ProxyHandler`` **强制直连**，避免容器里的 ``http_proxy``
+          把 API 请求带到未预期的出口。
+
+        :return: ``urllib.request`` 的 opener
+        """
+        proxy_map: Dict[str, str] = {}
+        if self._use_proxy:
+            raw_proxy = self._get_proxies()
+            if isinstance(raw_proxy, dict):
+                proxy_map = {key: value for key, value in raw_proxy.items() if value}
+            elif isinstance(raw_proxy, str) and raw_proxy.strip():
+                # 宿主也可能把 PROXY 配成单个 URL 字符串
+                proxy_map = {"http": raw_proxy, "https": raw_proxy}
+            if proxy_map:
+                logger.info("Browserless：API 请求经系统代理发出")
+        return urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map))
+
+    def _bql_post(self, endpoint: str, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """向 BrowserQL 发一次 GraphQL 请求并返回 ``data``。
+
+        失败时不抛异常，只把原因写进 ``self._browserless_error`` 并返回 None——
+        调用方据此决定是否回退本地浏览器，同时保证失败通知里有可读的原因。
+
+        BrowserQL 是「整段脚本跑完才返回响应」的整包请求，读超时必须覆盖 solve
+        预算，否则插件会自己先掐断连接，把「还在解验证」误报成网络故障。
+
+        :param endpoint: 已附加 Token 的 BrowserQL 地址
+        :param variables: GraphQL 变量
+        :return: 响应里的 ``data``；任何失败返回 None
+        """
+        read_timeout = self._browserless_solve_timeout + BQL_READ_MARGIN
+        payload = json.dumps(
+            {
+                "operationName": "CnlangSign",
+                "query": BQL_SIGN_MUTATION,
+                "variables": variables,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._bql_opener().open(request, timeout=read_timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403):
+                self._browserless_error = (
+                    f"Browserless 鉴权失败（HTTP {err.code}），请检查 Token 是否正确"
+                )
+            elif err.code == 429:
+                self._browserless_error = (
+                    "Browserless 额度不足或请求过于频繁（HTTP 429），"
+                    "免费额度为每月 1000 次"
+                )
+            else:
+                self._browserless_error = f"Browserless 请求失败（HTTP {err.code}）"
+            logger.error(self._browserless_error)
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as err:
+            self._browserless_error = (
+                f"Browserless 无响应（{err.__class__.__name__}: {err}），"
+                f"读超时 {read_timeout} 秒；国内网络请开启「使用代理」"
+            )
+            logger.error(self._browserless_error)
+            return None
+
+        data = body.get("data") if isinstance(body, dict) else None
+        error_text = _bql_error_text(body)
+        if not isinstance(data, dict) or not data:
+            self._browserless_error = (
+                "Browserless 未返回数据：" + (error_text or "响应里既没有 data 也没有 errors")
+            )
+            logger.error(self._browserless_error)
+            return None
+        if error_text:
+            # 单个步骤失败时 BQL 仍会返回其它步骤的数据，因此这里只记录不提前返回：
+            # 「solve 超时但页面其实已经放行」是真实存在的情况，交调用方按页面判定。
+            logger.warning(f"Browserless 有步骤报错：{error_text}")
+            self._browserless_error = error_text
+        return data
+
+    @staticmethod
+    def _parse_bql_page(raw: Any) -> Dict[str, Any]:
+        """解析页面内脚本返回的 JSON 字符串。
+
+        :param raw: ``evaluate`` 步骤的 ``value``
+        :return: 解析后的字典；无法解析时返回空字典
+        """
+        if isinstance(raw, dict):
+            return raw
+        try:
+            value = json.loads(str(raw or ""))
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _signin_by_browserless(self) -> Optional[Dict[str, Any]]:
+        """用 Browserless 云端 stealth 浏览器完成整轮签到。
+
+        一次 GraphQL 请求里做完：注入 Cookie → 打开签到页 → ``solve`` 解挑战 →
+        页面内 POST 签到接口 → 顺手读积分。全程不离开那个浏览器会话，因此
+        ``cf_clearance`` 与 IP / UA 自洽。
+
+        **不回传 Cookie 是刻意设计**：``cf_clearance`` 与签发时的 IP 绑定，云端节点
+        拿到的通行证在本机必然失效，存下来只会造成「有 Cookie 却依然 403」的假象。
+
+        :return: 已落库的结果；无法执行或执行失败时返回 None，原因写入
+                 ``self._browserless_error``
+        """
+        self._browserless_error = None
+        self._cookie_invalid_hint = None
+        if not self._browserless_ready():
+            self._browserless_error = "未配置 Browserless Token"
+            return None
+        try:
+            endpoint = _bql_endpoint(self._browserless_url, self._browserless_token or "")
+        except ValueError as err:
+            self._browserless_error = f"Browserless 地址无效：{err}"
+            logger.error(self._browserless_error)
+            return None
+
+        cookies = _bql_cookie_objects(self._cookie, SITE_HOST)
+        if not cookies:
+            self._browserless_error = "未配置有效 Cookie，云端浏览器无法登录站点"
+            logger.error(self._browserless_error)
+            return None
+
+        variables = {
+            "cookies": cookies,
+            "url": SIGN_PAGE_URL,
+            "beforeWait": float(BQL_NAV_WAIT),
+            "solveTimeout": float(self._browserless_solve_timeout * 1000),
+            "afterWait": float(BQL_AFTER_WAIT),
+            "submit": _bql_submit_script(self._build_say()),
+        }
+        logger.info(
+            f"Browserless：打开签到页并解 Cloudflare 验证"
+            f"（节点 {self._browserless_url}，solve 预算 {self._browserless_solve_timeout} 秒）"
+        )
+        data = self._bql_post(endpoint, variables)
+        if data is None:
+            return None
+
+        solve = data.get("solve") if isinstance(data.get("solve"), dict) else {}
+        if solve:
+            logger.info(
+                f"Browserless solve 结果：found={solve.get('found')} "
+                f"solved={solve.get('solved')} 耗时={solve.get('time')}"
+            )
+
+        submit = data.get("submit")
+        submit = submit if isinstance(submit, dict) else {}
+        page = self._parse_bql_page(submit.get("value"))
+        if not page:
+            self._browserless_error = (
+                "Browserless 未返回可解析的签到页结果（页面脚本执行失败）"
+                + (f"：{self._browserless_error}" if self._browserless_error else "")
+            )
+            logger.error(self._browserless_error)
+            return None
+
+        why = str(page.get("why") or "")
+        if page.get("already"):
+            logger.info("Browserless：今日已完成签到")
+            self._browserless_error = None
+            return self._record_already_signed(str(page.get("username") or "未知用户"))
+        if why == "challenge":
+            self._browserless_error = (
+                "云端浏览器仍停在 Cloudflare 验证页（solve 未放行）"
+                f"，页面标题：{page.get('title') or '未知'}"
+            )
+            logger.error(self._browserless_error)
+            return None
+        if why == "login":
+            # 登录态失效靠换浏览器修不好：不落库、不重试，交给调用方走自动登录
+            self._cookie_invalid_hint = "Cookie 已失效（云端浏览器打开签到页未显示用户名）"
+            self._browserless_error = self._cookie_invalid_hint
+            logger.error(self._cookie_invalid_hint)
+            return None
+        if why == "no-formhash":
+            self._browserless_error = "云端浏览器已进入签到页但未找到 formhash，页面结构可能已变化"
+            logger.error(self._browserless_error)
+            return None
+        if not page.get("ok"):
+            self._browserless_error = (
+                f"云端浏览器签到脚本异常：{why or '未知原因'}"
+                f"（页面标题：{page.get('title') or '未知'}）"
+            )
+            logger.error(self._browserless_error)
+            return None
+
+        content = str(page.get("content") or "").strip()
+        if not content:
+            self._browserless_error = "云端浏览器提交签到后未取到响应文案，签到结果未知"
+            logger.error(self._browserless_error)
+            return None
+
+        username = str(page.get("username") or "").strip() or "未知用户"
+        money = str(page.get("money") or "未知")
+        month = str(page.get("month") or "").strip()
+        total_signs = int(month) + 1 if month.isdigit() else 1
+        self._browserless_error = None
+        logger.info(f"Browserless 签到响应：{content}")
+        return self._record_success(
+            username=username,
+            total_signs=total_signs,
+            money=money,
+            content=content,
+        )
 
     def _stored_cf_cookies(self) -> List[Dict[str, str]]:
         """读取上一轮由浏览器自己签发的 Cloudflare 通行证 Cookie。
@@ -2732,6 +3344,10 @@ class CnlangSigninV3(_PluginBase):
             "force_browser": self._force_browser,
             "use_curl_cffi": self._use_curl_cffi,
             "impersonate": self._impersonate,
+            # Browserless（云端浏览器）字段同样必须回写，否则保存一次就被清空
+            "browserless_url": self._browserless_url,
+            "browserless_token": self._browserless_token or "",
+            "browserless_solve_timeout": self._browserless_solve_timeout,
             # 自动登录相关字段必须在这里回写，否则下次保存配置时会被前端表单整体覆盖、
             # 静默清空（保存流程是 save_config() 之后紧接 initialize()）。
             "auto_login": self._auto_login,
@@ -3935,7 +4551,151 @@ class CnlangSigninV3(_PluginBase):
                                                         'props': {
                                                             'type': 'info',
                                                             'variant': 'tonal',
-                                                            'text': '站点对签到路径下发了 Cloudflare 交互式人机验证（Turnstile 勾选框），必须由真实浏览器人工完成。实测确认：纯 requests、curl_cffi 指纹伪装、无头/虚拟显示浏览器均无法通过；唯一能直接放行的是有效的 cf_clearance。因此请以「更新 Cookie」为主要手段，浏览器模式仅作兜底。'
+                                                            'text': '站点对签到路径下发了 Cloudflare 交互式人机验证（Turnstile）。这类挑战判定的是「出口 IP 信誉 + 浏览器指纹」，本机浏览器（尤其容器内的无头/虚拟显示）实测跑满 150 秒也拿不到 cf_clearance。可靠方案是下面「Cloudflare 验证」卡片里的 Browserless 云端浏览器；本卡片的浏览器模式仅作兜底，手贴 cf_clearance 是最低限度的应急手段。'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    # Cloudflare 验证卡片（Browserless 云端浏览器）
+                    {
+                        'component': 'VCard',
+                        'props': {
+                            'variant': 'outlined',
+                            'class': 'mb-4'
+                        },
+                        'content': [
+                            {
+                                'component': 'VCardTitle',
+                                'props': {
+                                    'class': 'text-h6'
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VIcon',
+                                        'props': {
+                                            'color': 'success',
+                                            'class': 'me-2'
+                                        },
+                                        'text': 'mdi-shield-check'
+                                    },
+                                    {
+                                        'component': 'span',
+                                        'props': {
+                                            'class': 'font-weight-bold'
+                                        },
+                                        'text': 'Cloudflare 验证（Browserless）'
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCardText',
+                                'content': [
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 5
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'browserless_url',
+                                                            'label': 'Browserless 地址',
+                                                            'placeholder': DEFAULT_BROWSERLESS_URL,
+                                                            'prepend-inner-icon': 'mdi-cloud-outline',
+                                                            'hint': '填根地址即可，插件自动补 /stealth/bql；国内直连不通请开启「使用代理」'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'browserless_token',
+                                                            'label': 'Browserless Token',
+                                                            'type': 'password',
+                                                            'placeholder': '留空则不启用云端浏览器',
+                                                            'prepend-inner-icon': 'mdi-key',
+                                                            'hint': '在 browserless.io/account 获取，不会写入日志'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 3
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'browserless_solve_timeout',
+                                                            'label': '解验证超时（秒）',
+                                                            'type': 'number',
+                                                            'placeholder': str(BQL_DEFAULT_SOLVE_TIMEOUT),
+                                                            'prepend-inner-icon': 'mdi-timer-sand',
+                                                            'hint': f'默认 {BQL_DEFAULT_SOLVE_TIMEOUT}，允许 30~{BQL_MAX_SOLVE_TIMEOUT}'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VAlert',
+                                                        'props': {
+                                                            'type': 'success',
+                                                            'variant': 'tonal',
+                                                            'text': '站点签到的 Cloudflare 挑战在云端 stealth 浏览器里解：插件用一次请求完成「注入 Cookie → 打开签到页 → solve 解挑战 → 页面内提交签到 → 读积分」，全程不离开那个浏览器会话。未配置 Token 时本卡片不生效，Cloudflare 拦截只会退回本地浏览器模式或提示更新 Cookie。'
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VAlert',
+                                                        'props': {
+                                                            'type': 'warning',
+                                                            'variant': 'tonal',
+                                                            'text': '额度与安全：免费额度为每月 1000 次，仅在真的撞上 Cloudflare 时消耗（正常轮次走 HTTP 直连）。云端浏览器会收到你的站点 Cookie——Browserless 是境外服务，只建议在个人自用场景下开启。'
                                                         }
                                                     }
                                                 ]
@@ -4268,6 +5028,10 @@ class CnlangSigninV3(_PluginBase):
             "use_curl_cffi": True,
             "impersonate": "auto",
             "user_agent": "",
+            # Browserless 云端浏览器（默认不启用：需要用户自己注册并填 Token）
+            "browserless_url": DEFAULT_BROWSERLESS_URL,
+            "browserless_token": "",
+            "browserless_solve_timeout": BQL_DEFAULT_SOLVE_TIMEOUT,
             # 自动登录（默认关闭：需要用户显式提供账号密码才会生效）
             "auto_login": False,
             "account": "",

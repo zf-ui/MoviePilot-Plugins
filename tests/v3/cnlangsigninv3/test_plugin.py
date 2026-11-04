@@ -2486,8 +2486,10 @@ def test_cf_status_reports_expired_observation(host):
 def test_cf_status_uses_embedded_timestamp_as_expiry(host):
     """值内嵌的时间戳在未来时，应判定为到期时间。"""
     module = host.module
+    # 多给 100 秒余量：用例自身的执行耗时会让「整 1 小时」退化成「59 分钟」，
+    # 这不是被测逻辑的问题（旧值 now + 3600 在本机跑满整套测试时会随机失败）。
     now = int(time.time())
-    plugin = _enabled_plugin(host, cookie=f"cf_clearance=abc-{now + 3600}-1-x; b=2")
+    plugin = _enabled_plugin(host, cookie=f"cf_clearance=abc-{now + 3700}-1-x; b=2")
     plugin._cf_expiry = {}
 
     text = plugin._cf_clearance_status()
@@ -3576,3 +3578,598 @@ def test_get_form_declares_every_auto_login_field(host):
     assert defaults["captcha_mode"] == "auto"
     assert defaults["save_login_cookie"] is True
     assert defaults["auto_login"] is False
+
+
+# ---------------------------------------------------------------------------
+# Browserless（云端 stealth 浏览器）过 Cloudflare
+# ---------------------------------------------------------------------------
+
+
+class _FakeOpener:
+    """模拟 urllib 的 opener：返回预设响应或抛出预设异常。"""
+
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.timeout = None
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.timeout = timeout
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return _FakeHTTPResponse(self.payload)
+
+
+class _FakeHTTPResponse:
+    """只实现 _bql_post 用到的 read + 上下文管理器协议。"""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _install_bql(plugin, monkeypatch, payload=None, solve=None, error=None):
+    """把 _bql_post 换成直接返回构造好的 data，并记录调用参数。"""
+    calls = {}
+
+    def fake_post(endpoint, variables):
+        calls["endpoint"] = endpoint
+        calls["variables"] = variables
+        if error:
+            plugin._browserless_error = error
+            return None
+        return {
+            "solve": solve if solve is not None else {"found": True, "solved": True, "time": 4},
+            "submit": {"value": json.dumps(payload or {}, ensure_ascii=False)},
+        }
+
+    monkeypatch.setattr(
+        plugin.__class__, "_bql_post", lambda self, endpoint, variables: fake_post(endpoint, variables)
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+    return calls
+
+
+def test_init_plugin_reads_browserless_config(host):
+    """云端浏览器配置应被完整读入。"""
+    plugin = _enabled_plugin(
+        host,
+        browserless_url=" https://production-ams.browserless.io ",
+        browserless_token=" TOKEN ",
+        browserless_solve_timeout="120",
+    )
+
+    assert plugin._browserless_url == "https://production-ams.browserless.io"
+    assert plugin._browserless_token == "TOKEN"
+    assert plugin._browserless_solve_timeout == 120
+    assert plugin._browserless_ready() is True
+
+
+def test_browserless_disabled_by_default(host):
+    """未填 Token 时云端浏览器不生效，不能影响原有行为。"""
+    plugin = _enabled_plugin(host)
+
+    assert plugin._browserless_token is None
+    assert plugin._browserless_url == host.module.DEFAULT_BROWSERLESS_URL
+    assert plugin._browserless_solve_timeout == host.module.BQL_DEFAULT_SOLVE_TIMEOUT
+    assert plugin._browserless_ready() is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("5", 30), ("9999", 180), ("abc", 90), (None, 90), ("120", 120)],
+)
+def test_browserless_solve_timeout_is_clamped(host, raw, expected):
+    """非法或越界的超时都要收敛到 [30, 180]，不能让整轮签到卡死。"""
+    plugin = _enabled_plugin(host, browserless_solve_timeout=raw)
+
+    assert plugin._browserless_solve_timeout == expected
+
+
+@pytest.mark.parametrize(
+    "address,expected_path",
+    [
+        ("https://production-sfo.browserless.io", "/stealth/bql"),
+        ("https://production-sfo.browserless.io/", "/stealth/bql"),
+        ("http://192.168.1.10:3000", "/stealth/bql"),
+        ("http://192.168.1.10:3000/stealth", "/stealth/bql"),
+        ("http://192.168.1.10:3000/chromium/bql", "/chromium/bql"),
+    ],
+)
+def test_bql_endpoint_normalizes_address(host, address, expected_path):
+    """根地址补 /stealth/bql，完整端点原样保留（自建实例常用 /chromium/bql）。"""
+    module = host.module
+
+    endpoint = module._bql_endpoint(address, "T")
+
+    assert endpoint.startswith("http")
+    assert endpoint.split("?")[0].endswith(expected_path)
+    assert "token=T" in endpoint
+
+
+def test_bql_endpoint_omits_empty_token(host):
+    """自建实例关鉴权时不追加空 token 参数。"""
+    module = host.module
+
+    assert module._bql_endpoint("http://h:3000") == "http://h:3000/stealth/bql"
+
+
+@pytest.mark.parametrize("address", ["", "   ", "ftp://h", "h:3000"])
+def test_bql_endpoint_rejects_invalid_address(host, address):
+    """地址非法时必须抛 ValueError，由调用方转成可读的失败原因。"""
+    module = host.module
+
+    with pytest.raises(ValueError):
+        module._bql_endpoint(address, "T")
+
+
+def test_bql_cookie_objects_builds_cookie_inputs(host):
+    """Cookie 必须带 domain / path / url，跨路径的通行证才不会丢作用域。"""
+    module = host.module
+
+    cookies = module._bql_cookie_objects("a=1; b=2", module.SITE_HOST)
+
+    assert [item["name"] for item in cookies] == ["a", "b"]
+    assert cookies[0]["value"] == "1"
+    assert cookies[0]["domain"] == f".{module.SITE_HOST}"
+    assert cookies[0]["path"] == "/"
+    assert cookies[0]["secure"] is True
+    assert cookies[0]["url"] == f"https://{module.SITE_HOST}/"
+
+
+@pytest.mark.parametrize("raw", ["", None, "bad", " ; "])
+def test_bql_cookie_objects_returns_empty_for_invalid_input(host, raw):
+    """没有有效字段时返回空列表，由调用方判失败而不是发出半截 Cookie。"""
+    module = host.module
+
+    assert module._bql_cookie_objects(raw, module.SITE_HOST) == []
+
+
+def test_bql_error_text_extracts_first_error_with_path(host):
+    """GraphQL 错误要带步骤名，才能分清是 solve 超时还是 evaluate 报错。"""
+    module = host.module
+
+    payload = {"errors": [{"message": "boom", "path": ["solve"]}]}
+
+    assert module._bql_error_text(payload) == "boom（步骤：solve）"
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"errors": []}, "x"])
+def test_bql_error_text_returns_empty_without_errors(host, payload):
+    """没有 errors 时返回空串，不能凭空造一条错误。"""
+    module = host.module
+
+    assert module._bql_error_text(payload) == ""
+
+
+def test_bql_submit_script_substitutes_placeholders(host):
+    """脚本必须完成占位符替换，且寄语里的特殊字符不能破坏脚本。"""
+    module = host.module
+
+    script = module._bql_submit_script('今天"很好\n换行\\反斜杠')
+
+    assert "__SAY__" not in script
+    assert "__SUBMIT_URL__" not in script
+    assert "__CREDIT_URL__" not in script
+    assert module.SIGN_SUBMIT_URL in script
+    assert module.CREDIT_URL in script
+    # 引号 / 换行 / 反斜杠都应被 json.dumps 转义，而不是原样落进脚本
+    assert '今天"很好' not in script
+    assert "换行\\\\反斜杠" in script
+    assert "\\n" in script
+
+
+def test_signin_by_browserless_without_token_returns_none(host):
+    """没配 Token 时直接返回 None，让调用方继续走原有兜底。"""
+    plugin = _enabled_plugin(host, browser_mode=True)
+
+    assert plugin._signin_by_browserless() is None
+    assert "未配置 Browserless Token" in plugin._browserless_error
+
+
+def test_signin_by_browserless_rejects_invalid_url(host):
+    """地址非法时报可读错误，而不是抛异常打断整轮签到。"""
+    plugin = _enabled_plugin(host, browserless_token="T", browserless_url="ftp://bad")
+
+    assert plugin._signin_by_browserless() is None
+    assert "Browserless 地址无效" in plugin._browserless_error
+
+
+def test_signin_by_browserless_requires_cookie(host):
+    """没有 Cookie 时云端浏览器登录不了，直接判失败。"""
+    plugin = _enabled_plugin(host, browserless_token="T", cookie="")
+
+    assert plugin._signin_by_browserless() is None
+    assert "Cookie" in plugin._browserless_error
+
+
+def test_signin_by_browserless_success_records_result(host, monkeypatch):
+    """正常返回应落库为成功，并把 solve 预算换算成毫秒传给云端。"""
+    plugin = _enabled_plugin(host, browserless_token="T", browserless_solve_timeout=120)
+    calls = _install_bql(
+        plugin,
+        monkeypatch,
+        payload={
+            "ok": True,
+            "why": "",
+            "username": "tester",
+            "already": False,
+            "content": "恭喜你签到成功",
+            "money": "520",
+            "month": "7",
+            "status": 200,
+        },
+    )
+
+    result = plugin._signin_by_browserless()
+
+    assert result["success"] is True
+    assert result["username"] == "tester"
+    assert result["money"] == "520"
+    assert result["total_signs"] == 8
+    assert "token=T" in calls["endpoint"]
+    assert calls["variables"]["solveTimeout"] == 120000
+    assert calls["variables"]["url"] == host.module.SIGN_PAGE_URL
+    assert calls["variables"]["cookies"][0]["name"] == "a"
+    assert plugin._browserless_error is None
+
+
+def test_signin_by_browserless_reports_already_signed(host, monkeypatch):
+    """今日已签到时应报「已完成」，不能重复提交。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    _install_bql(
+        plugin, monkeypatch, payload={"ok": True, "already": True, "username": "tester"}
+    )
+
+    result = plugin._signin_by_browserless()
+
+    assert result["success"] is True
+    assert result["total_signs"] == 0
+    assert "已经签到过" in result["content"]
+
+
+def test_signin_by_browserless_challenge_returns_none(host, monkeypatch):
+    """solve 没放行时返回 None，让调用方回退本地浏览器并把原因带上。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    _install_bql(
+        plugin,
+        monkeypatch,
+        payload={"ok": False, "why": "challenge", "title": "Just a moment..."},
+    )
+
+    assert plugin._signin_by_browserless() is None
+    assert "Cloudflare 验证页" in plugin._browserless_error
+    assert "Just a moment" in plugin._browserless_error
+
+
+def test_signin_by_browserless_login_expired_defers_to_auto_login(host, monkeypatch):
+    """Cookie 失效不落库：只置提示位，交给上层触发自动登录，避免双份通知。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browserless_token="T")
+    _install_bql(plugin, monkeypatch, payload={"ok": False, "why": "login"})
+
+    assert plugin._signin_by_browserless() is None
+    assert "Cookie 已失效" in plugin._cookie_invalid_hint
+    assert plugin.get_data(module.KEY_LAST_RESULT) is None
+
+
+def test_cloudflare_block_returns_none_when_cookie_invalid(host, monkeypatch):
+    """云端判定 Cookie 失效时不回退本地浏览器，直接把原因交给调用方。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+
+    def fake_browserless(self):
+        self._cookie_invalid_hint = "Cookie 已失效（云端浏览器打开签到页未显示用户名）"
+        return None
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_browserless)
+    monkeypatch.setattr(
+        module.CnlangSigninV3,
+        "_signin_by_browser",
+        lambda self: pytest.fail("Cookie 失效时不该再去本地浏览器白等"),
+    )
+
+    assert plugin._handle_cloudflare_block() is None
+    assert "Cookie 已失效" in plugin._cookie_invalid_hint
+    assert plugin.get_data(module.KEY_LAST_RESULT) is None
+
+
+def test_signin_by_browserless_missing_formhash_returns_none(host, monkeypatch):
+    """找不到 formhash 说明页面结构变了，报 None 交给上层汇总。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    _install_bql(plugin, monkeypatch, payload={"ok": False, "why": "no-formhash"})
+
+    assert plugin._signin_by_browserless() is None
+    assert "formhash" in plugin._browserless_error
+
+
+def test_signin_by_browserless_without_content_returns_none(host, monkeypatch):
+    """提交后读不到结果文案时不能假装成功。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    _install_bql(plugin, monkeypatch, payload={"ok": True, "username": "tester", "content": ""})
+
+    assert plugin._signin_by_browserless() is None
+    assert "结果未知" in plugin._browserless_error
+
+
+def test_signin_by_browserless_unparsable_page_returns_none(host, monkeypatch):
+    """页面脚本没返回值时返回 None，而不是抛 KeyError。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+
+    def fake_post(endpoint, variables):
+        return {"solve": {"solved": False}, "submit": {"value": ""}}
+
+    monkeypatch.setattr(
+        plugin.__class__, "_bql_post", lambda self, endpoint, variables: fake_post(endpoint, variables)
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+
+    assert plugin._signin_by_browserless() is None
+    assert "未返回可解析" in plugin._browserless_error
+
+
+def test_bql_post_returns_data_and_keeps_step_error(host, monkeypatch):
+    """单个步骤报错但仍有 data 时必须返回 data：solve 超时但页面可能已放行。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browserless_token="T")
+    opener = _FakeOpener(
+        payload={
+            "data": {"solve": {"solved": False}},
+            "errors": [{"message": "timeout", "path": ["solve"]}],
+        }
+    )
+    monkeypatch.setattr(plugin.__class__, "_bql_opener", lambda self: opener)
+
+    data = plugin._bql_post("https://x/stealth/bql?token=T", {"url": "u"})
+
+    assert data == {"solve": {"solved": False}}
+    assert "timeout" in plugin._browserless_error
+    assert opener.timeout == plugin._browserless_solve_timeout + module.BQL_READ_MARGIN
+
+
+@pytest.mark.parametrize("code,keyword", [(401, "鉴权失败"), (403, "鉴权失败"), (429, "额度不足")])
+def test_bql_post_maps_http_errors(host, monkeypatch, code, keyword):
+    """鉴权失败与额度耗尽要给出可执行的提示，而不是笼统的 HTTP 错误。"""
+    import urllib.error
+
+    plugin = _enabled_plugin(host, browserless_token="T")
+    opener = _FakeOpener(
+        error=urllib.error.HTTPError("https://x", code, "err", None, None)
+    )
+    monkeypatch.setattr(plugin.__class__, "_bql_opener", lambda self: opener)
+
+    assert plugin._bql_post("https://x", {}) is None
+    assert keyword in plugin._browserless_error
+
+
+def test_bql_post_handles_empty_data(host, monkeypatch):
+    """响应里既没有 data 也没有 errors 时返回 None 并说明。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    monkeypatch.setattr(plugin.__class__, "_bql_opener", lambda self: _FakeOpener(payload={}))
+
+    assert plugin._bql_post("https://x", {}) is None
+    assert "未返回数据" in plugin._browserless_error
+
+
+def test_bql_post_reports_unreachable_endpoint(host, monkeypatch):
+    """网络不可达要把读超时一并报出来，方便判断是不是代理没开。"""
+    import urllib.error
+
+    plugin = _enabled_plugin(host, browserless_token="T")
+    opener = _FakeOpener(error=urllib.error.URLError("timed out"))
+    monkeypatch.setattr(plugin.__class__, "_bql_opener", lambda self: opener)
+
+    assert plugin._bql_post("https://x", {}) is None
+    assert "无响应" in plugin._browserless_error
+    assert "代理" in plugin._browserless_error
+
+
+def test_cloudflare_block_prefers_browserless(host, monkeypatch):
+    """配了 Token 时 Cloudflare 拦截应优先走云端浏览器，不再碰本地浏览器。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+    browser_called = []
+
+    def fake_browserless(self):
+        result = {
+            "time": "2026-11-04 21:00:00",
+            "success": True,
+            "username": "tester",
+            "money": "600",
+            "content": "云端签到成功",
+            "total_signs": 9,
+        }
+        self.save_data(module.KEY_LAST_RESULT, result)
+        return result
+
+    monkeypatch.setattr(
+        module.CnlangSigninV3, "_signin_by_browserless", fake_browserless
+    )
+    monkeypatch.setattr(
+        module.CnlangSigninV3,
+        "_signin_by_browser",
+        lambda self: browser_called.append(True) or True,
+    )
+
+    result = plugin.signin()
+
+    assert browser_called == []
+    assert result["success"] is True
+    assert result["content"] == "云端签到成功"
+
+
+def test_cloudflare_block_falls_back_to_browser(host, monkeypatch):
+    """云端失败时应回退本地浏览器，而不是直接判整轮失败。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    def fake_browserless(self):
+        self._browserless_error = "solve 超时"
+        return None
+
+    def fake_browser(self):
+        self.save_data(
+            module.KEY_LAST_RESULT,
+            {"time": "2026-11-04 21:00:00", "success": True, "content": "本地浏览器签到成功"},
+        )
+        return True
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_browserless)
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browser", fake_browser)
+
+    result = plugin.signin()
+
+    assert result["success"] is True
+    assert result["content"] == "本地浏览器签到成功"
+
+
+def test_cloudflare_block_reports_both_failures(host, monkeypatch):
+    """两边都失败时，失败通知必须同时带上云端与本地的原因。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=True, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    def fake_browserless(self):
+        self._browserless_error = "solve 超时"
+        return None
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_browserless)
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browser", lambda self: False)
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert "solve 超时" in result["content"]
+    assert "浏览器模式不可用" in result["content"]
+
+
+def test_cloudflare_block_browserless_only_when_browser_disabled(host, monkeypatch):
+    """关掉浏览器模式时，云端失败只报云端原因 + 排查建议，不再提本地浏览器。"""
+    module = host.module
+    plugin = _enabled_plugin(host, browser_mode=False, browserless_token="T")
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+
+    def fake_browserless(self):
+        self._browserless_error = "额度不足"
+        return None
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_browserless)
+
+    result = plugin.signin()
+
+    assert result["success"] is False
+    assert "额度不足" in result["content"]
+    assert "browserless.io" in result["content"]
+    assert "浏览器模式不可用" not in result["content"]
+
+
+def test_save_config_persists_browserless_fields(host):
+    """配置回写必须带上云端浏览器字段，否则保存一次就被清空。"""
+    plugin = _enabled_plugin(
+        host,
+        browserless_url="https://production-lon.browserless.io",
+        browserless_token="TOKEN",
+        browserless_solve_timeout=120,
+    )
+
+    plugin._save_config()
+
+    saved = plugin.saved_config
+    assert saved["browserless_url"] == "https://production-lon.browserless.io"
+    assert saved["browserless_token"] == "TOKEN"
+    assert saved["browserless_solve_timeout"] == 120
+
+
+def test_get_form_declares_every_browserless_field(host):
+    """表单必须声明全部新字段——没声明的字段会在保存时被静默清空。"""
+    plugin = _enabled_plugin(host)
+
+    form, defaults = plugin.get_form()
+    rendered = json.dumps(form, ensure_ascii=False)
+
+    for field in ("browserless_url", "browserless_token", "browserless_solve_timeout"):
+        assert f'"{field}"' in rendered, f"表单缺少字段 {field}"
+        assert field in defaults, f"默认值缺少字段 {field}"
+
+    assert defaults["browserless_url"] == host.module.DEFAULT_BROWSERLESS_URL
+    assert defaults["browserless_token"] == ""
+    assert defaults["browserless_solve_timeout"] == host.module.BQL_DEFAULT_SOLVE_TIMEOUT
+
+
+def test_execute_signin_auto_logins_after_browserless_reports_cookie_invalid(host, monkeypatch):
+    """云端确认 Cookie 失效时应触发自动登录，并在拿到新 Cookie 后重跑一轮并成功。"""
+    module = host.module
+    plugin = _enabled_plugin(
+        host,
+        browser_mode=True,
+        browserless_token="T",
+        auto_login=True,
+        account="tester",
+        password="pw",
+    )
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            403, CF_CHALLENGE_BODY, headers=CF_CHALLENGE_HEADERS
+        )
+    }
+    attempts = []
+    login_reasons = []
+
+    def fake_browserless(self):
+        attempts.append(True)
+        if len(attempts) == 1:
+            self._cookie_invalid_hint = "Cookie 已失效（云端浏览器打开签到页未显示用户名）"
+            return None
+        result = {
+            "time": "2026-11-04 21:30:00",
+            "success": True,
+            "username": "tester",
+            "money": "700",
+            "content": "自动登录后云端签到成功",
+            "total_signs": 5,
+        }
+        self.save_data(module.KEY_LAST_RESULT, result)
+        return result
+
+    def fake_login(self, reason):
+        login_reasons.append(reason)
+        self._cookie = "a=1; fresh=1"
+        return True
+
+    monkeypatch.setattr(module.CnlangSigninV3, "_signin_by_browserless", fake_browserless)
+    monkeypatch.setattr(module.CnlangSigninV3, "_auto_login_now", fake_login)
+
+    result = plugin.signin()
+
+    assert len(attempts) == 2
+    assert login_reasons == ["Cookie 已失效（云端浏览器打开签到页未显示用户名）"]
+    assert result["success"] is True
+    assert result["content"] == "自动登录后云端签到成功"

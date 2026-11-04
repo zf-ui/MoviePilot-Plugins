@@ -89,6 +89,9 @@
 | 打码平台 Key | 空 | 所选平台的 API Key；`service` 方案下必需 |
 | 打码接口地址 | 空 | 留空用平台默认地址；自建 / 中转服务可覆盖 |
 | 回写 Cookie | 开 | 登录成功后把新 Cookie 同时写进「Cnlang Cookie」配置，重启后无需重填。关掉则只存插件内部数据 |
+| Browserless 地址 | `https://production-sfo.browserless.io` | 云端浏览器节点。填根地址即可，插件自动补 `/stealth/bql`；另有 `production-ams` / `production-lon` 可换 |
+| Browserless Token | 空 | 留空则不启用云端浏览器。在 <https://browserless.io/account/> 获取，日志里不会输出 |
+| 解验证超时(秒) | `90` | `solve` 步骤的等待预算，允许 30~180。Turnstile 排队时会需要更长 |
 
 ### 获取 Cookie
 
@@ -111,6 +114,10 @@
 > 「浏览器UA」填成与导出 Cookie 时**完全一致**的 `navigator.userAgent`，否则会被立即拒绝。
 >
 > `cf_clearance` 的有效期有限，签到失败时**首选操作就是重新复制一份 Cookie**。
+>
+> **v3.9.0 起有了自动化方案**：站点升级成 interactive Turnstile 之后，本机浏览器已经
+> 过不去（详见下一节），请配置「Browserless Token」，让云端 stealth 浏览器替你把
+> 挑战解掉——不再需要手工刷 Cookie。
 
 ## 自动登录
 
@@ -184,6 +191,63 @@ dependencies = [
   发到第三方。
 - 若不想把密码交给插件，可以只用「打码平台」方案 + 手工更新 Cookie。
 
+## Cloudflare 验证（Browserless）
+
+### 为什么本机浏览器过不去
+
+站点对签到路径下发的是 **interactive Turnstile**。它判定的是「出口 IP 信誉 + 浏览器指纹 +
+自动化特征」，而不是「有没有点那个勾选框」。因此本机怎么调都没用，实测结论：
+
+| 客户端 | 结果 |
+| --- | --- |
+| 纯 `requests` / `urllib` | 403 + `Cf-Mitigated: challenge` |
+| `curl_cffi`（chrome150 指纹 + 完整 Client Hints + 论坛会话） | 同样 403 |
+| 无头 Chrome | 跑满 150 秒，拿不到 `cf_clearance` |
+| 有头 Chrome（全新 profile） | 跑满 150 秒，拿不到 `cf_clearance` |
+
+容器里更糟：MoviePilot 的「有头」模式实际跑在 Xvfb 虚拟显示上，对 Cloudflare 来说等同无头。
+
+### 工作方式
+
+插件用 [Browserless](https://browserless.io) 的云端 stealth Chromium，通过 BrowserQL 一次
+请求完成整轮签到：
+
+```text
+注入 Cookie → goto 签到页 → solve（服务端解挑战）→ 页面内 POST 签到接口 → 读大洋余额
+```
+
+`solve` 是 Browserless 的服务端验证码求解步骤，支持 Turnstile / reCAPTCHA / hCaptcha /
+Cloudflare Challenge。它是这类挑战目前唯一稳定的自动化突破口——**开源自建的 browserless
+镜像里没有 `solve`，也没有 stealth 补丁**，所以这条路必须用云端。
+
+几个刻意的设计：
+
+- **不回传 `cf_clearance`**。通行证与签发时的 IP 绑定，云端拿到的搬到本机必然失效，存下来
+  只会造成「有 Cookie 却依然 403」的假象。所以插件不存、不回写。
+- **只在真的撞上 Cloudflare 时消耗额度**。正常轮次走 HTTP 直连，免费额度（1000 次/月）足够
+  一天一次跑满一年。
+- **签到表单若内嵌 Turnstile widget**，脚本会先读 `window.turnstile.getResponse()`，读不到
+  就轮询等 8 秒，再退到 `input[name*=turnstile]`，把 token 一起提交。
+- **失败不硬扛**：云端失败会带着原因回退本地浏览器模式；两边都失败时，失败通知里会同时给出
+  两段原因，再附排查建议。
+
+### 配置步骤
+
+1. 打开 <https://browserless.io/signup/email?plan=free> 注册免费账号。
+2. 在 <https://browserless.io/account/> 复制 Token。
+3. 插件配置 →「Cloudflare 验证（Browserless）」→ 粘贴 Token，地址保持默认即可。
+4. 国内网络直连 `browserless.io` 经常超时：**打开「使用代理」**，让 API 请求走宿主系统代理。
+
+### 排查
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 通知里出现「鉴权失败（HTTP 401/403）」 | Token 不对 | 重新复制 Token |
+| 「额度不足（HTTP 429）」 | 当月免费额度用完 | 等下月，或换付费计划 |
+| 「无响应 … 读超时」 | 国内直连超时 | 开启「使用代理」 |
+| 「仍停在 Cloudflare 验证页」 | 节点出口 IP 被站点拉黑 | 换 `production-ams` / `production-lon` 节点；或把解验证超时调到 120 秒 |
+| 「Cookie 已失效（未显示用户名）」 | 登录态过期 | 开启「自动登录」，插件会自己续期后重跑 |
+
 ## 插件 API
 
 所有接口都需要 `bear` 鉴权，最终路径为 `/api/v1/plugin/CnlangSigninV3/<path>`。
@@ -210,6 +274,29 @@ dependencies = [
 
 > 之所以不做自动迁移：读取另一个插件 ID 的配置需要宿主未公开的接口，不同 MoviePilot
 > 版本行为不一致，风险高于让用户重填一次。
+
+## v3.9.0 变更说明
+
+### 新增：Browserless 云端浏览器，真正过掉 Cloudflare
+
+站点把签到路径升级成 **interactive Turnstile** 之后，v3.8.0 及更早版本只能提示用户手工
+更新 Cookie——因为本机浏览器（含容器内的「有头」模式）实测都过不去。本版改用云端
+stealth 浏览器解决：
+
+- 一次 BrowserQL 请求完成「注入 Cookie → 打开签到页 → `solve` 解挑战 → 页面内提交签到 →
+  读积分」，全程不离开那个浏览器会话，`cf_clearance` 与云端 IP / UA 自洽。
+- Cloudflare 拦截时的顺序改为「Browserless > 本地浏览器模式 > 可执行建议」。
+- 云端确认 Cookie 失效时不再白跑一轮本地浏览器，而是直接交给「自动登录」自愈。
+- 日志里记录 `solve` 的 `found / solved / time`，失败通知能直接指出是「验证没解出来」
+  「Cookie 失效」还是「页面结构变了」。
+
+详见 [Cloudflare 验证（Browserless）](#cloudflare-验证browserless)。
+
+### 修正：一个与时钟相关的测试假失败
+
+`test_cf_status_uses_embedded_timestamp_as_expiry` 用 `now + 3600` 构造到期时间，再断言
+文案里出现「1 小时」——只要用例自身耗时跨过 1 秒，剩余时间就退化成「59 分钟」，整跑时
+随机失败。现改为留 100 秒余量，断言意图不变。
 
 ## v3.8.0 变更说明
 
