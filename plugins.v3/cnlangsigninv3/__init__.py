@@ -101,6 +101,19 @@ SAY_FALLBACK = "一别之后，两地相思，只道是三四月，又谁知五�
 # 签到心情固定使用“开心”
 SIGN_MOOD = "kx"
 
+# 签到页上两处统计文案的解析规则。
+#
+# 一律先**去掉 HTML 标签**再正则，不做 `<p>您本月已累计签到:<b>(\d+)</b>` 这类死板匹配：
+# dsu_paulsign 的各处改版在 `<p>`、`<b>`、冒号和空格的位置上并不统一，3.9.4 之前就
+# 因为写死了 `<p>` 前缀，实战日志里一直显示「本月累计签到：1 天」，而站内实际是 7 次。
+#
+# 「连续签到」在不同模板里有「您已经连续签到 N 天」「连续签到：N 天」「已连续签到 N 天」
+# 几种写法，去标签后统一成「连续签到 + 可选冒号 + 数字 + 天」即可全部覆盖。
+MONTH_SIGNS_PATTERN = r"本月已累计签到\s*[:：]?\s*(\d+)"
+STREAK_PATTERN = r"连续签到\s*[:：]?\s*(\d+)\s*天"
+# 签到响应里的奖励金额，例如「恭喜你签到成功!获得随机奖励 大洋 7 .」
+REWARD_PATTERN = r"随机奖励\s*大洋\s*(\d+)"
+
 # 默认 User-Agent。Cloudflare 签发的 cf_clearance 与 UA 绑定，站点也会按 UA 判断
 # 浏览器新旧，因此这里取一个较新的稳定版本；用户可在配置中覆盖为与自己浏览器
 # 完全一致的 UA（见配置项「浏览器UA」）。
@@ -177,6 +190,52 @@ def _looks_like_human_check(text: Optional[str]) -> bool:
     if not value:
         return False
     return any(hint in value for hint in HUMAN_CHECK_HINTS)
+
+
+def _plain_text(html: Any) -> str:
+    """把 HTML 压成一行纯文本，用于对站点文案做宽松匹配。
+
+    dsu_paulsign 的文案里数字被 ``<b>`` 包住，且各改版在标签、冒号、空格上并不统一
+    （``您本月已累计签到:<b>7</b>`` / ``您已经连续签到 <b>18</b> 天``）。直接对原始
+    HTML 写死正则，站点换一处标签就静默失效——连续签到天数读成 0 就是这么来的。
+    去掉标签、把连续空白压成一个空格之后，再用「关键词 + 数字」这类宽松规则匹配，
+    对改版就稳得多。
+
+    :param html: 原始 HTML 或纯文本
+    :return: 压平后的单行文本
+    """
+    text = re.sub(r"<[^>]+>", " ", str(html or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _pick_int(html: Any, pattern: str) -> Optional[int]:
+    """在一段 HTML 里按宽松规则取第一个整数。
+
+    :param html: 原始 HTML 或纯文本
+    :param pattern: 只含一个捕获组的正则
+    :return: 匹配到的整数；没匹配到返回 None（调用方据此决定兜底）
+    """
+    if not html:
+        return None
+    match = re.search(pattern, _plain_text(html))
+    if not match:
+        return None
+    value = match.group(1)
+    return int(value) if value.isdigit() else None
+
+
+def _int_of(value: Any) -> int:
+    """把页面脚本回传的字符串数字转成 int，非数字或空值一律当 0。
+
+    BrowserQL 页面脚本返回的是 JSON 字符串，``streak`` / ``month`` 拿到的都是
+    ``"18"`` 这种字符串，且可能为空串。
+
+    :param value: 任意值
+    :return: 整数，无法解析时为 0
+    """
+    text = str(value if value is not None else "").strip()
+    return int(text) if text.isdigit() else 0
+
 
 # Cloudflare 自管 Cookie（cf_clearance / __cf_bm / cf_chl_* …）。
 # 早期版本以为「把旧通行证注入浏览器会让 CF 不信任会话」而把它们剔除，实测不成立：
@@ -265,7 +324,7 @@ BQL_SUBMIT_SCRIPT = r"""
   const SUBMIT_URL = "__SUBMIT_URL__";
   const CREDIT_URL = "__CREDIT_URL__";
   const out = {ok: false, why: "", title: "", url: "", username: "", already: false,
-               content: "", money: "未知", month: "", status: 0,
+               content: "", money: "未知", month: "", streak: "", status: 0,
                tokenFrom: "", widget: false, form: false, fields: 0};
   const strip = (html) => (html || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 
@@ -281,6 +340,11 @@ BQL_SUBMIT_SCRIPT = r"""
   out.widget = !!(
     document.querySelector("[data-sitekey], .cf-turnstile, iframe[src*='challenges.cloudflare.com']")
     || (window.turnstile && typeof window.turnstile.getResponse === "function"));
+
+  // 连续签到天数：先去标签再匹配，站点把数字包在 <b> 里、冒号和空格也不统一
+  const plainRoot = root.replace(/<[^>]+>/g, " ");
+  const streakRoot = plainRoot.match(/连续签到\s*[:：]?\s*(\d+)\s*天/);
+  if (streakRoot) out.streak = streakRoot[1];
 
   // A) 是否还停在「整页挑战」。
   //
@@ -394,8 +458,17 @@ BQL_SUBMIT_SCRIPT = r"""
     return JSON.stringify(out);
   }
 
-  const month = root.match(/您本月已累计签到:\s*<b>(\d+)<\/b>/);
-  if (month) out.month = month[1];
+  // E) 签到成功后再回读一次签到页：连续签到天数只有签到后那一版页面才把今天算进去，
+  //    提交前读到的是昨天的值。顺带取站点认可的「本月已累计」，比页面初始值 +1 更准。
+  try {
+    const after = await fetch("__SIGN_PAGE_URL__", {credentials: "include"});
+    const afterHtml = await after.text();
+    const afterText = afterHtml.replace(/<[^>]+>/g, " ");
+    const streakMatch = afterText.match(/连续签到\s*[:：]?\s*(\d+)\s*天/);
+    if (streakMatch) out.streak = streakMatch[1];
+    const monthMatch = afterText.match(/本月已累计签到\s*[:：]?\s*(\d+)/);
+    if (monthMatch) out.month = monthMatch[1];
+  } catch (err) {}
 
   try {
     const credit = await fetch(CREDIT_URL, {credentials: "include"});
@@ -1018,6 +1091,7 @@ def _bql_submit_script(say: str, token: str = "") -> str:
         BQL_SUBMIT_SCRIPT.replace("__SAY__", literal)
         .replace("__TOKEN__", token_literal)
         .replace("__HUMAN_HINTS__", hints_literal)
+        .replace("__SIGN_PAGE_URL__", SIGN_PAGE_URL)
         .replace("__SUBMIT_URL__", SIGN_SUBMIT_URL)
         .replace("__CREDIT_URL__", CREDIT_URL)
     )
@@ -1065,27 +1139,15 @@ NOTIFY_STYLES = ("style1", "style2", "style3", "style4", "style5")
 
 # 通知样式模板。占位符：{detail} 结果详情、{time} 执行时间、
 # {headline} 失败标题、{advice} Cookie 失效时的处理建议。
+#
+# style1（默认）不走模板：它由 ``_format_compact_notice`` 逐行拼装，只输出签到结果
+# 本身的关键信息（时间 / 状态 / 奖励 / 连续签到 / 余额）。放在这里的一行说明只是为了让
+# 「全部样式都在这个字典里」这件事保持成立，避免以后有人误以为 style1 缺配置。
 NOTIFY_TEMPLATES: Dict[str, Dict[str, str]] = {
     "style1": {
-        "title": "🎬 国语视界签到",
-        "success": (
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "✅ 签到成功\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 详细信息：\n"
-            "{detail}\n"
-            "⏰ 执行时间：{time}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━"
-        ),
-        "failure": (
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "❌ {headline}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 失败原因：{detail}\n"
-            "⏰ 执行时间：{time}\n"
-            "{advice}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━"
-        ),
+        "title": "【✅ 国语视界签到成功】",
+        "success": "（style1 为紧凑版式，由 _format_compact_notice 生成，不走模板）",
+        "failure": "（style1 为紧凑版式，由 _format_compact_notice 生成，不走模板）",
         "headline": "签到失败",
         "cookie_headline": "Cookie已失效",
         "advice": "🔑 请更新Cookie后重试",
@@ -1205,7 +1267,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.4"
+    plugin_version = "3.9.5"
     # 插件作者（本仓库维护者；不再沿用上游 xijin285）
     plugin_author = "zf-ui"
     # 作者主页
@@ -1643,15 +1705,17 @@ class CnlangSigninV3(_PluginBase):
 
         if re.search(r"您今天已经签到过了或者签到时间还未开始", page):
             logger.info("今日已完成签到，跳过提交")
-            return self._record_already_signed(user_name), None
+            # 已签到时页面上的「连续签到」就是含今天的准确值，直接读
+            streak = _pick_int(page, STREAK_PATTERN) or self._history_streak()
+            return self._record_already_signed(user_name, streak=streak), None
 
         formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', page)
         if not formhash:
             return self._record_failure("未获取到 formhash，站点页面结构可能已变化"), None
         logger.info(f"formhash：{formhash}")
 
-        month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", page)
-        total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
+        month_signs = _pick_int(page, MONTH_SIGNS_PATTERN)
+        total_signs = (month_signs or 0) + 1
         logger.info(f"本月累计签到（含本次）：{total_signs}")
 
         # 步骤 2：提交签到
@@ -1703,12 +1767,26 @@ class CnlangSigninV3(_PluginBase):
         money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_page) or "未知"
         logger.info(f"当前大洋余额：{money}")
 
+        # 步骤 4：回读签到页取「连续签到」与站点认可的「本月累计」
+        #
+        # 连续签到天数只有在**签到后**的页面上才把今天算进去，提交前那个页面读到的是
+        # 昨天的值（首签还是 0），所以必须重新读一次。顺带把本月累计也对齐站点口径：
+        # 提交前读到的数字 +1 只是推算，站点自己算的更可信。
+        after_page = self._fetch(SIGN_PAGE_URL, headers=headers) or ""
+        streak = _pick_int(after_page, STREAK_PATTERN) or 0
+        if streak:
+            logger.info(f"连续签到：{streak} 天")
+        month_after = _pick_int(after_page, MONTH_SIGNS_PATTERN)
+        if month_after:
+            total_signs = max(total_signs, month_after)
+
         return (
             self._record_success(
                 username=user_name,
                 total_signs=total_signs,
                 money=money,
                 content=content,
+                streak=streak,
             ),
             None,
         )
@@ -2738,7 +2816,10 @@ class CnlangSigninV3(_PluginBase):
         if page.get("already"):
             logger.info("Browserless：今日已完成签到")
             self._browserless_error = None
-            return self._record_already_signed(str(page.get("username") or "未知用户"))
+            return self._record_already_signed(
+                str(page.get("username") or "未知用户"),
+                streak=_int_of(page.get("streak")),
+            )
         if why == "challenge":
             self._browserless_error = (
                 "云端浏览器仍停在 Cloudflare 验证页（solve 未放行）"
@@ -2792,15 +2873,19 @@ class CnlangSigninV3(_PluginBase):
 
         username = str(page.get("username") or "").strip() or "未知用户"
         money = str(page.get("money") or "未知")
-        month = str(page.get("month") or "").strip()
-        total_signs = int(month) + 1 if month.isdigit() else 1
+        # month / streak 都是签到后回读签到页拿到的，已经含本次与今天，不再 +1
+        total_signs = _int_of(page.get("month")) or 1
+        streak = _int_of(page.get("streak"))
         self._browserless_error = None
         logger.info(f"Browserless 签到响应：{content}")
+        if streak:
+            logger.info(f"Browserless 连续签到：{streak} 天")
         return self._record_success(
             username=username,
             total_signs=total_signs,
             money=money,
             content=content,
+            streak=streak,
         )
 
     def _stored_cf_cookies(self) -> List[Dict[str, str]]:
@@ -3352,7 +3437,9 @@ class CnlangSigninV3(_PluginBase):
 
         if re.search(r"您今天已经签到过了或者签到时间还未开始", html):
             logger.info("今日已完成签到，跳过提交")
-            self._record_already_signed(user_name)
+            self._record_already_signed(
+                user_name, streak=_pick_int(html, STREAK_PATTERN) or 0
+            )
             return True
 
         formhash = self._search(r'<input[^>]*name="formhash"[^>]*value="([^"]*)"', html)
@@ -3360,8 +3447,8 @@ class CnlangSigninV3(_PluginBase):
             self._record_failure("未获取到 formhash，站点页面结构可能已变化")
             return True
 
-        month_signs = self._search(r"<p>您本月已累计签到:<b>(.*?)</b>", html)
-        total_signs = int(month_signs) + 1 if month_signs and month_signs.isdigit() else 1
+        month_signs = _pick_int(html, MONTH_SIGNS_PATTERN)
+        total_signs = (month_signs or 0) + 1
 
         logger.info("浏览器模式：在页面上下文内提交签到")
         submitted = self._browser_fetch(
@@ -3398,11 +3485,21 @@ class CnlangSigninV3(_PluginBase):
         money = self._search(r'<span id="hcredit_2">(\d+)</span>', credit_html) or "未知"
         logger.info(f"当前大洋余额：{money}")
 
+        # 连续签到天数只在签到后的页面上才含今天，回读一次签到页
+        after_html = self._browser_fetch(page, SIGN_PAGE_URL) or ""
+        streak = _pick_int(after_html, STREAK_PATTERN) or 0
+        if streak:
+            logger.info(f"连续签到：{streak} 天")
+        month_after = _pick_int(after_html, MONTH_SIGNS_PATTERN)
+        if month_after:
+            total_signs = max(total_signs, month_after)
+
         self._record_success(
             username=user_name,
             total_signs=total_signs,
             money=money,
             content=content,
+            streak=streak,
         )
         return True
 
@@ -3547,24 +3644,40 @@ class CnlangSigninV3(_PluginBase):
     # 结果记录与通知
     # ------------------------------------------------------------------
 
-    def _record_success(
-        self, *, username: str, total_signs: int, money: str, content: str
-    ) -> Dict[str, Any]:
-        """记录一次成功签到：发送通知、追加历史、保存最近结果。"""
-        sign_time = self._now()
-        detail = (
-            f"签到账号：{username}\n"
-            f"本月累计签到：{total_signs} 天\n"
-            f"当前大洋：{money}\n"
-            f"签到时间：{sign_time}\n"
-            f"{content}\n"
-            f"{self._cf_clearance_status()}"
-        )
-        self._notify_result(success=True, detail=detail)
+    def _history_streak(self) -> int:
+        """按历史记录推算连续签到天数（站点读不到时的兜底）。
+
+        :return: 从最近一次成功签到起逐日回溯的天数；无历史时为 0
+        """
         try:
-            self.save_data(KEY_LAST_SUCCESS, int(time.time()))
-        except Exception as err:  # noqa: BLE001 - 记录失败不影响签到结果
-            logger.debug(f"记录上次成功签到时间失败：{err}")
+            history = self.get_data(KEY_HISTORY) or []
+        except Exception as err:  # noqa: BLE001 - 统计失败不影响签到结果
+            logger.debug(f"读取签到历史失败：{err}")
+            return 0
+        return int(self._analyze_history(history).get("current_continuous") or 0)
+
+    def _record_success(
+        self,
+        *,
+        username: str,
+        total_signs: int,
+        money: str,
+        content: str,
+        streak: int = 0,
+        reward: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """记录一次成功签到：发送通知、追加历史、保存最近结果。
+
+        :param username: 签到账号
+        :param total_signs: 本月累计签到天数（含本次）
+        :param money: 当前大洋余额
+        :param content: 站点返回的原文
+        :param streak: 连续签到天数；传 0 表示站点没读到，由历史记录推算兜底
+        :param reward: 本次奖励大洋；None 表示从 ``content`` 里解析
+        """
+        sign_time = self._now()
+        if reward is None:
+            reward = _pick_int(content, REWARD_PATTERN)
 
         history = self.get_data(KEY_HISTORY) or []
         history.append(
@@ -3572,12 +3685,42 @@ class CnlangSigninV3(_PluginBase):
                 "date": sign_time,
                 "username": username,
                 "totalContinuousCheckIn": total_signs,
+                "streak": int(streak or 0),
+                "reward": reward if reward is not None else "",
                 "money": money,
                 "content": content,
                 "success": True,
             }
         )
-        self.save_data(KEY_HISTORY, self._prune_history(history))
+        history = self._prune_history(history)
+        self.save_data(KEY_HISTORY, history)
+
+        # 站点没给出连续签到天数时，用历史记录推算，别让通知里固定显示 0 天
+        if not streak:
+            streak = int(self._analyze_history(history).get("current_continuous") or 0)
+
+        detail = (
+            f"签到账号：{username}\n"
+            f"本月累计签到：{total_signs} 天\n"
+            f"连续签到：{streak} 天\n"
+            f"本次奖励：{reward if reward is not None else '未知'} 大洋\n"
+            f"当前大洋：{money}\n"
+            f"签到时间：{sign_time}\n"
+            f"{content}\n"
+            f"{self._cf_clearance_status()}"
+        )
+        self._notify_result(
+            success=True,
+            detail=detail,
+            kind="sign",
+            reward=reward,
+            streak=streak,
+            money=money,
+        )
+        try:
+            self.save_data(KEY_LAST_SUCCESS, int(time.time()))
+        except Exception as err:  # noqa: BLE001 - 记录失败不影响签到结果
+            logger.debug(f"记录上次成功签到时间失败：{err}")
 
         result = {
             "time": sign_time,
@@ -3586,28 +3729,45 @@ class CnlangSigninV3(_PluginBase):
             "money": money,
             "content": content,
             "total_signs": total_signs,
+            "streak": streak,
+            "reward": reward if reward is not None else "",
             "message": detail,
         }
         self.save_data(KEY_LAST_RESULT, result)
         return result
 
-    def _record_already_signed(self, username: str) -> Dict[str, Any]:
-        """记录“今日已签到”：发送通知但不重复追加历史，避免统计虚高。"""
+    def _record_already_signed(self, username: str, streak: int = 0) -> Dict[str, Any]:
+        """记录“今日已签到”：发送通知但不重复追加历史，避免统计虚高。
+
+        :param username: 签到账号
+        :param streak: 连续签到天数（已签到时页面上的值就含今天）
+        """
         sign_time = self._now()
+        money = self._last_known_money()
+        if not streak:
+            streak = self._history_streak()
         detail = (
             f"签到账号：{username}\n"
             f"今日已完成签到，无需重复提交\n"
+            f"连续签到：{streak} 天\n"
             f"检查时间：{sign_time}\n"
             f"{self._cf_clearance_status()}"
         )
-        self._notify_result(success=True, detail=detail)
+        self._notify_result(
+            success=True,
+            detail=detail,
+            kind="already",
+            streak=streak,
+            money=money,
+        )
         result = {
             "time": sign_time,
             "success": True,
             "username": username,
-            "money": self._last_known_money(),
+            "money": money,
             "content": "您今天已经签到过了或者签到时间还未开始",
             "total_signs": 0,
+            "streak": streak,
             "message": detail,
         }
         self.save_data(KEY_LAST_RESULT, result)
@@ -3622,7 +3782,7 @@ class CnlangSigninV3(_PluginBase):
             note = self._cf_survival_note()
             if note and note not in reason:
                 reason = f"{reason}\n\n{note}"
-        self._notify_result(success=False, detail=reason)
+        self._notify_result(success=False, detail=reason, kind="failure")
         result = {
             "time": sign_time,
             "success": False,
@@ -3630,18 +3790,45 @@ class CnlangSigninV3(_PluginBase):
             "money": self._last_known_money(),
             "content": reason,
             "total_signs": 0,
+            "streak": 0,
             "message": reason,
         }
         self.save_data(KEY_LAST_RESULT, result)
         return result
 
-    def _notify_result(self, *, success: bool, detail: str) -> None:
-        """按配置的通知样式发送签到结果通知。"""
+    def _notify_result(
+        self,
+        *,
+        success: bool,
+        detail: str,
+        kind: str = "failure",
+        reward: Optional[int] = None,
+        streak: int = 0,
+        money: str = "",
+    ) -> None:
+        """按配置的通知样式发送签到结果通知。
+
+        :param success: 是否成功（已签到也算成功）
+        :param detail: 明细文本，同时写日志
+        :param kind: ``sign`` 新签到 / ``already`` 今日已签到 / ``failure`` 失败
+        :param reward: 本次奖励大洋，None 表示不展示
+        :param streak: 连续签到天数，0 表示不展示
+        :param money: 当前大洋余额
+        """
         logger.info(detail)
         if not self._notify:
             return
 
         style = self._notify_style if self._notify_style in NOTIFY_STYLES else "style1"
+        if style == "style1":
+            expired = (not success) and self._looks_like_cookie_expired(detail)
+            title, text = self._format_compact_notice(
+                kind=kind, detail=detail, reward=reward, streak=streak, money=money,
+                expired=expired,
+            )
+            self.post_message(mtype=MessageType.Plugin, title=title, text=text)
+            return
+
         template = NOTIFY_TEMPLATES[style]
         expired = self._looks_like_cookie_expired(detail)
         advice = template["advice"] if (expired and not success) else ""
@@ -3654,6 +3841,50 @@ class CnlangSigninV3(_PluginBase):
         # 未命中 Cookie 失效分支时会残留空行，这里统一清理
         text = "\n".join(line for line in text.split("\n") if line.strip())
         self.post_message(mtype=MessageType.Plugin, title=template["title"], text=text)
+
+    def _format_compact_notice(
+        self,
+        *,
+        kind: str,
+        detail: str,
+        reward: Optional[int] = None,
+        streak: int = 0,
+        money: str = "",
+        expired: bool = False,
+    ) -> Tuple[str, str]:
+        """style1：紧凑的 emoji 版式，一行一个关键信息。
+
+        :return: ``(标题, 正文)``
+        """
+        success = kind in ("sign", "already")
+        icon = "✅" if success else "❌"
+        headline = {
+            "sign": "签到成功",
+            "already": "今日已签到",
+            "failure": "Cookie已失效" if expired else "签到失败",
+        }.get(kind, "签到失败")
+        title = f"【{icon} 国语视界{headline}】"
+
+        lines = ["📢 执行结果", "━━━━━━━━━━", f"🕐 时间：{self._now()}", f"✨ 状态：{headline}"]
+        if kind == "sign":
+            if reward not in (None, ""):
+                lines.append(f"🎁 奖励：{reward}大洋")
+            if streak:
+                lines.append(f"📆 连续签到：{streak}天")
+            if money and money != "未知":
+                lines.append(f"📊 余额：{money}大洋")
+        elif kind == "already":
+            if streak:
+                lines.append(f"📆 连续签到：{streak}天")
+            if money and money != "未知":
+                lines.append(f"📊 余额：{money}大洋")
+            lines.append("💤 今日无需重复签到")
+        else:
+            lines.append(f"📝 原因：{detail.strip()}")
+            if expired:
+                lines.append("🔑 请更新Cookie后重试")
+        return title, "\n".join(lines)
+
 
     @staticmethod
     def _looks_like_cookie_expired(detail: str) -> bool:
@@ -4127,13 +4358,17 @@ class CnlangSigninV3(_PluginBase):
                 status_data["account"]["username"] = username
                 status_data["account"]["cookie_status"] = "有效"
 
-            month_signs = self._search(r"您本月已累计签到:<b>(\d+)</b>", page)
-            if month_signs and month_signs.isdigit():
-                status_data["month_signs"] = int(month_signs)
+            month_signs = _pick_int(page, MONTH_SIGNS_PATTERN)
+            if month_signs is not None:
+                status_data["month_signs"] = month_signs
 
-            continuous_days = self._search(r"您已经连续签到<b>(\d+)</b>天", page)
-            if continuous_days and continuous_days.isdigit():
-                status_data["continuous_days"] = int(continuous_days)
+            # 连续签到：优先读站点，读不到再按历史推算——之前的正则写死成
+            # 「您已经连续签到<b>(\d+)</b>天」，站点换个标签就静默变成 0 天
+            continuous_days = _pick_int(page, STREAK_PATTERN)
+            if continuous_days is not None:
+                status_data["continuous_days"] = continuous_days
+            else:
+                status_data["continuous_days"] = self._history_streak()
 
             if re.search(r"您今天已经签到过了或者签到时间还未开始", page):
                 status_data["last_sign_status"] = "成功"
@@ -4452,14 +4687,14 @@ class CnlangSigninV3(_PluginBase):
                                                             'model': 'notify_style',
                                                             'label': '通知样式',
                                                             'items': [
-                                                                {'title': '简约风格', 'value': 'style1', 'prepend-icon': 'mdi-view-dashboard'},
+                                                                {'title': '简洁风格（推荐）', 'value': 'style1', 'prepend-icon': 'mdi-view-dashboard'},
                                                                 {'title': '清新风格', 'value': 'style2', 'prepend-icon': 'mdi-flower'},
                                                                 {'title': '科技风格', 'value': 'style3', 'prepend-icon': 'mdi-rocket'},
                                                                 {'title': '商务风格', 'value': 'style4', 'prepend-icon': 'mdi-briefcase'},
                                                                 {'title': '优雅风格', 'value': 'style5', 'prepend-icon': 'mdi-star'}
                                                             ],
                                                             'prepend-inner-icon': 'mdi-palette',
-                                                            'hint': '选择通知消息的显示样式',
+                                                            'hint': '简洁风格一行只报一个关键信息（时间 / 状态 / 奖励 / 连续签到 / 余额），其余样式为整段明细',
                                                             'persistent-hint': True
                                                         }
                                                     }
@@ -6409,7 +6644,11 @@ class CnlangSigninV3(_PluginBase):
                                                     'props': {
                                                         'class': 'text-caption text-medium-emphasis'
                                                     },
-                                                    'text': str(h.get("totalContinuousCheckIn"))
+                                                    'text': str(
+                                                        h.get("streak")
+                                                        if h.get("streak") not in (None, "")
+                                                        else h.get("totalContinuousCheckIn")
+                                                    )
                                                 },
                                                 {
                                                     'component': 'td',

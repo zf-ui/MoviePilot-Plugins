@@ -3821,9 +3821,10 @@ def test_signin_by_browserless_success_records_result(host, monkeypatch):
             "why": "",
             "username": "tester",
             "already": False,
-            "content": "恭喜你签到成功",
+            "content": "恭喜你签到成功!获得随机奖励 大洋 9 .",
             "money": "520",
             "month": "7",
+            "streak": "18",
             "status": 200,
         },
     )
@@ -3833,7 +3834,10 @@ def test_signin_by_browserless_success_records_result(host, monkeypatch):
     assert result["success"] is True
     assert result["username"] == "tester"
     assert result["money"] == "520"
-    assert result["total_signs"] == 8
+    # month / streak 来自签到后回读的签到页，本身已含本次与今天，不再 +1
+    assert result["total_signs"] == 7
+    assert result["streak"] == 18
+    assert result["reward"] == 9
     assert "token=T" in calls["endpoint"]
     assert calls["variables"]["solveTimeout"] == 120000
     assert calls["variables"]["url"] == host.module.SIGN_PAGE_URL
@@ -4344,7 +4348,7 @@ def test_signin_by_browserless_retries_with_solve_token_after_human_check(host, 
         "why": "",
         "username": "luobop",
         "content": "恭喜你签到成功，获得 10 大洋",
-        "month": "1",
+        "month": "2",
         "money": "272",
         "tokenFrom": "solve",
     }
@@ -4381,6 +4385,7 @@ def test_signin_by_browserless_retries_with_solve_token_after_human_check(host, 
     assert requests[1]["variables"]["cookies"]
     assert result["success"] is True
     assert result["money"] == "272"
+    # 第二段页面上的「本月已累计」已含本次，直接采用不再 +1
     assert result["total_signs"] == 2
 
 
@@ -4662,3 +4667,224 @@ def test_signin_by_browserless_second_stage_failure_keeps_its_own_reason(host, m
     assert "HTTP 404" in error
     # 不能把两件事混成一句「站点仍判定未完成人机验证」，那会误导排查方向
     assert "站点仍判定未完成人机验证" not in error
+
+
+# ---------------------------------------------------------------------------
+# 3.9.5：通知改成紧凑版式 + 连续签到读不出来
+#
+# 两件事同源：旧实现把「本月已累计签到:<b>N</b>」写死成 `<p>...` 前缀，读到就变 0/1；
+# 连续签到同理写死成「您已经连续签到<b>N</b>天」，站点换个标签就静默变 0 天。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "您已经连续签到<b>18</b>天",
+        "您已经连续签到 <b>18</b> 天",
+        "您已经连续签到：<b>18</b> 天",
+        "连续签到：18天",
+        "已连续签到 18 天",
+        "<div>连续签到 <span>18</span> 天</div>",
+    ],
+)
+def test_pick_int_reads_streak_loosely(host, html):
+    """连续签到的写法在各改版里不统一，去标签后要都能读到。"""
+    module = host.module
+
+    assert module._pick_int(html, module.STREAK_PATTERN) == 18
+
+
+@pytest.mark.parametrize(
+    "html,expected",
+    [
+        ("<p>您本月已累计签到:<b>7</b>", 7),
+        ("您本月已累计签到:<b>7</b> 次", 7),
+        ("您本月已累计签到：<b>7</b>", 7),
+        ("本月已累计签到 7 天", 7),
+        ("您本月已累计签到:<b>0</b>", 0),
+    ],
+)
+def test_pick_int_reads_month_signs_without_p_tag(host, html, expected):
+    """本月累计不再要求 `<p>` 前缀——3.9.4 之前因此一直显示 1 天。"""
+    module = host.module
+
+    assert module._pick_int(html, module.MONTH_SIGNS_PATTERN) == expected
+
+
+@pytest.mark.parametrize("html", ["", None, "<html>什么都没有</html>"])
+def test_pick_int_returns_none_when_absent(host, html):
+    """读不到时要返回 None，让调用方走兜底，而不是当 0 用。"""
+    module = host.module
+
+    assert module._pick_int(html, module.STREAK_PATTERN) is None
+
+
+def test_compact_notice_matches_success_layout(host):
+    """style1 的成功通知必须是一行一个关键信息，且奖励 / 连续 / 余额都来自真实数据。"""
+    plugin = _enabled_plugin(host, notify=True)
+
+    plugin._record_success(
+        username="luobop",
+        total_signs=7,
+        money="96",
+        content="恭喜你签到成功!获得随机奖励 大洋 9 .",
+        streak=18,
+    )
+
+    message = plugin.messages[-1]
+    assert message["title"] == "【✅ 国语视界签到成功】"
+    lines = message["text"].split("\n")
+    assert lines[0] == "📢 执行结果"
+    assert lines[1] == "━━━━━━━━━━"
+    assert lines[2].startswith("🕐 时间：")
+    assert lines[3] == "✨ 状态：签到成功"
+    assert lines[4] == "🎁 奖励：9大洋"
+    assert lines[5] == "📆 连续签到：18天"
+    assert lines[6] == "📊 余额：96大洋"
+    assert len(lines) == 7
+
+
+def test_compact_notice_omits_unknown_reward(host):
+    """站点没给奖励金额时整行不出现，不能写成「奖励：None大洋」。"""
+    plugin = _enabled_plugin(host, notify=True)
+
+    plugin._record_success(
+        username="luobop", total_signs=7, money="未知", content="签到成功", streak=0
+    )
+
+    text = plugin.messages[-1]["text"]
+    assert "🎁" not in text
+    assert "📊" not in text
+    assert "None" not in text
+
+
+def test_compact_notice_failure_layout(host):
+    """失败通知要带原因，且不吃成成功模板。"""
+    plugin = _enabled_plugin(host, notify=True)
+
+    plugin._record_failure("获取签到页面失败，状态码：502")
+
+    message = plugin.messages[-1]
+    assert message["title"] == "【❌ 国语视界签到失败】"
+    assert "✨ 状态：签到失败" in message["text"]
+    assert "📝 原因：获取签到页面失败，状态码：502" in message["text"]
+
+
+def test_compact_notice_failure_distinguishes_cookie_expired(host):
+    """Cookie 失效要单独给标题和建议，而不是笼统的「签到失败」。"""
+    plugin = _enabled_plugin(host, notify=True)
+
+    plugin._record_failure("Cookie 已失效（签到页未显示用户名）")
+
+    message = plugin.messages[-1]
+    assert message["title"] == "【❌ 国语视界Cookie已失效】"
+    assert "🔑 请更新Cookie后重试" in message["text"]
+
+
+def test_compact_notice_already_signed_layout(host):
+    """已签到也要报出连续签到与余额，并说明今天不用再签。"""
+    plugin = _enabled_plugin(host, notify=True)
+    plugin.save_data(host.module.KEY_LAST_RESULT, {"money": "96", "success": True})
+
+    plugin._record_already_signed("luobop", streak=18)
+
+    message = plugin.messages[-1]
+    assert message["title"] == "【✅ 国语视界今日已签到】"
+    assert "📆 连续签到：18天" in message["text"]
+    assert "📊 余额：96大洋" in message["text"]
+    assert "💤 今日无需重复签到" in message["text"]
+
+
+def test_record_success_falls_back_to_history_streak(host):
+    """站点读不到连续签到时用历史推算，不能让通知固定显示 0 天。"""
+    module = host.module
+    plugin = _enabled_plugin(host, notify=True)
+    plugin.save_data(
+        module.KEY_HISTORY,
+        [{"date": plugin._now(), "username": "luobop", "success": True, "money": "96"}],
+    )
+
+    result = plugin._record_success(
+        username="luobop", total_signs=7, money="96", content="签到成功", streak=0
+    )
+
+    assert result["streak"] >= 1
+    assert "📆 连续签到：" in plugin.messages[-1]["text"]
+
+
+def test_record_success_stores_streak_and_reward_in_history(host):
+    """历史里要存下连续签到与本次奖励，供详情页与统计用。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+
+    plugin._record_success(
+        username="luobop",
+        total_signs=7,
+        money="96",
+        content="恭喜你签到成功!获得随机奖励 大洋 9 .",
+        streak=18,
+    )
+
+    record = plugin.get_data(module.KEY_HISTORY)[0]
+    assert record["streak"] == 18
+    assert record["reward"] == 9
+    assert record["totalContinuousCheckIn"] == 7
+
+
+def test_signin_uses_month_signs_without_p_tag(host):
+    """签到流程也要吃「本月已累计签到:<b>N</b>」不带 <p> 的写法。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    host.request.routes = {
+        module.SIGN_PAGE_URL: host.response_cls(
+            200,
+            '<input name="formhash" value="ff00" />'
+            '<a title="访问我的空间">tester</a>'
+            "您本月已累计签到:<b>7</b> 天",
+        ),
+        module.SIGN_SUBMIT_URL: host.response_cls(
+            200, '<div class="c">恭喜你签到成功!获得随机奖励 大洋 9 .</div>'
+        ),
+        module.CREDIT_URL: host.response_cls(200, '<span id="hcredit_2">96</span>'),
+        module.HITOKOTO_URL: host.response_cls(200, "今天也要加油鸭"),
+    }
+
+    result = plugin.signin()
+
+    assert result["total_signs"] == 8      # 提交前 7 + 本次
+    assert result["reward"] == 9
+    assert result["money"] == "96"
+
+
+def test_signin_reads_streak_from_page_after_submit(host, monkeypatch):
+    """连续签到必须从**签到后**的页面读——提交前那版是昨天（首签是 0）的值。"""
+    module = host.module
+    plugin = _enabled_plugin(host)
+    page_html = (
+        '<input name="formhash" value="ff00" />'
+        '<a title="访问我的空间">tester</a>'
+        "您本月已累计签到:<b>6</b>"
+    )
+    host.request.routes = {
+        # 提交前那一版页面：没有连续签到字样
+        module.SIGN_PAGE_URL: host.response_cls(200, page_html),
+        module.SIGN_SUBMIT_URL: host.response_cls(200, '<div class="c">签到成功</div>'),
+        module.CREDIT_URL: host.response_cls(200, '<span id="hcredit_2">96</span>'),
+        module.HITOKOTO_URL: host.response_cls(200, "今天也要加油鸭"),
+    }
+
+    # 提交后回读的签到页才有「连续签到 18 天」
+    original_fetch = plugin._fetch
+
+    def fake_fetch(url, **kwargs):
+        if url == module.SIGN_PAGE_URL:
+            return page_html + "您已经连续签到 <b>18</b> 天"
+        return original_fetch(url, **kwargs)
+
+    monkeypatch.setattr(plugin, "_fetch", fake_fetch)
+
+    result = plugin.signin()
+
+    assert result["success"] is True
+    assert result["streak"] == 18
