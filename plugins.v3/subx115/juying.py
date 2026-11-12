@@ -213,11 +213,12 @@ class JuyingSigner:
                 if luck.get("checked_today") or luck.get("daily_checked_today"):
                     return {"state": "success", "already": True,
                             "points": luck.get("user_points")}
-                body = self._api(session, "POST", "checkin/luck/draw/", {})
+                body = self._api(session, "POST", "checkin/luck/draw/",
+                                 {"accept_risk": True})
                 draw = body.get("draw") if isinstance(
                     body.get("draw"), dict) else {}
-                earned = draw.get("delta")
-                points = draw.get("balance_after")
+                earned = draw.get("delta") or draw.get("reward_points")
+                points = draw.get("balance_after") or draw.get("user_points")
                 streak = body.get("my_total_days")
             else:
                 body = self._api(session, "POST", "checkin/do/", {})
@@ -232,19 +233,42 @@ class JuyingSigner:
             self._close(session)
 
     def draw_bonus(self, mark_pending: Optional[Callable[[], None]] = None) -> dict:
-        """奖池抽奖（签到后自动抽奖）。"""
+        """奖池抽奖（签到后自动抽奖）。
+
+        前端实际调用：GET bonus-pool/ 拿 pool（含 id/can_draw/my_draw），
+        再 POST bonus-pool/draw/ 传 {pool_id: id}。
+        """
         session = self._authed_session()
         try:
-            pool = self._api(session, "GET", "checkin/bonus-pool/")
+            body = self._api(session, "GET", "checkin/bonus-pool/")
+            pool = body.get("pool") if isinstance(
+                body.get("pool"), dict) else body
+            # 已抽过 / 当前不可抽，直接返回
             if pool.get("my_draw"):
-                return {"state": "success", "already": True}
+                return {"state": "success", "already": True,
+                        "message": pool.get("status") == "exhausted"
+                        and "本期奖池已抽完" or "今日已参与"}
+            if not pool.get("can_draw", True):
+                status = pool.get("status") or ""
+                if status == "exhausted":
+                    return {"state": "success", "already": True,
+                            "message": "本期奖池已抽完"}
+                return {"state": "success", "already": True,
+                        "message": "当前奖池不可抽取"}
+            pool_id = pool.get("id")
+            if pool_id is None:
+                raise JuyingSignError("未找到有效奖池")
             if mark_pending is not None:
                 mark_pending()
-            body = self._api(session, "POST", "checkin/bonus-pool/draw/", {})
-            data = body.get("data") if isinstance(body.get("data"), dict) else {}
+            body = self._api(session, "POST", "checkin/bonus-pool/draw/",
+                             {"pool_id": pool_id})
+            # 前端拿到返回后取 e.pool 更新；奖励信息可能在 message 或 pool 里
+            new_pool = body.get("pool") if isinstance(
+                body.get("pool"), dict) else {}
             return {"state": "success",
-                    "reward": data.get("reward_points") or data.get("points"),
-                    "message": body.get("message")}
+                    "reward": (new_pool.get("last_reward")
+                               or new_pool.get("reward_points")),
+                    "message": body.get("message") or "抽奖成功"}
         finally:
             self._close(session)
 

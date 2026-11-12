@@ -474,6 +474,7 @@ class _JyFakeSession:
         self.responses = responses
         self.gets: list = []
         self.posts: list = []
+        self.post_bodies: list = []
         self.cookies = {}
 
     def get(self, url, **kwargs):
@@ -485,6 +486,7 @@ class _JyFakeSession:
 
     def post(self, url, **kwargs):
         self.posts.append(url)
+        self.post_bodies.append(kwargs.get("json"))
         return _FakeResp(self.responses.get("POST:" + url.split("/api/app/")[-1],
                                             {"status": "success"}))
 
@@ -573,6 +575,63 @@ def test_juying_check_login_expired():
     result = signer.check_login()
     assert result["ok"] is False
     assert "失效" in result["message"]
+
+
+def test_juying_draw_bonus_sends_pool_id():
+    """奖池抽奖必须带 pool_id（否则站点返回「请选择有效奖池」）。"""
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/bonus-pool/": {
+            "status": "success",
+            "pool": {"id": 42, "can_draw": True, "my_draw": False,
+                     "status": "open"},
+        },
+        "POST:checkin/bonus-pool/draw/": {
+            "status": "success", "message": "抽奖成功",
+            "pool": {"last_reward": 8},
+        },
+    })
+    signer._session = lambda: fake
+    result = signer.draw_bonus()
+    assert result["state"] == "success"
+    assert result.get("already") is not True  # 成功抽奖（非 already）
+    assert result["reward"] == 8
+    # 必须带 pool_id=42
+    assert fake.post_bodies and fake.post_bodies[0] == {"pool_id": 42}
+
+
+def test_juying_draw_bonus_already_drawn():
+    """奖池已抽完/已参与时，不发起 POST，返回 already。"""
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/bonus-pool/": {
+            "status": "success",
+            "pool": {"id": 42, "can_draw": False, "my_draw": True,
+                     "status": "exhausted"},
+        },
+    })
+    signer._session = lambda: fake
+    result = signer.draw_bonus()
+    assert result["state"] == "success"
+    assert result["already"] is True
+    assert fake.posts == []  # 已抽完不应发起 POST
+
+
+def test_juying_luck_draw_sends_accept_risk():
+    """幸运签到 draw 需带 accept_risk=True。"""
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/stats/": {"status": "success", "checked_today": False},
+        "GET:checkin/luck/": {"status": "success", "checked_today": False},
+        "POST:checkin/luck/draw/": {"status": "success",
+                                    "message": "幸运签到成功",
+                                    "draw": {"delta": 3, "balance_after": 100}},
+    })
+    signer._session = lambda: fake
+    result = signer.signin(mode="lucky")
+    assert result["state"] == "success"
+    assert any("luck/draw/" in u for u in fake.posts)
+    assert fake.post_bodies[-1] == {"accept_risk": True}
 
 
 def _main():
