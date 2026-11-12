@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.1"
+    plugin_version = "1.6.2"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -95,31 +95,37 @@ class Subx115(_PluginBase):
     CHANNEL_DEFS = [
         {"key": "juying", "name": "聚影配置", "short": "聚影", "en": "JYing",
          "color": "teal", "icon": "mdi-movie-open", "site": "https://jying.top",
-         "tip": "聚影资源站：填写站点地址与账号即可参与搜索，"
+         "tip": "聚影资源站：填写站点地址与账号即可参与搜索。\n"
                 "无 115 分享的消息自动忽略。"},
         {"key": "hdhive", "name": "栖影配置", "short": "栖影", "en": "HDHive",
          "color": "green", "icon": "mdi-earth", "site": "https://hdhaven.com",
-         "tip": "栖影（HDHaven）：填写站点地址与登录会话 Cookie（含 hdh_session）。"},
+         "tip": "栖影（HDHaven）：填写站点地址与登录会话 Cookie。\n"
+                "（需含 hdh_session）"},
         {"key": "jumi", "name": "剧迷配置", "short": "剧迷", "en": "Gimy",
          "color": "orange", "icon": "mdi-movie-filter", "site": "",
-         "tip": "剧迷渠道：填写站点地址与账号。"},
+         "tip": "剧迷渠道：填写站点地址与账号。\n"
+                "登录需验证码时建议使用浏览器 Cookie。"},
         {"key": "dianying", "name": "癫影配置", "short": "癫影", "en": "Dian115",
          "color": "purple", "icon": "mdi-filmstrip", "site": "https://m.dian115.com",
          "tip": "OpenAPI Key 优先用于癫影搜索、解锁和签到；没有 Key 时可填写"
-                "浏览器 Cookie 作为普通网页模式兜底，遇到站点防护会提示重新登录。"
+                "浏览器 Cookie 作为普通网页模式兜底，遇到站点防护会提示重新登录。\n"
                 "普通 Cookie 模式只提取网页已返回的 115、磁力、ed2k 明文链接。"},
         {"key": "guanying", "name": "观影配置", "short": "观影", "en": "GuanYing",
          "color": "blue", "icon": "mdi-cinema", "site": "",
-         "tip": "观影渠道：填写站点地址与账号。"},
+         "tip": "观影渠道：填写站点地址与账号。\n"
+                "后台会自动选择可用镜像并刷新登录态。"},
         {"key": "zhenying", "name": "帧影配置", "short": "帧影", "en": "FrameHDR",
          "color": "indigo", "icon": "mdi-image-multiple", "site": "https://framehdr.com",
-         "tip": "帧影渠道：填写站点地址与账号。"},
+         "tip": "帧影渠道：填写站点地址与账号。\n"
+                "搜索读取详情页的 115、磁力和 ed2k 链接。"},
         {"key": "woniu", "name": "蜗牛4K", "short": "蜗牛4K", "en": "WN4K",
          "color": "green", "icon": "mdi-turtle", "site": "",
-         "tip": "蜗牛4K：填写站点地址与账号（优先 4K 高画质资源）。"},
+         "tip": "蜗牛4K：填写站点地址与账号。\n"
+                "优先收录 4K 高画质资源。"},
         {"key": "quanyi", "name": "权益宝", "short": "权益宝", "en": "QuanYiBao",
          "color": "orange", "icon": "mdi-gift", "site": "",
-         "tip": "权益宝：填写站点地址与账号。"},
+         "tip": "权益宝：填写站点地址与账号。\n"
+                "先匹配 TMDb 再检索站内资源。"},
     ]
 
     # ---- 运行状态 ----
@@ -330,27 +336,76 @@ class Subx115(_PluginBase):
     # =====================================================================
 
     @classmethod
-    def _site_action_buttons(cls) -> dict:
-        """渠道页右上角操作区。
+    def _site_action_buttons(cls, has_sign: bool) -> dict:
+        """渠道页右上角「立即签到 / 测试登录」按钮。
 
-        MoviePilot 前端的插件后端 API 只能在「详情页」（get_page）通过
-        events 的 click -> api 相对路径调用；配置页（get_form）的 VBtn 只
-        支持 Vue 事件，无法直接调后端接口（href 打开的是不带登录态 token
-        的裸 JSON，会被 401 拦截）。因此这里提示用户到插件详情页操作，
-        详情页顶部提供「立即签到 / 测试登录态」可用按钮。
+        配置页（get_form）的 VBtn 无法像详情页那样通过 events 调后端 API，
+        但可通过 onclick（FormRender 会把 on 开头的字符串转成函数执行）调用
+        前端全局注入的 window.MoviePilotAPI（保留完整响应的 pluginApi，自动
+        带 Bearer token）。签到仅栖影（HDHaven）实现了实际逻辑，其余渠道点
+        「立即签到」同样走栖影签到接口。
         """
+        plugin = cls.__name__
+
+        def _btn(text: str, api: str, color: str, variant: str,
+                 extra_class: str = "") -> dict:
+            return {
+                "component": "VBtn",
+                "props": {
+                    "color": color, "variant": variant,
+                    "prepend-icon": "mdi-check", "size": "small",
+                    "class": extra_class,
+                    "onclick": (
+                        "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
+                        + "/" + api + "').then(function(r){ "
+                        "if(r && r.message){ alert(r.message); } "
+                        "}).catch(function(){ }); }"
+                    ),
+                },
+                "text": text,
+            }
+
+        buttons = []
+        if has_sign:
+            buttons.append(_btn("立即签到", "sign", "deep-purple", "tonal"))
+        buttons.append(_btn("测试登录", "test_login", "grey", "outlined",
+                            "ml-2" if has_sign else ""))
         return {
-            "component": "VAlert",
-            "props": {
-                "type": "info", "variant": "tonal", "density": "compact",
-                "text": "「立即签到 / 测试登录」请在插件详情页执行："
-                        "返回插件列表点击本插件卡片进入详情页即可。",
-            },
+            "component": "VRow",
+            "props": {"justify": "end", "align": "center"},
+            "content": buttons,
         }
 
     @classmethod
+    def _channel_header(cls, ch: dict) -> list[dict]:
+        """渠道页顶部：右上角操作按钮 + 提示（tip 按 \\n 分两行展示）。"""
+        key = ch["key"]
+        # 仅「观影」无签到功能，只显示「测试登录」
+        has_sign = key != "guanying"
+        tip = ch.get("tip", "")
+        lines = [ln.strip() for ln in tip.split("\n") if ln.strip()]
+        tip_content = [
+            {"component": "div",
+             "props": {"class": "mb-1" if i < len(lines) - 1 else ""},
+             "text": ln}
+            for i, ln in enumerate(lines)
+        ]
+        return [
+            cls._site_action_buttons(has_sign),
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact"},
+                "content": tip_content,
+            },
+        ]
+
+    @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
-        """按渠道分发到各自专属字段方法（版式对应 subx 原版各渠道页）。"""
+        """按渠道分发到各自专属字段方法（版式对应 subx 原版各渠道页）。
+
+        所有渠道页顶部统一加「操作按钮 + 提示」header（见 _channel_header）。
+        """
         key = ch["key"]
         builder = {
             "juying": cls._juying_fields,
@@ -361,8 +416,10 @@ class Subx115(_PluginBase):
             "quanyi": cls._quanyi_fields,
         }.get(key)
         if builder is not None:
-            return builder(ch)
-        return cls._default_channel_fields(ch)
+            body = builder(ch)
+        else:
+            body = cls._default_channel_fields(ch)
+        return cls._channel_header(ch) + body
 
     # ---- 表单构造 helper ---------------------------------------------------
 
@@ -408,18 +465,12 @@ class Subx115(_PluginBase):
             return cls._f_col(cols, md, node)
 
         fields = [
-            {
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "density": "compact",
-                          "text": ch["tip"]},
-            },
-            # 站点地址（右上角为「立即签到 / 测试登录」按钮）
+            # 站点地址（顶部 header 已含操作按钮与提示，此处只留站点地址）
             {
                 "component": "VRow",
                 "content": [
-                    _col(12, 8, _text(f"{key}_site", "站点地址",
+                    _col(12, 12, _text(f"{key}_site", "站点地址",
                                       placeholder="https://...")),
-                    _col(12, 4, cls._site_action_buttons()),
                 ],
             },
             cls._f_header("账号认证"),
