@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.6"
+    plugin_version = "1.6.7"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -362,30 +362,25 @@ class Subx115(_PluginBase):
         return {"component": "VBtn", "props": props, "text": text}
 
     @classmethod
-    def _site_action_buttons(cls, has_sign: bool) -> dict:
-        """渠道页右上角「立即签到 / 测试登录」按钮。"""
+    def _site_action_btn_list(cls, has_sign: bool) -> list[dict]:
+        """渠道页操作按钮列表（立即签到 + 测试登录）。"""
         buttons = []
         if has_sign:
             buttons.append(cls._action_btn("立即签到", "sign"))
         buttons.append(cls._action_btn("测试登录", "test_login", "grey",
                                        "outlined", "ml-2" if has_sign else ""))
-        return {
-            "component": "VRow",
-            "props": {"justify": "end", "align": "center",
-                      "class": "mb-3 pr-3"},
-            "content": buttons,
-        }
+        return buttons
 
     @classmethod
     def _channel_header(cls, ch: dict) -> list[dict]:
-        """渠道页顶部：右上角操作按钮 + 提示（tip 单行展示）。"""
+        """渠道页顶部：提示条在上，操作按钮在下（右对齐），按钮不贴顶不裁切。"""
         key = ch["key"]
         # 聚影页：右上角单个「测试聚影账号」按钮，无顶部提示条（subx 原版）
         if key == "juying":
             return [{
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
-                          "class": "mb-3 pr-3"},
+                          "class": "mb-3 mt-2 pr-3"},
                 "content": [cls._action_btn(
                     "测试聚影账号", "test_login", "green", "outlined",
                     icon="mdi-account-check")],
@@ -394,15 +389,20 @@ class Subx115(_PluginBase):
         has_sign = key != "guanying"
         # 提示单行展示：去掉换行符，让文字自然流动（不再强制两行）
         tip = ch.get("tip", "").replace("\n", " ")
+        # 提示条在上、按钮行在下（右对齐 + 顶部间距），按钮不会被面板顶边裁切
         return [
-            cls._site_action_buttons(has_sign),
             {
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
-                    "text": tip,
-                    "class": "mb-2",
+                    "text": tip, "class": "mb-2",
                 },
+            },
+            {
+                "component": "VRow",
+                "props": {"justify": "end", "align": "center",
+                          "class": "mb-3"},
+                "content": cls._site_action_btn_list(has_sign),
             },
         ]
 
