@@ -85,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.4"
+    plugin_version = "1.7.5"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -402,6 +402,9 @@ class Subx115(_PluginBase):
         但可通过 onclick（FormRender 会把 on 开头的字符串转成函数执行）调用
         前端全局注入的 window.MoviePilotAPI（保留完整响应的 pluginApi，自动
         带 Bearer token）。
+
+        点击后结果以内联提示条显示在按钮下方（绿色=成功、红色=失败），
+        而非浏览器 alert 弹窗。
         """
         plugin = cls.__name__
         props = {
@@ -410,7 +413,26 @@ class Subx115(_PluginBase):
             "onclick": (
                 "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
                 + "/" + api + "').then(function(r){ "
-                "if(r && r.message){ alert(r.message); } "
+                "var ok = r && (r.success === true || r.ok === true);"
+                "var msg = (r && r.message) || (ok ? '操作成功' : '操作失败');"
+                "var old = document.querySelector('.subx-inline-status');"
+                "if (old) { old.parentNode.removeChild(old); }"
+                "var d = document.createElement('div');"
+                "d.className = 'subx-inline-status';"
+                "d.style.cssText = 'border-radius:6px;padding:8px 14px;"
+                "margin:0 12px 8px 0;font-size:13px;line-height:1.5;"
+                "word-break:break-all;' + (ok ? "
+                "'background:#e8f5e9;color:#1b5e20;border:1px solid #a5d6a7;' : "
+                "'background:#fdecea;color:#b71c1c;border:1px solid #f5c6cb;');"
+                "d.textContent = msg;"
+                "var row = e.target;"
+                "while (row && row.parentNode && "
+                "row.className && row.className.indexOf && "
+                "row.className.indexOf('v-row') === -1 && "
+                "row.parentNode !== document.body) { row = row.parentNode; }"
+                "if (row && row.parentNode) { "
+                "row.parentNode.insertBefore(d, row.nextSibling); }"
+                "else { document.body.appendChild(d); }"
                 "}).catch(function(){ }); }"
             ),
         }
@@ -455,24 +477,24 @@ class Subx115(_PluginBase):
             }]
         # 仅「观影」无签到功能，只显示「测试登录」
         has_sign = key != "guanying"
-        # 提示单行展示：去掉换行符，让文字自然流动（不再强制两行）
-        tip = ch.get("tip", "").replace("\n", " ")
-        # 按钮行在上（右对齐），用 pt-6 内边距把按钮从面板顶边推下来，避免贴顶被裁切；提示条在下
-        return [
-            {
-                "component": "VRow",
-                "props": {"justify": "end", "align": "center",
-                          "class": "pt-6 mb-3 pr-3"},
-                "content": cls._site_action_btn_list(key, has_sign),
-            },
-            {
+        # 按钮行在上（右对齐），用 pt-6 内边距把按钮从面板顶边推下来，避免贴顶被裁切
+        header = [{
+            "component": "VRow",
+            "props": {"justify": "end", "align": "center",
+                      "class": "pt-6 mb-3 pr-3"},
+            "content": cls._site_action_btn_list(key, has_sign),
+        }]
+        # 帧影不显示顶部 info 提示条（用户要求移除）；其余渠道显示单行提示
+        if key != "zhenying":
+            tip = ch.get("tip", "").replace("\n", " ")
+            header.append({
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
                     "text": tip, "class": "mb-4",
                 },
-            },
-        ]
+            })
+        return header
 
     @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
@@ -501,13 +523,13 @@ class Subx115(_PluginBase):
     def _f_text(model: str, label: str, **props) -> dict:
         return {"component": "VTextField",
                 "props": {"model": model, "label": label,
-                          "class": "mb-4", **props}}
+                          "class": "mb-2", **props}}
 
     @staticmethod
     def _f_area(model: str, label: str, rows: int = 3, **props) -> dict:
         return {"component": "VTextarea",
                 "props": {"model": model, "label": label, "rows": rows,
-                          "class": "mb-4", **props}}
+                          "class": "mb-2", **props}}
 
     @staticmethod
     def _f_col(cols: int, md: int, node: dict) -> dict:
@@ -517,7 +539,7 @@ class Subx115(_PluginBase):
     @staticmethod
     def _f_header(text: str) -> dict:
         # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
-        return {"component": "VCardTitle", "props": {"class": "px-0 py-3 mt-2"},
+        return {"component": "VCardTitle", "props": {"class": "px-0 py-1 mt-1"},
                 "text": text}
 
     @staticmethod
@@ -766,13 +788,6 @@ class Subx115(_PluginBase):
         """帧影：站点地址 / 邮箱密码 / Cookie / 显示标签 + 签到。"""
         c = ch["color"]
         return [
-            {
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal",
-                          "density": "compact", "class": "mb-3",
-                          "text": "帧影搜索会读取详情页中的 115、磁力和 ed2k 链接，"
-                                  "并过滤其他网盘；积分资源不会自动购买。"},
-            },
             cls._f_header("账号认证"),
             cls._f_text("zhenying_site", "站点地址",
                         placeholder="https://framehdr.com/"),
@@ -805,7 +820,7 @@ class Subx115(_PluginBase):
             },
             # ---- 帧影签到设置 ----
             {
-                "component": "VDivider", "props": {"class": "my-3"},
+                "component": "VDivider", "props": {"class": "my-2"},
             },
             cls._f_header("帧影签到设置"),
             cls._f_text("zhenying_sign_cookie", "帧影登录会话 Cookie",
