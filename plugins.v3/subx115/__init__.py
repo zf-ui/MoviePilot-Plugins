@@ -67,7 +67,7 @@ except Exception:  # pragma: no cover
     _NT_PLUGIN = None
 
 from .channels import (ADAPTER_CLASSES, ShareInfo, match_keywords,
-                       match_subscribes, split_lines)
+                       match_subscribes, regex_match_any, split_lines)
 from .hdhaven import HDHavenSigner, HDHavenSignError, curl_cffi_available
 from .p115 import P115Client, P115Error
 
@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -129,6 +129,8 @@ class Subx115(_PluginBase):
     _p115_cookie = ""
     _p115_cid = "0"
     _keywords: list[str] = []          # 资源搜索页配置的关键词
+    _search_include: list[str] = []    # 资源搜索页：包含关键词（正则）
+    _search_exclude: list[str] = []    # 资源搜索页：排除关键词（正则）
 
     # ---- 栖影（HDHaven）签到状态 ----
     _sign_enabled = False
@@ -159,6 +161,8 @@ class Subx115(_PluginBase):
         self._p115_cookie = str(config.get("p115_cookie") or "").strip()
         self._p115_cid = str(config.get("p115_cid") or "0").strip() or "0"
         self._keywords = split_lines(config.get("search_keywords"))
+        self._search_include = split_lines(config.get("search_include"))
+        self._search_exclude = split_lines(config.get("search_exclude"))
 
         # 栖影（HDHaven）签到配置
         self._sign_enabled = bool(config.get("hdhive_sign_enabled"))
@@ -368,7 +372,8 @@ class Subx115(_PluginBase):
                 ],
             },
             *_area_cookie(key, short),
-            # 搜索与设置
+            # 搜索与设置（转存目录统一在「115设置」页；包含/排除关键词
+            # 统一在「资源搜索」页，渠道页不再重复）
             _header("搜索与设置"),
             {
                 "component": "VRow",
@@ -377,23 +382,8 @@ class Subx115(_PluginBase):
                                  "props": {"model": f"{key}_enabled",
                                            "label": f"启用{short}搜索",
                                            "color": "deep-purple"}}),
-                    _col(12, 6, _text(f"{key}_target", "转存目录（cid 或目录名，留空用全局）")),
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    _col(12, 6, _text(f"{key}_limit", "单次处理条数", placeholder="20")),
-                ],
-            },
-            _area(f"{key}_channels", "订阅来源（一行一个，可选；与接口地址并用）"),
-            {
-                "component": "VRow",
-                "content": [
-                    _col(12, 6, _area(f"{key}_include",
-                                      "包含关键词（正则，一行一个，可选）", rows=2)),
-                    _col(12, 6, _area(f"{key}_exclude",
-                                      "排除关键词（正则，一行一个，可选）", rows=2)),
+                    _col(12, 6, _text(f"{key}_limit", "单次处理条数",
+                                      placeholder="20")),
                 ],
             },
         ]
@@ -579,6 +569,8 @@ class Subx115(_PluginBase):
             "p115_cookie": "",
             "p115_cid": "0",
             "search_keywords": "",
+            "search_include": "",
+            "search_exclude": "",
             # 栖影（HDHaven）签到
             "hdhive_sign_enabled": False,
             "hdhive_sign_onlyonce": False,
@@ -612,11 +604,6 @@ class Subx115(_PluginBase):
                               "color": ch["color"], "density": "compact"},
                 }],
             })
-        tabs.append({
-            "component": "VTab",
-            "props": {"value": "search", "prepend-icon": "mdi-magnify",
-                      "text": "资源搜索"},
-        })
         windows.append({
             "component": "VWindowItem",
             "props": {"value": "search"},
@@ -635,6 +622,29 @@ class Subx115(_PluginBase):
                     "props": {"model": "search_keywords", "rows": 4,
                               "label": "搜索关键词（一行一个，留空则仅按订阅匹配）",
                               "placeholder": "流浪地球 3\n三体 第二季"},
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 6},
+                            "content": [{
+                                "component": "VTextarea",
+                                "props": {"model": "search_include", "rows": 3,
+                                          "label": "包含关键词（正则，一行一个，可选）",
+                                          "placeholder": "4K\nHDR"},
+                            }],
+                        },
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 6},
+                            "content": [{
+                                "component": "VTextarea",
+                                "props": {"model": "search_exclude", "rows": 3,
+                                          "label": "排除关键词（正则，一行一个，可选）",
+                                          "placeholder": "预告\n花絮"},
+                            }],
+                        },
+                    ],
                 },
                 {
                     "component": "VRow",
@@ -697,7 +707,7 @@ class Subx115(_PluginBase):
                         {
                             "component": "VCol", "props": {"cols": 12, "md": 3},
                             "content": [{"component": "VTextField", "props": {
-                                "model": "p115_cid", "label": "默认转存目录 cid",
+                                "model": "p115_cid", "label": "转存目录 cid",
                                 "placeholder": "0（根目录）"}}],
                         },
                         {
@@ -733,10 +743,6 @@ class Subx115(_PluginBase):
                 f"{ch['key']}_username": "",
                 f"{ch['key']}_password": "",
                 f"{ch['key']}_cookie": "",
-                f"{ch['key']}_channels": "",
-                f"{ch['key']}_target": "",
-                f"{ch['key']}_include": "",
-                f"{ch['key']}_exclude": "",
                 f"{ch['key']}_limit": "20",
             })
 
@@ -914,6 +920,18 @@ class Subx115(_PluginBase):
             return
 
         # 3) 匹配目标（MoviePilot 订阅：片名 + 季；资源搜索页关键词并用）
+        # 资源搜索页的全局包含/排除关键词（正则）先行过滤
+        if self._search_include or self._search_exclude:
+            before = len(shares)
+            shares = [
+                s for s in shares
+                if (not self._search_include
+                    or regex_match_any(s.title, self._search_include))
+                and not regex_match_any(s.title, self._search_exclude)
+            ]
+            dropped = before - len(shares)
+            if dropped:
+                logger.info(f"SubX115：全局包含/排除关键词过滤掉 {dropped} 条资源")
         subscribes = self._get_subscribes()
         if not subscribes and not self._keywords:
             logger.warning("SubX115：未能读取 MoviePilot 订阅列表，且资源搜索"

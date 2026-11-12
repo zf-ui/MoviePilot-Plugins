@@ -492,3 +492,15 @@ def match_subscribes(share: ShareInfo, subscribes: list) -> list:
 def match_keywords(share: ShareInfo, keywords: list) -> list:
     """按自定义关键词（包含匹配）过滤，返回命中的关键词。"""
     return [k for k in (keywords or []) if k.lower() in share.title.lower()]
+
+
+def regex_match_any(text: str, patterns: list) -> bool:
+    """标题是否命中任一正则（非法正则自动忽略）；patterns 为空返回 False。"""
+    text = text or ""
+    for pattern in patterns or []:
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False

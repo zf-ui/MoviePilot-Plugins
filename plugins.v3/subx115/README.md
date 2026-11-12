@@ -33,7 +33,7 @@ plugins.v3/
 3. 重启 MoviePilot，在「插件市场 → 已安装」中找到 **网盘聚合签到** 并安装/启用；
 4. 按下方顺序完成首次配置。
 
-> 三处版本必须一致：`__init__.py` 的 `plugin_version`、索引 `version`、`history` 顶部记录（当前均为 `1.4.0`）。
+> 三处版本必须一致：`__init__.py` 的 `plugin_version`、索引 `version`、`history` 顶部记录（当前均为 `1.4.1`）。
 
 ## 快速上手（3 步）
 
