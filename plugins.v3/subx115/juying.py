@@ -68,13 +68,15 @@ class JuyingSigner:
                 client.proxies = {"http://": self.proxy,
                                   "https://": self.proxy}
             client.headers.update(self._headers())
-            client.get(self.BASE + "/")  # 预取 csrftoken
+            # 对齐前端：csrf 从 /api/csrf/ 接口获取（而非首页 /）
+            client.get(self.BASE + "/api/csrf/")
             return client
         session = requests.Session()
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.update(self._headers())
-        session.get(self.BASE + "/")  # 预取 csrftoken
+        # 对齐前端：csrf 从 /api/csrf/ 接口获取（而非首页 /）
+        session.get(self.BASE + "/api/csrf/")
         return session
 
     def _headers(self) -> dict:
