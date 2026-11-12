@@ -86,7 +86,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.4"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -481,7 +481,7 @@ class Subx115(_PluginBase):
                 "var d = document.createElement('div');"
                 "d.className = 'subx-inline-status';"
                 "d.style.cssText = 'border-radius:6px;padding:8px 14px;"
-                "margin:0 12px 8px 0;font-size:13px;line-height:1.5;"
+                "margin:12px 12px 8px 0;font-size:13px;line-height:1.5;"
                 "word-break:break-all;' + (ok ? "
                 "'background:#e8f5e9;color:#1b5e20;border:1px solid #a5d6a7;' : "
                 "'background:#fdecea;color:#b71c1c;border:1px solid #f5c6cb;');"
@@ -747,7 +747,7 @@ class Subx115(_PluginBase):
             # 预留一行空白：供「签到与抽奖记录」等内联提示条显示，避免紧贴保存按钮
             {
                 "component": "VRow",
-                "props": {"class": "my-1", "style": {"min-height": "36px"}},
+                "props": {"class": "my-2", "style": {"min-height": "48px"}},
                 "content": [],
             },
             {
