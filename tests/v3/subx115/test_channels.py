@@ -31,10 +31,19 @@ zhenying = importlib.util.module_from_spec(_spec3)
 sys.modules["subx115_zhenying"] = zhenying
 _spec3.loader.exec_module(zhenying)
 
+# juying.py（聚影签到）同样不依赖宿主，按文件路径独立加载
+_JUYING = Path(__file__).resolve().parents[3] / "plugins.v3" / "subx115" / "juying.py"
+_spec4 = importlib.util.spec_from_file_location("subx115_juying", _JUYING)
+juying = importlib.util.module_from_spec(_spec4)
+sys.modules["subx115_juying"] = juying
+_spec4.loader.exec_module(juying)
+
 HDHavenSigner = hdhaven.HDHavenSigner
 HDHavenSignError = hdhaven.HDHavenSignError
 ZhenyingSigner = zhenying.ZhenyingSigner
 ZhenyingSignError = zhenying.ZhenyingSignError
+JuyingSigner = juying.JuyingSigner
+JuyingSignError = juying.JuyingSignError
 
 parse_share = channels.parse_share
 parse_season_episode = channels.parse_season_episode
@@ -453,6 +462,117 @@ def test_zhenying_extract_session_cookie_requires_wangpan():
     session = _FakeSession({}, cookies=[_FakeCookie("_security_token", "abc")])
     # 只有 _security_token 没有 wangpan_session → 返回空串
     assert signer._extract_session_cookie(session) == ""
+
+
+# ---------------------------------------------------------------------------
+# 聚影（JYing）签到：账号密码登录换 token（login / signin / check_login）
+# ---------------------------------------------------------------------------
+
+class _JyFakeSession:
+    """模拟聚影 HTTP 会话：按路径返回预设响应。"""
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.gets: list = []
+        self.posts: list = []
+        self.cookies = {}
+
+    def get(self, url, **kwargs):
+        self.gets.append(url)
+        if url.endswith("/") and "/api/app/" not in url:
+            return _FakeResp({"status": "success"})  # 首页预取 csrftoken
+        return _FakeResp(self.responses.get("GET:" + url.split("/api/app/")[-1],
+                                            {"status": "success"}))
+
+    def post(self, url, **kwargs):
+        self.posts.append(url)
+        return _FakeResp(self.responses.get("POST:" + url.split("/api/app/")[-1],
+                                            {"status": "success"}))
+
+    def close(self):
+        pass
+
+
+def test_juying_login_returns_token():
+    signer = JuyingSigner(username="u@x.com", password="secret")
+    fake = _JyFakeSession({
+        "POST:login/": {"status": "success", "token": "tok123"},
+    })
+    signer._session = lambda: fake
+    assert signer.login() == "tok123"
+    assert signer.token == "tok123"
+
+
+def test_juying_login_requires_credentials():
+    signer = JuyingSigner()  # 无账号密码
+    try:
+        signer.login()
+        assert False, "未配账号密码应抛异常"
+    except JuyingSignError as exc:
+        assert "账号密码" in str(exc)
+
+
+def test_juying_signin_already_checked():
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/stats/": {"status": "success", "checked_today": True,
+                               "reward_points": 5, "my_total_days": 29},
+    })
+    signer._session = lambda: fake
+    result = signer.signin()
+    assert result["state"] == "success"
+    assert result["already"] is True
+    assert fake.posts == []  # 已签到不应发起 POST
+
+
+def test_juying_signin_submits_normal():
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/stats/": {"status": "success", "checked_today": False},
+        "POST:checkin/do/": {"status": "success", "message": "签到成功",
+                             "reward_points": 5},
+    })
+    signer._session = lambda: fake
+    result = signer.signin(mode="normal")
+    assert result["state"] == "success"
+    assert any("checkin/do/" in u for u in fake.posts)
+
+
+def test_juying_check_login():
+    signer = JuyingSigner(username="u", password="p", token="tok")
+    fake = _JyFakeSession({
+        "GET:checkin/stats/": {"status": "success", "checked_today": True,
+                               "reward_points": 540, "my_total_days": 29,
+                               "checkin_mode": "luck", "reward_exp": 5},
+    })
+    signer._session = lambda: fake
+    result = signer.check_login()
+    assert result["ok"] is True
+    assert result["user"]["points"] == 540
+    assert result["user"]["checked_today"] is True
+
+
+def test_juying_check_login_expired():
+    # 401 登录失效 → check_login 返回 ok=False
+    signer = JuyingSigner(username="u", password="p", token="bad")
+    fake = _JyFakeSession({
+        "GET:checkin/stats/": {"status": "error",
+                               "message": "登录已失效，请重新登录"},
+    })
+    fake.responses["_status"] = 401
+
+    # 让 _api 识别 401：覆盖 resp 状态码
+    class _ExpiredSession(_JyFakeSession):
+        def get(self, url, **kwargs):
+            if "/api/app/" in url:
+                return _FakeResp({"status": "error",
+                                  "message": "登录已失效，请重新登录"},
+                                 status_code=401)
+            return _FakeResp({"status": "success"})
+
+    signer._session = lambda: _ExpiredSession({})
+    result = signer.check_login()
+    assert result["ok"] is False
+    assert "失效" in result["message"]
 
 
 def _main():

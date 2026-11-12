@@ -70,6 +70,7 @@ from .channels import (ADAPTER_CLASSES, ShareInfo, match_keywords,
                        match_subscribes, regex_match_any, split_lines)
 from .hdhaven import HDHavenSigner, HDHavenSignError, curl_cffi_available
 from .zhenying import ZhenyingSigner, ZhenyingSignError
+from .juying import JuyingSigner, JuyingSignError
 from .p115 import P115Client, P115Error
 
 # 历史记录上限（超过后截断旧记录）
@@ -85,7 +86,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.9"
+    plugin_version = "1.8.0"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -160,6 +161,17 @@ class Subx115(_PluginBase):
     _zy_sign_lock: threading.Lock = threading.Lock()   # 防并发签到
     _zy_sign_timer: threading.Timer | None = None      # 兜底一次性签到定时器
 
+    # ---- 聚影（JYing）签到状态 ----
+    _jy_sign_enabled = False
+    _jy_username = ""
+    _jy_password = ""
+    _jy_token = ""
+    _jy_sign_cron = "12 8 * * *"
+    _jy_sign_mode = "normal"     # normal | lucky
+    _jy_sign_draw = False
+    _jy_sign_notify = True
+    _jy_sign_lock: threading.Lock = threading.Lock()   # 防并发签到
+
     # 固定运行参数（不再暴露配置页，需要调整时改这里后重载插件）
     _max_transfer = 10      # 单轮最大转存数（防风控）
     _p115_timeout = 15      # 115 请求超时（秒）
@@ -206,6 +218,18 @@ class Subx115(_PluginBase):
         # 账号密码兜底登录（Cookie 失效时自动重新登录）
         self._zy_username = str(config.get("zhenying_username") or "").strip()
         self._zy_password = str(config.get("zhenying_password") or "").strip()
+
+        # 聚影（JYing）签到配置（账号密码自动登录换 token）
+        self._jy_sign_enabled = bool(config.get("juying_sign_enabled"))
+        self._jy_username = str(config.get("juying_username") or "").strip()
+        self._jy_password = str(config.get("juying_password") or "").strip()
+        self._jy_token = str(config.get("juying_token") or "").strip()
+        self._jy_sign_cron = str(
+            config.get("juying_sign_cron") or "12 8 * * *").strip()
+        self._jy_sign_mode = str(
+            config.get("juying_sign_mode") or "normal").strip()
+        self._jy_sign_draw = bool(config.get("juying_sign_draw"))
+        self._jy_sign_notify = bool(config.get("juying_sign_notify", True))
 
         # 勾选「保存后立即签到一次」：先清除一次性开关再执行，避免宿主
         # 重启后再次触发
@@ -287,6 +311,14 @@ class Subx115(_PluginBase):
                 "name": "SubX115 帧影（FrameHDR）自动签到",
                 "trigger": self._cron_trigger(self._zy_sign_cron, "18 9 * * *"),
                 "func": self._zhenying_sign,
+                "kwargs": {},
+            })
+        if self._jy_sign_enabled and (self._jy_username or self._jy_token):
+            services.append({
+                "id": "Subx115.JuyingSign",
+                "name": "SubX115 聚影（JYing）自动签到",
+                "trigger": self._cron_trigger(self._jy_sign_cron, "12 8 * * *"),
+                "func": self._juying_sign,
                 "kwargs": {},
             })
         return services
@@ -373,6 +405,34 @@ class Subx115(_PluginBase):
                 "summary": "测试帧影（FrameHDR）登录态",
             },
             {
+                "path": "/juying_sign",
+                "endpoint": self.api_juying_sign,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "立即执行聚影（JYing）签到",
+            },
+            {
+                "path": "/juying_test_login",
+                "endpoint": self.api_juying_test_login,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "测试聚影（JYing）登录态",
+            },
+            {
+                "path": "/juying_draw",
+                "endpoint": self.api_juying_draw,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "聚影（JYing）奖池抽奖",
+            },
+            {
+                "path": "/juying_history",
+                "endpoint": self.api_juying_history,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "聚影（JYing）签到与抽奖记录",
+            },
+            {
                 "path": "/history",
                 "endpoint": self.api_history,
                 "methods": ["GET"],
@@ -413,7 +473,8 @@ class Subx115(_PluginBase):
             "onclick": (
                 "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
                 + "/" + api + "').then(function(r){ "
-                "var ok = r && (r.success === true || r.ok === true);"
+                "var ok = r && (r.code === 0 || r.success === true "
+                "|| r.ok === true);"
                 "var msg = (r && r.message) || (ok ? '操作成功' : '操作失败');"
                 "var old = document.querySelector('.subx-inline-status');"
                 "if (old) { old.parentNode.removeChild(old); }"
@@ -472,7 +533,7 @@ class Subx115(_PluginBase):
                 "props": {"justify": "end", "align": "center",
                           "class": "pt-6 mb-4 pr-3"},
                 "content": [cls._action_btn(
-                    "测试聚影账号", "test_login", "green", "outlined",
+                    "测试聚影账号", "juying_test_login", "green", "outlined",
                     icon="mdi-account-check")],
             }]
         # 仅「观影」无签到功能，只显示「测试登录」
@@ -675,19 +736,13 @@ class Subx115(_PluginBase):
                 "component": "VRow",
                 "props": {"class": "mt-2"},
                 "content": [
-                    cls._action_btn("立即签到", "sign", "deep-purple",
+                    cls._action_btn("立即签到", "juying_sign", "deep-purple",
                                     "outlined", "mr-2", "mdi-check"),
-                    cls._action_btn("奖池抽奖", "sign", "deep-purple",
+                    cls._action_btn("奖池抽奖", "juying_draw", "deep-purple",
                                     "outlined", "mr-2", "mdi-gift"),
-                    cls._action_btn("签到与抽奖记录", "history", "grey",
+                    cls._action_btn("签到与抽奖记录", "juying_history", "grey",
                                     "text", "", "mdi-history"),
                 ],
-            },
-            {
-                "component": "VAlert",
-                "props": {"type": "error", "variant": "tonal",
-                          "density": "compact", "class": "mt-2",
-                          "text": "抽奖：聚影账号密码未配置"},
             },
             {
                 "component": "VBtn",
@@ -1295,6 +1350,8 @@ class Subx115(_PluginBase):
             "juying_sign_draw": False,
             "juying_sign_mode": "normal",
             "juying_sign_cron": "12 8 * * *",
+            "juying_sign_notify": True,
+            "juying_token": "",
             # 剧迷
             "jumi_site": "https://www.gimy115.top/",
             "jumi_show_tag": False,
@@ -1503,6 +1560,29 @@ class Subx115(_PluginBase):
                 "message": result.get("message", ""),
                 "data": result.get("user")}
 
+    def api_juying_sign(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/juying_sign（聚影「立即签到」按钮）。"""
+        result = self._juying_sign(manual=True)
+        return {"code": 0 if result.get("success") else 1,
+                "message": result.get("message", "")}
+
+    def api_juying_draw(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/juying_draw（聚影「奖池抽奖」按钮）。"""
+        result = self._juying_draw()
+        return {"code": 0 if result.get("success") else 1,
+                "message": result.get("message", "")}
+
+    def api_juying_test_login(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/juying_test_login（聚影「测试账号」按钮）。"""
+        result = self._juying_test_login()
+        return {"code": 0 if result.get("ok") else 1,
+                "message": result.get("message", ""),
+                "data": result.get("user")}
+
+    def api_juying_history(self) -> dict:
+        """GET /api/v1/plugin/Subx115/juying_history（聚影签到/抽奖记录）。"""
+        return {"code": 0, "message": self._juying_history_text()}
+
     def api_status(self) -> dict:
         """GET /api/v1/plugin/Subx115/status。"""
         return {"code": 0, "data": {
@@ -1518,6 +1598,11 @@ class Subx115(_PluginBase):
                 "enabled": self._zy_sign_enabled,
                 "cron": self._zy_sign_cron,
                 "last": self.get_data("zy_sign_last") or {},
+            },
+            "juying_sign": {
+                "enabled": self._jy_sign_enabled,
+                "cron": self._jy_sign_cron,
+                "last": self.get_data("jy_sign_last") or {},
             },
             "stats": self._status_text(),
         }}
@@ -1909,6 +1994,170 @@ class Subx115(_PluginBase):
                 parts.append("今日已签到")
             result["message"] = "；".join(parts)
         return result
+
+    # =====================================================================
+    # 聚影（JYing）签到：账号密码自动登录换 token
+    # =====================================================================
+
+    def _jy_resolve_signer(self) -> JuyingSigner:
+        """构造聚影 signer；token 失效时自动用账号密码重新登录换 token。"""
+        proxy = self._proxy_from_settings()
+        signer = JuyingSigner(self._jy_username, self._jy_password,
+                              token=self._jy_token, proxy=proxy, timeout=20)
+        return signer
+
+    def _juying_sign(self, manual: bool = False) -> dict:
+        """聚影签到主流程（线程锁防并发；登录 -> 预检 -> 签到 -> 保存 -> 通知）。"""
+        if not manual and not self._jy_sign_enabled:
+            return {"success": False, "message": "聚影签到未启用"}
+        if not self._jy_sign_lock.acquire(blocking=False):
+            return {"success": False, "message": "签到正在运行"}
+        try:
+            if not self._jy_username or not self._jy_password:
+                raise JuyingSignError("未配置聚影账号密码")
+            today = datetime.now().date().isoformat()
+            signer = self._jy_resolve_signer()
+
+            def _mark_pending() -> None:
+                self.save_data("jy_sign_last",
+                               {"date": today, "state": "pending"})
+                marker = self.get_data("jy_sign_last") or {}
+                if (marker.get("date") != today
+                        or marker.get("state") != "pending"):
+                    raise JuyingSignError("待核对标记保存失败，未发送签到请求")
+
+            result = signer.signin(mode=self._jy_sign_mode,
+                                   mark_pending=_mark_pending)
+            # 签到成功后缓存 token
+            if signer.token and signer.token != self._jy_token:
+                self._jy_token = signer.token
+                self._save_jy_token(signer.token)
+
+            if result.get("already"):
+                self.save_data("jy_sign_last",
+                               {"date": today, "state": "success",
+                                "already": True})
+                self._jy_notice("【SubX115】聚影签到",
+                                "站点确认今日已签到，不重复提交")
+                return {"success": True, "message": "站点确认今日已签到"}
+            self.save_data("jy_sign_last", {"date": today, **result})
+            saved = self.get_data("jy_sign_last") or {}
+            if (saved.get("date") != today
+                    or saved.get("state") != "success"):
+                raise JuyingSignError("签到已返回成功，但记录保存失败，请人工核对")
+
+            detail = []
+            if result.get("earned") is not None:
+                detail.append(f"获得积分：{result['earned']}")
+            if result.get("points") is not None:
+                detail.append(f"当前积分：{result['points']}")
+            if result.get("streak") is not None:
+                detail.append(f"累计签到：{result['streak']} 天")
+            msg = "；".join(detail) if detail else (result.get("message")
+                                                    or "签到成功")
+            self._jy_notice("【SubX115】聚影签到成功", msg)
+
+            # 签到后自动抽奖
+            if self._jy_sign_draw:
+                try:
+                    draw = signer.draw_bonus()
+                    if not draw.get("already"):
+                        self._jy_notice("【SubX115】聚影抽奖",
+                                        draw.get("message")
+                                        or f"获得 {draw.get('reward')} 积分")
+                except JuyingSignError as exc:
+                    logger.warning(f"SubX115：聚影抽奖未完成：{exc}")
+
+            return {"success": True,
+                    "message": "签到成功" + ("：" + msg if msg else "")}
+        except JuyingSignError as exc:
+            logger.warning(f"SubX115：聚影签到未完成：{exc}")
+            self._jy_notice("【SubX115】聚影签到待核对", str(exc))
+            return {"success": False, "message": str(exc)}
+        except Exception as exc:
+            logger.warning(f"SubX115：聚影签到异常：{type(exc).__name__}")
+            message = "请求或存储异常，结果可能已提交；请人工核对，勿重试"
+            self._jy_notice("【SubX115】聚影签到待核对", message)
+            return {"success": False, "message": message}
+        finally:
+            self._jy_sign_lock.release()
+
+    def _juying_draw(self) -> dict:
+        """聚影奖池抽奖（手动「奖池抽奖」按钮）。"""
+        if not self._jy_username or not self._jy_password:
+            return {"success": False, "message": "未配置聚影账号密码"}
+        try:
+            signer = self._jy_resolve_signer()
+            result = signer.draw_bonus()
+            if result.get("already"):
+                return {"success": True, "message": "本期奖池已参与"}
+            return {"success": True,
+                    "message": result.get("message")
+                               or f"获得 {result.get('reward')} 积分"}
+        except JuyingSignError as exc:
+            return {"success": False, "message": str(exc)}
+        except Exception:
+            return {"success": False, "message": "抽奖请求异常，请稍后重试"}
+
+    def _juying_test_login(self) -> dict:
+        """测试聚影账号登录态（自动登录换 token 后预检）。"""
+        if not self._jy_username or not self._jy_password:
+            return {"ok": False, "message": "未配置聚影账号密码"}
+        try:
+            signer = self._jy_resolve_signer()
+            result = signer.check_login()
+        except JuyingSignError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception:
+            return {"ok": False, "message": "请求异常，请检查网络与代理配置"}
+        if result.get("ok"):
+            user = result.get("user") or {}
+            parts = ["聚影账号登录成功"]
+            if user.get("points") is not None:
+                parts.append(f"积分 {user['points']}")
+            if user.get("total_days") is not None:
+                parts.append(f"累计签到 {user['total_days']} 天")
+            if user.get("checkin_mode"):
+                parts.append("幸运签到" if user["checkin_mode"] == "luck"
+                             else "普通签到")
+            if user.get("checked_today"):
+                parts.append("今日已签到")
+            result["message"] = "；".join(parts)
+        return result
+
+    def _juying_history_text(self) -> str:
+        """聚影签到/抽奖记录（读取本地保存的最后状态）。"""
+        last = self.get_data("jy_sign_last") or {}
+        if not last:
+            return "暂无聚影签到记录"
+        date = last.get("date", "")
+        if last.get("state") == "success":
+            if last.get("already"):
+                return f"{date}：已签到（站点确认不重复提交）"
+            detail = []
+            if last.get("earned") is not None:
+                detail.append(f"获得 {last['earned']}")
+            if last.get("points") is not None:
+                detail.append(f"积分 {last['points']}")
+            if last.get("streak") is not None:
+                detail.append(f"累计 {last['streak']} 天")
+            return f"{date}：签到成功" + ("（" + "，".join(detail) + "）"
+                                          if detail else "")
+        return f"{date}：{last.get('state', '未知')}"
+
+    def _jy_notice(self, title: str, text: str) -> None:
+        """聚影签到结果通知（受通知开关控制）。"""
+        if self._jy_sign_notify:
+            self._send_message(title, text)
+
+    def _save_jy_token(self, token: str) -> None:
+        """把新 token 回写配置（下次重载仍可用，避免重复登录）。"""
+        try:
+            cfg = dict(self.get_config() or {})
+            cfg["juying_token"] = token
+            self.update_config(cfg)
+        except Exception as exc:
+            logger.warning(f"SubX115：聚影 token 回写配置失败：{exc}")
 
     # =====================================================================
     # 宿主集成（订阅读取、通知）
