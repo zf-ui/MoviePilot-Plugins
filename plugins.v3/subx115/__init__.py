@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.7"
+    plugin_version = "1.6.8"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -380,7 +380,7 @@ class Subx115(_PluginBase):
             return [{
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
-                          "class": "mb-3 mt-2 pr-3"},
+                          "class": "mb-5 mt-2 pr-3"},
                 "content": [cls._action_btn(
                     "测试聚影账号", "test_login", "green", "outlined",
                     icon="mdi-account-check")],
@@ -395,13 +395,13 @@ class Subx115(_PluginBase):
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
-                    "text": tip, "class": "mb-2",
+                    "text": tip, "class": "mb-3",
                 },
             },
             {
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
-                          "class": "mb-3"},
+                          "class": "mb-5"},
                 "content": cls._site_action_btn_list(has_sign),
             },
         ]
@@ -432,12 +432,14 @@ class Subx115(_PluginBase):
     @staticmethod
     def _f_text(model: str, label: str, **props) -> dict:
         return {"component": "VTextField",
-                "props": {"model": model, "label": label, **props}}
+                "props": {"model": model, "label": label,
+                          "class": "mb-4", **props}}
 
     @staticmethod
     def _f_area(model: str, label: str, rows: int = 3, **props) -> dict:
         return {"component": "VTextarea",
-                "props": {"model": model, "label": label, "rows": rows, **props}}
+                "props": {"model": model, "label": label, "rows": rows,
+                          "class": "mb-4", **props}}
 
     @staticmethod
     def _f_col(cols: int, md: int, node: dict) -> dict:
@@ -447,13 +449,14 @@ class Subx115(_PluginBase):
     @staticmethod
     def _f_header(text: str) -> dict:
         # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
-        return {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
+        return {"component": "VCardTitle", "props": {"class": "px-0 py-3 mt-2"},
                 "text": text}
 
     @staticmethod
     def _f_switch(model: str, label: str, color: str = "deep-purple") -> dict:
         return {"component": "VSwitch",
-                "props": {"model": model, "label": label, "color": color}}
+                "props": {"model": model, "label": label, "color": color,
+                          "class": "mb-2"}}
 
     @classmethod
     def _default_channel_fields(cls, ch: dict) -> list[dict]:
@@ -818,7 +821,7 @@ class Subx115(_PluginBase):
             {
                 "component": "VTextarea",
                 "props": {"model": "dianying_apikey", "label": "OpenAPI Key",
-                          "rows": 2,
+                          "rows": 2, "class": "mb-4",
                           "placeholder": "dys_xxxxxxxxxxxxxxxx",
                           "hint": "VIP 或开发者账号建议使用 OpenAPI Key；"
                                   "普通账号可使用 Cookie 模式进行搜索、解锁和签到"},
@@ -826,7 +829,7 @@ class Subx115(_PluginBase):
             {
                 "component": "VTextarea",
                 "props": {"model": "dianying_cookie", "label": "Cookie",
-                          "rows": 3,
+                          "rows": 3, "class": "mb-4",
                           "placeholder": "浏览器正常登录癫影后，从请求头复制"
                                          " Cookie；不会自动绕过站点防护",
                           "hint": "普通 Cookie 模式只提取网页已返回的 115、"
@@ -836,7 +839,7 @@ class Subx115(_PluginBase):
             {
                 "component": "VTextField",
                 "props": {"model": "dianying_useragent",
-                          "label": "User-Agent（可选）",
+                          "label": "User-Agent（可选）", "class": "mb-4",
                           "placeholder": "默认（Windows Chrome 124）",
                           "hint": "与复制 Cookie 的浏览器 UA 保持一致可提高通过率"
                                   "（站点防护 Cookie 通常绑定 UA）；不确定时保持"
@@ -844,6 +847,7 @@ class Subx115(_PluginBase):
             },
             {
                 "component": "VRow",
+                "props": {"class": "mb-4"},
                 "content": [
                     {
                         "component": "VCol", "props": {"cols": 12, "md": 6},
@@ -868,12 +872,13 @@ class Subx115(_PluginBase):
             {
                 "component": "VSwitch",
                 "props": {"model": "dianying_sign_enabled",
-                          "label": "启用每日自动签到", "color": "purple"},
+                          "label": "启用每日自动签到", "color": "purple",
+                          "class": "mb-2"},
             },
             {
                 "component": "VTextField",
                 "props": {"model": "dianying_sign_cron",
-                          "label": "签到 Cron 表达式",
+                          "label": "签到 Cron 表达式", "class": "mb-4",
                           "placeholder": "10 8 * * *",
                           "hint": "默认每天 08:10 执行一次，按北京时间"
                                   "（Asia/Shanghai）解释"},
@@ -881,7 +886,7 @@ class Subx115(_PluginBase):
             {
                 "component": "VSelect",
                 "props": {"model": "dianying_sign_mode",
-                          "label": "签到模式",
+                          "label": "签到模式", "class": "mb-4",
                           "items": [
                               {"title": "普通签到", "value": "normal"},
                               {"title": "运气签到", "value": "lucky"},
@@ -934,23 +939,24 @@ class Subx115(_PluginBase):
             {
                 "component": "VSwitch",
                 "props": {"model": "hdhive_sign_enabled", "label": "启用自动签到",
-                          "color": "green"},
+                          "color": "green", "class": "mb-2"},
             },
             {
                 "component": "VSwitch",
                 "props": {"model": "hdhive_sign_onlyonce",
-                          "label": "保存后立即签到一次", "color": "green"},
+                          "label": "保存后立即签到一次", "color": "green",
+                          "class": "mb-2"},
             },
             {
                 "component": "VSwitch",
                 "props": {"model": "hdhive_sign_notify", "label": "签到结果通知",
-                          "color": "green"},
+                          "color": "green", "class": "mb-4"},
             },
             {
                 "component": "VTextField",
                 "props": {
                     "model": "hdhive_sign_cookie", "label": "栖影登录会话 Cookie",
-                    "type": "password",
+                    "type": "password", "class": "mb-4",
                     "hint": "浏览器登录 hdhaven.com 后复制的完整 Cookie"
                             "（必须含 hdh_session）；失效后需手动更新"},
             },
@@ -959,18 +965,20 @@ class Subx115(_PluginBase):
                 "props": {
                     "model": "hdhive_sign_cron",
                     "label": "签到 Cron（默认每天 09:30）",
+                    "class": "mb-4",
                     "placeholder": "30 9 * * *"},
             },
             {
                 "component": "VSwitch",
                 "props": {"model": "hdhive_sign_use_system_proxy",
                           "label": "签到使用系统代理（默认开启）",
-                          "color": "green"},
+                          "color": "green", "class": "mb-4"},
             },
             {
                 "component": "VTextField",
                 "props": {
                     "model": "hdhive_sign_proxy",
+                    "class": "mb-4",
                     "label": "自定义代理（关闭系统代理时使用）"},
             },
         ]
