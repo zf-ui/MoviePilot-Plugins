@@ -24,8 +24,17 @@ hdhaven = importlib.util.module_from_spec(_spec2)
 sys.modules["subx115_hdhaven"] = hdhaven
 _spec2.loader.exec_module(hdhaven)
 
+# zhenying.py（帧影签到）同样不依赖宿主，按文件路径独立加载
+_ZHENYING = Path(__file__).resolve().parents[3] / "plugins.v3" / "subx115" / "zhenying.py"
+_spec3 = importlib.util.spec_from_file_location("subx115_zhenying", _ZHENYING)
+zhenying = importlib.util.module_from_spec(_spec3)
+sys.modules["subx115_zhenying"] = zhenying
+_spec3.loader.exec_module(zhenying)
+
 HDHavenSigner = hdhaven.HDHavenSigner
 HDHavenSignError = hdhaven.HDHavenSignError
+ZhenyingSigner = zhenying.ZhenyingSigner
+ZhenyingSignError = zhenying.ZhenyingSignError
 
 parse_share = channels.parse_share
 parse_season_episode = channels.parse_season_episode
@@ -223,6 +232,44 @@ def test_hdhaven_parse_cookie_bad_format():
             HDHavenSigner.parse_cookie(bad)
             assert False, f"非法 Cookie 应抛异常：{bad!r}"
         except HDHavenSignError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 帧影（FrameHDR）签到 Cookie 校验
+# ---------------------------------------------------------------------------
+
+def test_zhenying_parse_cookie_ok():
+    value = "wangpan_session=ch0m3tgh3a4b6grhjeaf7dh84g"
+    assert ZhenyingSigner.parse_cookie(value) == value
+
+
+def test_zhenying_parse_cookie_with_security_token():
+    result = ZhenyingSigner.parse_cookie(
+        "_security_token=abc123; wangpan_session=xyz")
+    assert "wangpan_session=xyz" in result
+    assert "_security_token=abc123" in result
+
+
+def test_zhenying_parse_cookie_with_prefix():
+    assert ZhenyingSigner.parse_cookie(
+        "Cookie: wangpan_session=xyz") == "wangpan_session=xyz"
+
+
+def test_zhenying_parse_cookie_missing_session():
+    try:
+        ZhenyingSigner.parse_cookie("_security_token=abc; uid=1")
+        assert False, "缺少 wangpan_session 应抛异常"
+    except ZhenyingSignError:
+        pass
+
+
+def test_zhenying_parse_cookie_bad_format():
+    for bad in ("", "不是cookie", "wangpan_session=abc\nuid=2"):
+        try:
+            ZhenyingSigner.parse_cookie(bad)
+            assert False, f"非法 Cookie 应抛异常：{bad!r}"
+        except ZhenyingSignError:
             pass
 
 

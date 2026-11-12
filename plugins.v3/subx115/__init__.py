@@ -69,6 +69,7 @@ except Exception:  # pragma: no cover
 from .channels import (ADAPTER_CLASSES, ShareInfo, match_keywords,
                        match_subscribes, regex_match_any, split_lines)
 from .hdhaven import HDHavenSigner, HDHavenSignError, curl_cffi_available
+from .zhenying import ZhenyingSigner, ZhenyingSignError
 from .p115 import P115Client, P115Error
 
 # 历史记录上限（超过后截断旧记录）
@@ -84,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.12"
+    plugin_version = "1.7.0"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -149,6 +150,16 @@ class Subx115(_PluginBase):
     _sign_lock: threading.Lock = threading.Lock()   # 防并发签到
     _sign_timer: threading.Timer | None = None      # 兜底一次性签到定时器
 
+    # ---- 帧影（FrameHDR）签到状态 ----
+    _zy_sign_enabled = False
+    _zy_sign_cookie = ""
+    _zy_sign_cron = "18 9 * * *"
+    _zy_sign_notify = True
+    _zy_sign_use_system_proxy = True
+    _zy_sign_proxy = ""
+    _zy_sign_lock: threading.Lock = threading.Lock()   # 防并发签到
+    _zy_sign_timer: threading.Timer | None = None      # 兜底一次性签到定时器
+
     # 固定运行参数（不再暴露配置页，需要调整时改这里后重载插件）
     _max_transfer = 10      # 单轮最大转存数（防风控）
     _p115_timeout = 15      # 115 请求超时（秒）
@@ -185,6 +196,18 @@ class Subx115(_PluginBase):
             logger.warning("SubX115：宿主缺少 curl_cffi 依赖，栖影签到不可用"
                            "（渠道订阅功能不受影响）")
 
+        # 帧影（FrameHDR）签到配置
+        self._zy_sign_enabled = bool(config.get("zhenying_sign_enabled"))
+        self._zy_sign_cookie = str(
+            config.get("zhenying_sign_cookie") or "").strip()
+        self._zy_sign_cron = str(
+            config.get("zhenying_sign_cron") or "18 9 * * *").strip()
+        self._zy_sign_notify = bool(config.get("zhenying_sign_notify", True))
+        self._zy_sign_use_system_proxy = bool(
+            config.get("zhenying_sign_use_system_proxy", True))
+        self._zy_sign_proxy = str(
+            config.get("zhenying_sign_proxy") or "").strip()
+
         # 勾选「保存后立即签到一次」：先清除一次性开关再执行，避免宿主
         # 重启后再次触发
         if config.get("hdhive_sign_onlyonce"):
@@ -195,6 +218,16 @@ class Subx115(_PluginBase):
                 logger.warning("SubX115：签到一次性开关持久化失败，未执行签到")
             else:
                 self._schedule_sign_once()
+
+        # 帧影「保存后立即签到一次」
+        if config.get("zhenying_sign_onlyonce"):
+            config["zhenying_sign_onlyonce"] = False
+            try:
+                self.update_config(config)
+            except Exception:
+                logger.warning("SubX115：帧影签到一次性开关持久化失败，未执行签到")
+            else:
+                self._schedule_zy_sign_once()
 
         # 启用时轻量校验 115 Cookie（只读接口，失败不阻断加载）
         if self._enabled and self._p115_cookie:
@@ -212,7 +245,7 @@ class Subx115(_PluginBase):
     def stop_service(self) -> None:
         """释放后台资源；要求可重复、安全执行。"""
         if scheduler_sdk is not None:
-            for job_id in ("poll_once", "sign_once"):
+            for job_id in ("poll_once", "sign_once", "zy_sign_once"):
                 try:
                     scheduler_sdk.remove_plugin_once_job(
                         self.__class__.__name__, job_id)
@@ -221,6 +254,9 @@ class Subx115(_PluginBase):
         if self._sign_timer is not None:
             self._sign_timer.cancel()
             self._sign_timer = None
+        if self._zy_sign_timer is not None:
+            self._zy_sign_timer.cancel()
+            self._zy_sign_timer = None
         self._enabled = False
 
     # =====================================================================
@@ -244,6 +280,14 @@ class Subx115(_PluginBase):
                 "name": "SubX115 栖影（HDHaven）自动签到",
                 "trigger": self._cron_trigger(self._sign_cron, "30 9 * * *"),
                 "func": self._hdhaven_sign,
+                "kwargs": {},
+            })
+        if self._zy_sign_enabled and self._zy_sign_cookie:
+            services.append({
+                "id": "Subx115.ZhenyingSign",
+                "name": "SubX115 帧影（FrameHDR）自动签到",
+                "trigger": self._cron_trigger(self._zy_sign_cron, "18 9 * * *"),
+                "func": self._zhenying_sign,
                 "kwargs": {},
             })
         return services
@@ -316,6 +360,20 @@ class Subx115(_PluginBase):
                 "summary": "测试栖影（HDHaven）登录态",
             },
             {
+                "path": "/zhenying_sign",
+                "endpoint": self.api_zhenying_sign,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "立即执行帧影（FrameHDR）签到",
+            },
+            {
+                "path": "/zhenying_test_login",
+                "endpoint": self.api_zhenying_test_login,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "测试帧影（FrameHDR）登录态",
+            },
+            {
                 "path": "/history",
                 "endpoint": self.api_history,
                 "methods": ["GET"],
@@ -362,9 +420,20 @@ class Subx115(_PluginBase):
         return {"component": "VBtn", "props": props, "text": text}
 
     @classmethod
-    def _site_action_btn_list(cls, has_sign: bool) -> list[dict]:
-        """渠道页操作按钮列表（立即签到 + 测试登录）。"""
+    def _site_action_btn_list(cls, key: str, has_sign: bool) -> list[dict]:
+        """渠道页操作按钮列表（立即签到 + 测试登录）。
+
+        帧影（zhenying）走独立的 zhenying_sign / zhenying_test_login 端点，
+        其余渠道沿用默认 sign / test_login（当前仅栖影真正实现签到）。
+        """
         buttons = []
+        if key == "zhenying":
+            if has_sign:
+                buttons.append(cls._action_btn("立即签到", "zhenying_sign"))
+            buttons.append(cls._action_btn("测试登录", "zhenying_test_login",
+                                           "grey", "outlined",
+                                           "ml-2" if has_sign else ""))
+            return buttons
         if has_sign:
             buttons.append(cls._action_btn("立即签到", "sign"))
         buttons.append(cls._action_btn("测试登录", "test_login", "grey",
@@ -395,7 +464,7 @@ class Subx115(_PluginBase):
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
                           "class": "pt-6 mb-3 pr-3"},
-                "content": cls._site_action_btn_list(has_sign),
+                "content": cls._site_action_btn_list(key, has_sign),
             },
             {
                 "component": "VAlert",
@@ -737,6 +806,29 @@ class Subx115(_PluginBase):
                              "（Asia/Shanghai）解释。")),
                 ],
             },
+            # ---- 帧影签到设置 ----
+            {
+                "component": "VDivider", "props": {"class": "my-3"},
+            },
+            cls._f_header("帧影签到设置"),
+            cls._f_text("zhenying_sign_cookie", "帧影登录会话 Cookie",
+                        type="password",
+                        placeholder="wangpan_session=...; _security_token=...;",
+                        hint="浏览器登录 framehdr.com 后复制的完整 Cookie"
+                             "（必须含 wangpan_session）；失效后需手动更新。"),
+            {
+                "component": "VRow",
+                "content": [
+                    cls._f_col(12, 6, cls._f_switch(
+                        "zhenying_sign_notify", "签到结果通知", c)),
+                    cls._f_col(12, 6, cls._f_switch(
+                        "zhenying_sign_use_system_proxy",
+                        "签到使用系统代理（默认开启）", c)),
+                ],
+            },
+            cls._f_text("zhenying_sign_proxy",
+                        "自定义代理（关闭系统代理时使用）",
+                        placeholder="http://127.0.0.1:7890"),
         ]
 
     @classmethod
@@ -1207,6 +1299,11 @@ class Subx115(_PluginBase):
             "zhenying_show_tag": False,
             "zhenying_sign_enabled": False,
             "zhenying_sign_cron": "18 9 * * *",
+            "zhenying_sign_cookie": "",
+            "zhenying_sign_notify": True,
+            "zhenying_sign_use_system_proxy": True,
+            "zhenying_sign_proxy": "",
+            "zhenying_sign_onlyonce": False,
             # 蜗牛4K
             "woniu_show_tag": False,
             "woniu_sign_enabled": False,
@@ -1329,6 +1426,20 @@ class Subx115(_PluginBase):
                     "text": f"栖影（HDHaven）签到：{state}；"
                             f"日期：{sign_record.get('date', '-')}"},
             })
+        # 帧影签到状态
+        zy_sign_record = self.get_data("zy_sign_last") or {}
+        if self._zy_sign_enabled or zy_sign_record:
+            state = {"success": "签到成功", "pending": "结果待核对"}.get(
+                str(zy_sign_record.get("state") or ""), "尚无记录")
+            page.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "success" if zy_sign_record.get("state") == "success"
+                            else "warning",
+                    "variant": "tonal", "density": "compact",
+                    "text": f"帧影（FrameHDR）签到：{state}；"
+                            f"日期：{zy_sign_record.get('date', '-')}"},
+            })
         if not history:
             page.append({
                 "component": "VAlert",
@@ -1373,6 +1484,19 @@ class Subx115(_PluginBase):
                 "message": result.get("message", ""),
                 "data": result.get("user")}
 
+    def api_zhenying_sign(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/zhenying_sign（帧影「立即签到」按钮）。"""
+        result = self._zhenying_sign(manual=True)
+        return {"code": 0 if result.get("success") else 1,
+                "message": result.get("message", "")}
+
+    def api_zhenying_test_login(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/zhenying_test_login（帧影「测试登录」按钮）。"""
+        result = self._zhenying_test_login()
+        return {"code": 0 if result.get("ok") else 1,
+                "message": result.get("message", ""),
+                "data": result.get("user")}
+
     def api_status(self) -> dict:
         """GET /api/v1/plugin/Subx115/status。"""
         return {"code": 0, "data": {
@@ -1383,6 +1507,11 @@ class Subx115(_PluginBase):
                 "enabled": self._sign_enabled,
                 "cron": self._sign_cron,
                 "last": self.get_data("sign_last") or {},
+            },
+            "zhenying_sign": {
+                "enabled": self._zy_sign_enabled,
+                "cron": self._zy_sign_cron,
+                "last": self.get_data("zy_sign_last") or {},
             },
             "stats": self._status_text(),
         }}
@@ -1621,6 +1750,115 @@ class Subx115(_PluginBase):
         return result
 
     # =====================================================================
+    # 帧影（FrameHDR）签到
+    # =====================================================================
+
+    def _schedule_zy_sign_once(self) -> None:
+        """延迟 3 秒执行一次帧影签到（一次性任务，宿主 SDK 优先，本地定时器兜底）。"""
+        if scheduler_sdk is not None:
+            try:
+                scheduler_sdk.add_plugin_once_job(
+                    self.__class__.__name__, "zy_sign_once",
+                    lambda: self._zhenying_sign(manual=True),
+                    "SubX115 帧影签到一次", delay_seconds=3)
+                return
+            except Exception as exc:
+                logger.warning(f"SubX115：注册一次性帧影签到任务失败，"
+                               f"改用本地定时器：{exc}")
+        self._zy_sign_timer = threading.Timer(
+            3.0, self._zhenying_sign, kwargs={"manual": True})
+        self._zy_sign_timer.daemon = True
+        self._zy_sign_timer.start()
+
+    def _zhenying_sign(self, manual: bool = False) -> dict:
+        """帧影签到主流程（线程锁防并发；预检 -> 提交 -> 保存 -> 通知）。"""
+        if not manual and not self._zy_sign_enabled:
+            return {"success": False, "message": "帧影签到未启用"}
+        if not self._zy_sign_lock.acquire(blocking=False):
+            return {"success": False, "message": "签到正在运行"}
+        try:
+            if not self._zy_sign_cookie:
+                raise ZhenyingSignError("未配置帧影登录会话 Cookie")
+            today = datetime.now().date().isoformat()
+            proxy = (self._proxy_from_settings()
+                     if self._zy_sign_use_system_proxy else self._zy_sign_proxy)
+            if self._zy_sign_use_system_proxy and not proxy:
+                logger.info("SubX115：帧影签到已开启系统代理但未读到代理配置，"
+                            "将直连")
+            signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
+                                    timeout=20)
+
+            def _mark_pending() -> None:
+                self.save_data("zy_sign_last",
+                               {"date": today, "state": "pending"})
+                marker = self.get_data("zy_sign_last") or {}
+                if (marker.get("date") != today
+                        or marker.get("state") != "pending"):
+                    raise ZhenyingSignError("待核对标记保存失败，未发送签到请求")
+
+            result = signer.signin(mark_pending=_mark_pending)
+            if result.get("already"):
+                self.save_data("zy_sign_last",
+                               {"date": today, "state": "success",
+                                "already": True})
+                self._zy_sign_notice("【SubX115】帧影签到",
+                                     "站点确认今日已签到，不重复提交")
+                return {"success": True, "message": "站点确认今日已签到"}
+            self.save_data("zy_sign_last", {"date": today, **result})
+            saved = self.get_data("zy_sign_last") or {}
+            if (saved.get("date") != today
+                    or saved.get("state") != "success"):
+                raise ZhenyingSignError("签到已返回成功，但记录保存失败，请人工核对")
+            earned = result.get("earned")
+            points = result.get("points")
+            streak = result.get("streak")
+            detail = []
+            if earned is not None:
+                detail.append(f"获得积分：{earned}")
+            if points is not None:
+                detail.append(f"当前积分：{points}")
+            if streak is not None:
+                detail.append(f"连续签到：{streak}")
+            self._zy_sign_notice(
+                "【SubX115】帧影签到成功",
+                "；".join(detail) if detail else "签到成功")
+            return {"success": True, "message": "签到成功", "data": result}
+        except ZhenyingSignError as exc:
+            logger.warning(f"SubX115：帧影签到未完成：{exc}")
+            self._zy_sign_notice("【SubX115】帧影签到待核对", str(exc))
+            return {"success": False, "message": str(exc)}
+        except Exception as exc:
+            logger.warning(f"SubX115：帧影签到异常：{type(exc).__name__}")
+            message = "请求或存储异常，结果可能已提交；请人工核对，勿重试"
+            self._zy_sign_notice("【SubX115】帧影签到待核对", message)
+            return {"success": False, "message": message}
+        finally:
+            self._zy_sign_lock.release()
+
+    def _zy_sign_notice(self, title: str, text: str) -> None:
+        """帧影签到结果通知（受通知开关控制）。"""
+        if self._zy_sign_notify:
+            self._send_message(title, text)
+
+    def _zhenying_test_login(self) -> dict:
+        """测试帧影登录态（只读预检，供「测试登录」按钮）。"""
+        if not self._zy_sign_cookie:
+            return {"ok": False, "message": "未配置帧影登录会话 Cookie"}
+        proxy = (self._proxy_from_settings()
+                 if self._zy_sign_use_system_proxy else self._zy_sign_proxy)
+        try:
+            signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
+                                    timeout=20)
+            result = signer.check_login()
+        except ZhenyingSignError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            logger.warning("SubX115：帧影登录测试异常："
+                           f"{type(exc).__name__}")
+            return {"ok": False, "message": "请求异常，请检查网络与代理配置"}
+        return result
+
+    # =====================================================================
     # 宿主集成（订阅读取、通知）
     # =====================================================================
 
@@ -1678,6 +1916,12 @@ class Subx115(_PluginBase):
                 str(record.get("state") or ""), "尚无记录")
             lines.append(
                 f"栖影签到：{self._sign_cron}，{state}（{record.get('date', '-')}）")
+        if self._zy_sign_enabled:
+            record = self.get_data("zy_sign_last") or {}
+            state = {"success": "签到成功", "pending": "结果待核对"}.get(
+                str(record.get("state") or ""), "尚无记录")
+            lines.append(
+                f"帧影签到：{self._zy_sign_cron}，{state}（{record.get('date', '-')}）")
         lines.append("发送 /subx_run 立即轮询，/subx_sign 立即签到")
         return "\n".join(lines)
 
