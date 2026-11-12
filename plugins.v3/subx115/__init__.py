@@ -85,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.3"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -155,8 +155,6 @@ class Subx115(_PluginBase):
     _zy_sign_cookie = ""
     _zy_sign_cron = "18 9 * * *"
     _zy_sign_notify = True
-    _zy_sign_use_system_proxy = True
-    _zy_sign_proxy = ""
     _zy_sign_lock: threading.Lock = threading.Lock()   # 防并发签到
     _zy_sign_timer: threading.Timer | None = None      # 兜底一次性签到定时器
 
@@ -203,10 +201,6 @@ class Subx115(_PluginBase):
         self._zy_sign_cron = str(
             config.get("zhenying_sign_cron") or "18 9 * * *").strip()
         self._zy_sign_notify = bool(config.get("zhenying_sign_notify", True))
-        self._zy_sign_use_system_proxy = bool(
-            config.get("zhenying_sign_use_system_proxy", True))
-        self._zy_sign_proxy = str(
-            config.get("zhenying_sign_proxy") or "").strip()
 
         # 勾选「保存后立即签到一次」：先清除一次性开关再执行，避免宿主
         # 重启后再次触发
@@ -788,10 +782,6 @@ class Subx115(_PluginBase):
                         placeholder="帧影密码")),
                 ],
             },
-            cls._f_area("zhenying_cookie", "Cookie", rows=3,
-                        placeholder="wangpan_session=...; remember_me=...;",
-                        hint="可使用账号密码自动登录；如果遇到验证码或风控，"
-                             "可在浏览器登录后复制 Cookie。"),
             cls._f_header("搜索与签到"),
             cls._f_switch("zhenying_show_tag", "在影视资源站中显示“帧影”标签", c),
             {
@@ -816,19 +806,7 @@ class Subx115(_PluginBase):
                         placeholder="wangpan_session=...; _security_token=...;",
                         hint="浏览器登录 framehdr.com 后复制的完整 Cookie"
                              "（必须含 wangpan_session）；失效后需手动更新。"),
-            {
-                "component": "VRow",
-                "content": [
-                    cls._f_col(12, 6, cls._f_switch(
-                        "zhenying_sign_notify", "签到结果通知", c)),
-                    cls._f_col(12, 6, cls._f_switch(
-                        "zhenying_sign_use_system_proxy",
-                        "签到使用系统代理（默认开启）", c)),
-                ],
-            },
-            cls._f_text("zhenying_sign_proxy",
-                        "自定义代理（关闭系统代理时使用）",
-                        placeholder="http://127.0.0.1:7890"),
+            cls._f_switch("zhenying_sign_notify", "签到结果通知", c),
         ]
 
     @classmethod
@@ -1301,8 +1279,6 @@ class Subx115(_PluginBase):
             "zhenying_sign_cron": "18 9 * * *",
             "zhenying_sign_cookie": "",
             "zhenying_sign_notify": True,
-            "zhenying_sign_use_system_proxy": True,
-            "zhenying_sign_proxy": "",
             "zhenying_sign_onlyonce": False,
             # 蜗牛4K
             "woniu_show_tag": False,
@@ -1780,11 +1756,9 @@ class Subx115(_PluginBase):
             if not self._zy_sign_cookie:
                 raise ZhenyingSignError("未配置帧影登录会话 Cookie")
             today = datetime.now().date().isoformat()
-            proxy = (self._proxy_from_settings()
-                     if self._zy_sign_use_system_proxy else self._zy_sign_proxy)
-            if self._zy_sign_use_system_proxy and not proxy:
-                logger.info("SubX115：帧影签到已开启系统代理但未读到代理配置，"
-                            "将直连")
+            proxy = self._proxy_from_settings()
+            if not proxy:
+                logger.info("SubX115：帧影签到未读到代理配置，将直连")
             signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
                                     timeout=20)
 
@@ -1847,8 +1821,7 @@ class Subx115(_PluginBase):
         """测试帧影登录态（只读预检，供「测试登录」按钮）。"""
         if not self._zy_sign_cookie:
             return {"ok": False, "message": "未配置帧影登录会话 Cookie"}
-        proxy = (self._proxy_from_settings()
-                 if self._zy_sign_use_system_proxy else self._zy_sign_proxy)
+        proxy = self._proxy_from_settings()
         try:
             signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
                                     timeout=20)
