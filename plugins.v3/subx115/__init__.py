@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.3"
+    plugin_version = "1.6.4"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -336,39 +336,39 @@ class Subx115(_PluginBase):
     # =====================================================================
 
     @classmethod
-    def _site_action_buttons(cls, has_sign: bool) -> dict:
-        """渠道页右上角「立即签到 / 测试登录」按钮。
+    def _action_btn(cls, text: str, api: str, color: str = "deep-purple",
+                    variant: str = "tonal", extra_class: str = "",
+                    icon: str = "") -> dict:
+        """生成一个点击后调插件 API 的操作按钮（onclick 调 window.MoviePilotAPI）。
 
         配置页（get_form）的 VBtn 无法像详情页那样通过 events 调后端 API，
         但可通过 onclick（FormRender 会把 on 开头的字符串转成函数执行）调用
         前端全局注入的 window.MoviePilotAPI（保留完整响应的 pluginApi，自动
-        带 Bearer token）。签到仅栖影（HDHaven）实现了实际逻辑，其余渠道点
-        「立即签到」同样走栖影签到接口。
+        带 Bearer token）。
         """
         plugin = cls.__name__
+        props = {
+            "color": color, "variant": variant,
+            "size": "small", "class": extra_class,
+            "onclick": (
+                "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
+                + "/" + api + "').then(function(r){ "
+                "if(r && r.message){ alert(r.message); } "
+                "}).catch(function(){ }); }"
+            ),
+        }
+        if icon:
+            props["prepend-icon"] = icon
+        return {"component": "VBtn", "props": props, "text": text}
 
-        def _btn(text: str, api: str, color: str, variant: str,
-                 extra_class: str = "") -> dict:
-            return {
-                "component": "VBtn",
-                "props": {
-                    "color": color, "variant": variant,
-                    "size": "small", "class": extra_class,
-                    "onclick": (
-                        "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
-                        + "/" + api + "').then(function(r){ "
-                        "if(r && r.message){ alert(r.message); } "
-                        "}).catch(function(){ }); }"
-                    ),
-                },
-                "text": text,
-            }
-
+    @classmethod
+    def _site_action_buttons(cls, has_sign: bool) -> dict:
+        """渠道页右上角「立即签到 / 测试登录」按钮。"""
         buttons = []
         if has_sign:
-            buttons.append(_btn("立即签到", "sign", "deep-purple", "tonal"))
-        buttons.append(_btn("测试登录", "test_login", "grey", "outlined",
-                            "ml-2" if has_sign else ""))
+            buttons.append(cls._action_btn("立即签到", "sign"))
+        buttons.append(cls._action_btn("测试登录", "test_login", "grey",
+                                       "outlined", "ml-2" if has_sign else ""))
         return {
             "component": "VRow",
             "props": {"justify": "end", "align": "center", "class": "mb-3"},
@@ -379,6 +379,15 @@ class Subx115(_PluginBase):
     def _channel_header(cls, ch: dict) -> list[dict]:
         """渠道页顶部：右上角操作按钮 + 提示（tip 按 \\n 分两行展示）。"""
         key = ch["key"]
+        # 聚影页：右上角单个「测试聚影账号」按钮，无顶部提示条（subx 原版）
+        if key == "juying":
+            return [{
+                "component": "VRow",
+                "props": {"justify": "end", "align": "center", "class": "mb-3"},
+                "content": [cls._action_btn(
+                    "测试聚影账号", "test_login", "green", "outlined",
+                    icon="mdi-account-check")],
+            }]
         # 仅「观影」无签到功能，只显示「测试登录」
         has_sign = key != "guanying"
         tip = ch.get("tip", "")
@@ -506,30 +515,91 @@ class Subx115(_PluginBase):
 
     @classmethod
     def _juying_fields(cls, ch: dict) -> list[dict]:
-        """聚影：App Key / 账号密码 / 签到（普通|幸运）+ 抽奖。"""
+        """聚影：App Key / 账号密码 / 签到（普通|幸运）+ 抽奖（对齐 subx 原版）。"""
         return [
             cls._f_text("juying_apikey", "聚影 App Key",
                         placeholder="填入你的聚影 App Key"),
-            cls._f_text("juying_username", "聚影账号", placeholder="用户名"),
-            cls._f_text("juying_password", "聚影密码", type="password",
-                        placeholder="密码"),
-            cls._f_switch("juying_enabled", "启用聚影搜索"),
-            cls._f_switch("juying_sign_enabled", "启用每日自动签到"),
-            cls._f_switch("juying_sign_draw", "签到后自动抽奖"),
+            # 账号 + 密码 左右并排
             {
-                "component": "VSelect",
-                "props": {
-                    "model": "juying_sign_mode", "label": "签到方式",
-                    "items": [
-                        {"title": "普通签到", "value": "normal"},
-                        {"title": "幸运签到", "value": "lucky"},
-                    ],
-                },
+                "component": "VRow",
+                "content": [
+                    cls._f_col(12, 6, cls._f_text(
+                        "juying_username", "聚影账号", placeholder="用户名")),
+                    cls._f_col(12, 6, cls._f_text(
+                        "juying_password", "聚影密码", type="password",
+                        placeholder="密码")),
+                ],
+            },
+            # 启用搜索 + 启用每日签到 左右并排
+            {
+                "component": "VRow",
+                "content": [
+                    cls._f_col(12, 6, cls._f_switch(
+                        "juying_enabled", "启用聚影搜索")),
+                    cls._f_col(12, 6, cls._f_switch(
+                        "juying_sign_enabled", "启用每日自动签到")),
+                ],
             },
             cls._f_text("juying_sign_cron", "签到 Cron 表达式",
                         placeholder="12 8 * * *",
                         hint="默认每天 08:12 执行一次，按北京时间"
                              "（Asia/Shanghai）解释。"),
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            # ---- 签到设置 ----
+            cls._f_header("签到设置"),
+            {
+                "component": "VRow",
+                "props": {"align": "center"},
+                "content": [
+                    cls._f_col(12, 4, {
+                        "component": "div",
+                        "props": {"class": "text-body-2 text-medium-emphasis"},
+                        "text": "签到方式",
+                    }),
+                    cls._f_col(12, 8, {
+                        "component": "VBtnToggle",
+                        "props": {
+                            "model": "juying_sign_mode",
+                            "mandatory": True,
+                            "variant": "outlined",
+                            "color": "deep-purple",
+                            "density": "comfortable",
+                        },
+                        "content": [
+                            {"component": "VBtn", "props": {"value": "normal"},
+                             "text": "普通签到"},
+                            {"component": "VBtn", "props": {"value": "lucky"},
+                             "text": "幸运签到"},
+                        ],
+                    }),
+                ],
+            },
+            cls._f_switch("juying_sign_draw", "签到后自动抽奖"),
+            {
+                "component": "VRow",
+                "props": {"class": "mt-2"},
+                "content": [
+                    cls._action_btn("立即签到", "sign", "deep-purple",
+                                    "outlined", "mr-2", "mdi-check"),
+                    cls._action_btn("奖池抽奖", "sign", "deep-purple",
+                                    "outlined", "mr-2", "mdi-gift"),
+                    cls._action_btn("签到与抽奖记录", "history", "grey",
+                                    "text", "", "mdi-history"),
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {"type": "error", "variant": "tonal",
+                          "density": "compact", "class": "mt-2",
+                          "text": "抽奖：聚影账号密码未配置"},
+            },
+            {
+                "component": "VBtn",
+                "props": {"color": "deep-purple", "block": True,
+                          "class": "mt-2",
+                          "prepend-icon": "mdi-content-save"},
+                "text": "保存聚影配置",
+            },
         ]
 
     @classmethod
