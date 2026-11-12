@@ -46,12 +46,18 @@ class NetworkError(Exception):
 
 
 def _request(method: str, url: str, *, headers: dict | None = None,
-             data: dict | None = None, timeout: int = 15) -> str:
+             data: dict | None = None, timeout: int = 15,
+             proxies: dict | None = None) -> str:
     """发起 HTTP 请求并返回文本；网络层异常统一转为 NetworkError。"""
     if httpx is not None:
         try:
-            resp = httpx.request(method, url, headers=headers, data=data,
-                                 timeout=timeout, follow_redirects=True)
+            if proxies:
+                with httpx.Client(proxies=proxies, timeout=timeout,
+                                  follow_redirects=True) as client:
+                    resp = client.request(method, url, headers=headers, data=data)
+            else:
+                resp = httpx.request(method, url, headers=headers, data=data,
+                                     timeout=timeout, follow_redirects=True)
         except Exception as exc:
             raise NetworkError(f"httpx 请求失败: {exc}") from exc
         resp.raise_for_status()
@@ -59,7 +65,8 @@ def _request(method: str, url: str, *, headers: dict | None = None,
     if requests is not None:
         try:
             resp = requests.request(method, url, headers=headers, data=data,
-                                     timeout=timeout, allow_redirects=True)
+                                     timeout=timeout, allow_redirects=True,
+                                     proxies=proxies or None)
         except Exception as exc:
             raise NetworkError(f"requests 请求失败: {exc}") from exc
         resp.raise_for_status()
@@ -68,16 +75,17 @@ def _request(method: str, url: str, *, headers: dict | None = None,
 
 
 def request_text(url: str, headers: dict | None = None, data: dict | None = None,
-                 timeout: int = 15) -> str:
+                 timeout: int = 15, proxies: dict | None = None) -> str:
     """GET（无 data）或 POST（有 data）请求，返回响应文本。"""
     return _request("POST" if data else "GET", url,
-                    headers=headers, data=data, timeout=timeout)
+                    headers=headers, data=data, timeout=timeout, proxies=proxies)
 
 
 def request_json(url: str, headers: dict | None = None, data: dict | None = None,
-                 timeout: int = 15) -> Any:
+                 timeout: int = 15, proxies: dict | None = None) -> Any:
     """请求并解析 JSON；非 JSON 响应抛 NetworkError。"""
-    text = request_text(url, headers=headers, data=data, timeout=timeout)
+    text = request_text(url, headers=headers, data=data, timeout=timeout,
+                        proxies=proxies)
     try:
         return json.loads(text)
     except ValueError as exc:
@@ -216,6 +224,11 @@ class ChannelAdapter:
         self.include = split_lines(config.get(f"{self.key}_include"))
         self.exclude = split_lines(config.get(f"{self.key}_exclude"))
         self.target = str(config.get(f"{self.key}_target") or "").strip()
+        # 渠道级代理（配置页开关 + 地址），未启用时为 None
+        self.proxies: dict | None = None
+        proxy_addr = str(config.get(f"{self.key}_proxy") or "").strip()
+        if bool(config.get(f"{self.key}_proxy_enabled")) and proxy_addr:
+            self.proxies = {"http://": proxy_addr, "https://": proxy_addr}
 
     # -- 基础判断 ----------------------------------------------------------
 
@@ -229,8 +242,10 @@ class ChannelAdapter:
         return list(dict.fromkeys(urls))
 
     def _headers(self) -> dict:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                 "MoviePilot-SubX115/1.0"}
+        ua = str(self.config.get(f"{self.key}_useragent")
+                 or "").strip() or ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "MoviePilot-SubX115/1.0")
+        headers = {"User-Agent": ua}
         if self.cookie:
             headers["Cookie"] = self.cookie
             headers["Authorization"] = f"Bearer {self.cookie}"
@@ -295,7 +310,8 @@ class RssChannel(ChannelAdapter):
             raise RuntimeError("未配置接口地址或订阅来源")
         result: list[ShareInfo] = []
         for url in urls:
-            text = request_text(url, headers=self._headers(), timeout=self.timeout)
+            text = request_text(url, headers=self._headers(), timeout=self.timeout,
+                                proxies=self.proxies)
             for chunk in self._ITEM_RE.findall(text):
                 title = self._tag(chunk, "title")
                 link = self._tag(chunk, "link")
@@ -355,7 +371,7 @@ class JsonApiChannel(ChannelAdapter):
                 sep = "&" if "?" in url else "?"
                 real_url = f"{url}{sep}keyword={quote(keyword)}"
             data = request_json(real_url, headers=self._headers(),
-                                timeout=self.timeout)
+                                timeout=self.timeout, proxies=self.proxies)
             for item in self._iter_items(data) or []:
                 title = str(self._pick(item, "title", "name", "subject") or "")
                 link = str(self._pick(item, "link", "url", "share_url",

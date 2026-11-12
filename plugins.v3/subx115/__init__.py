@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -104,7 +104,9 @@ class Subx115(_PluginBase):
          "tip": "剧迷渠道：填写 RSS / 接口地址（一行一个可配多个来源）。"},
         {"key": "dianying", "name": "癫影配置", "short": "癫影", "en": "Dian115",
          "color": "purple", "icon": "mdi-filmstrip",
-         "tip": "癫影渠道：填写 RSS / 接口地址。"},
+         "tip": "OpenAPI Key 优先用于癫影搜索、解锁和签到；没有 Key 时可填写"
+                "浏览器 Cookie 作为普通网页模式兜底，遇到站点防护会提示重新登录。"
+                "普通 Cookie 模式只提取网页已返回的 115、磁力、ed2k 明文链接。"},
         {"key": "guanying", "name": "观影配置", "short": "观影", "en": "GuanYing",
          "color": "blue", "icon": "mdi-cinema",
          "tip": "观影渠道：填写 RSS / 接口地址。"},
@@ -331,6 +333,13 @@ class Subx115(_PluginBase):
             return {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
                     "text": text}
 
+        def _area_cookie(k: str, s: str) -> tuple[dict]:
+            # 癫影页 Cookie 放在下方专属区块（OpenAPI Key / UA 之后），此处跳过
+            if k == "dianying":
+                return ()
+            return (_area(f"{k}_cookie",
+                          f"{s} Cookie（可选，浏览器登录后复制）", rows=2),)
+
         fields = [
             {
                 "component": "VAlert",
@@ -358,7 +367,7 @@ class Subx115(_PluginBase):
                                       type="password", placeholder=f"{short}密码")),
                 ],
             },
-            _area(f"{key}_cookie", "Cookie（可选，浏览器登录后复制）", rows=2),
+            *_area_cookie(key, short),
             # 搜索与设置
             _header("搜索与设置"),
             {
@@ -391,7 +400,118 @@ class Subx115(_PluginBase):
         # 栖影（HDHaven）页额外包含签到配置（整合自 hdhavensign 插件）
         if key == "hdhive":
             fields.extend(cls._hdhaven_sign_fields())
+        # 癫影页：subx 原版字段（OpenAPI Key / UA / 保活 / 签到 / 代理）
+        if key == "dianying":
+            fields.extend(cls._dianying_fields())
         return fields
+
+    @staticmethod
+    def _dianying_fields() -> list[dict]:
+        """癫影（Dian115）专属字段，版式对应 subx 原版癫影配置页。"""
+        return [
+            {
+                "component": "VTextarea",
+                "props": {"model": "dianying_apikey", "label": "OpenAPI Key",
+                          "rows": 2,
+                          "placeholder": "dys_xxxxxxxxxxxxxxxx",
+                          "hint": "VIP 或开发者账号建议使用 OpenAPI Key；"
+                                  "普通账号可使用 Cookie 模式进行搜索、解锁和签到"},
+            },
+            {
+                "component": "VTextarea",
+                "props": {"model": "dianying_cookie", "label": "Cookie",
+                          "rows": 3,
+                          "placeholder": "浏览器正常登录癫影后，从请求头复制"
+                                         " Cookie；不会自动绕过站点防护",
+                          "hint": "普通 Cookie 模式只提取网页已返回的 115、"
+                                  "磁力、ed2k 明文链接；如果触发验证，需要先在"
+                                  "浏览器重新登录再复制 Cookie"},
+            },
+            {
+                "component": "VTextField",
+                "props": {"model": "dianying_useragent",
+                          "label": "User-Agent（可选）",
+                          "placeholder": "默认（Windows Chrome 124）",
+                          "hint": "与复制 Cookie 的浏览器 UA 保持一致可提高通过率"
+                                  "（站点防护 Cookie 通常绑定 UA）；不确定时保持"
+                                  "默认即可"},
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                        "content": [{
+                            "component": "VSwitch",
+                            "props": {"model": "dianying_show_tag",
+                                      "label": "在影视资源站中显示“癫影”标签",
+                                      "color": "deep-purple"},
+                        }],
+                    },
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                        "content": [{
+                            "component": "VSwitch",
+                            "props": {"model": "dianying_keepalive",
+                                      "label": "启用 Cookie 保活刷新（每 6 小时）",
+                                      "color": "deep-purple"},
+                        }],
+                    },
+                ],
+            },
+            {
+                "component": "VSwitch",
+                "props": {"model": "dianying_sign_enabled",
+                          "label": "启用每日自动签到", "color": "deep-purple"},
+            },
+            {
+                "component": "VTextField",
+                "props": {"model": "dianying_sign_cron",
+                          "label": "签到 Cron 表达式",
+                          "placeholder": "10 8 * * *",
+                          "hint": "默认每天 08:10 执行一次，按北京时间"
+                                  "（Asia/Shanghai）解释"},
+            },
+            {
+                "component": "VSelect",
+                "props": {"model": "dianying_sign_mode",
+                          "label": "签到模式",
+                          "items": [
+                              {"title": "普通签到", "value": "normal"},
+                              {"title": "运气签到", "value": "lucky"},
+                          ],
+                          "hint": "普通签到固定奖励；运气签到按癫影接口返回"
+                                  "随机倍数"},
+            },
+            # ---- 代理 ----
+            {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
+             "text": "代理"},
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 4},
+                        "content": [{
+                            "component": "VSwitch",
+                            "props": {"model": "dianying_proxy_enabled",
+                                      "label": "启用代理",
+                                      "color": "deep-purple"},
+                        }],
+                    },
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 8},
+                        "content": [{
+                            "component": "VTextField",
+                            "props": {"model": "dianying_proxy",
+                                      "label": "代理地址",
+                                      "placeholder": "http://127.0.0.1:7890",
+                                      "hint": "启用后癫影渠道的搜索请求"
+                                              "走该代理"},
+                        }],
+                    },
+                ],
+            },
+        ]
 
     @staticmethod
     def _hdhaven_sign_fields() -> list[dict]:
@@ -619,6 +739,20 @@ class Subx115(_PluginBase):
                 f"{ch['key']}_exclude": "",
                 f"{ch['key']}_limit": "20",
             })
+
+        # 癫影（Dian115）专属默认值（对应 subx 原版癫影配置页）
+        defaults.update({
+            "dianying_site": "https://m.dian115.com",
+            "dianying_apikey": "",
+            "dianying_useragent": "",
+            "dianying_show_tag": False,
+            "dianying_keepalive": True,
+            "dianying_sign_enabled": False,
+            "dianying_sign_cron": "10 8 * * *",
+            "dianying_sign_mode": "normal",
+            "dianying_proxy_enabled": False,
+            "dianying_proxy": "",
+        })
 
         defaults["tab"] = "search"
 
