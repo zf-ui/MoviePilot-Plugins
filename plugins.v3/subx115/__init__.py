@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.5"
+    plugin_version = "1.6.6"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -371,28 +371,29 @@ class Subx115(_PluginBase):
                                        "outlined", "ml-2" if has_sign else ""))
         return {
             "component": "VRow",
-            "props": {"justify": "end", "align": "center", "class": "mb-3"},
+            "props": {"justify": "end", "align": "center",
+                      "class": "mb-3 pr-3"},
             "content": buttons,
         }
 
     @classmethod
     def _channel_header(cls, ch: dict) -> list[dict]:
-        """渠道页顶部：右上角操作按钮 + 提示（tip 按 \\n 分两行展示）。"""
+        """渠道页顶部：右上角操作按钮 + 提示（tip 单行展示）。"""
         key = ch["key"]
         # 聚影页：右上角单个「测试聚影账号」按钮，无顶部提示条（subx 原版）
         if key == "juying":
             return [{
                 "component": "VRow",
-                "props": {"justify": "end", "align": "center", "class": "mb-3"},
+                "props": {"justify": "end", "align": "center",
+                          "class": "mb-3 pr-3"},
                 "content": [cls._action_btn(
                     "测试聚影账号", "test_login", "green", "outlined",
                     icon="mdi-account-check")],
             }]
         # 仅「观影」无签到功能，只显示「测试登录」
         has_sign = key != "guanying"
-        tip = ch.get("tip", "")
-        # 用 text + white-space: pre-line 让 \\n 正确换行，两行在信息图标右侧
-        # 同一左边界对齐（比 content 多 div 更稳定，不会第二行错位）
+        # 提示单行展示：去掉换行符，让文字自然流动（不再强制两行）
+        tip = ch.get("tip", "").replace("\n", " ")
         return [
             cls._site_action_buttons(has_sign),
             {
@@ -400,7 +401,6 @@ class Subx115(_PluginBase):
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
                     "text": tip,
-                    "style": {"white-space": "pre-line"},
                     "class": "mb-2",
                 },
             },
