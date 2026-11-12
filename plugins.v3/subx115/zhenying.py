@@ -72,14 +72,18 @@ class ZhenyingSigner:
             raw = raw[7:].strip()
         if not raw or any(c in raw for c in "\r\n"):
             raise ZhenyingSignError("请填写站点登录会话 Cookie")
+        # 宽容解析：先过滤掉无法识别为「键=值」的孤立片段（如复制/粘贴时
+        # 被截断、缺少「键=」前缀的 token 尾巴），只保留合法键值对，避免
+        # SimpleCookie 因单个坏片段而整体失败
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        kv_parts = [p for p in parts if "=" in p]
         jar = SimpleCookie()
         try:
-            jar.load(raw)
+            for p in kv_parts:
+                jar.load(p)
         except Exception:
             raise ZhenyingSignError("Cookie 格式错误") from None
-        if not jar or any(not part.strip() or "=" not in part
-                          for part in raw.split(";")):
-            raise ZhenyingSignError("Cookie 格式错误")
+        # 只要求关键的 wangpan_session 存在且非空即可
         if "wangpan_session" not in jar or not jar["wangpan_session"].value:
             raise ZhenyingSignError("缺少 wangpan_session 登录会话 Cookie")
         return "; ".join(f"{name}={item.value}" for name, item in jar.items())

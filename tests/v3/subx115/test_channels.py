@@ -273,6 +273,22 @@ def test_zhenying_parse_cookie_bad_format():
             pass
 
 
+def test_zhenying_parse_cookie_tolerates_orphan_fragment():
+    # 复制/粘贴时 _security_token= 前缀被截断、只剩孤立 token 尾巴的场景：
+    # 应宽容忽略无「=」的片段，只要 wangpan_session 完整即可
+    result = ZhenyingSigner.parse_cookie(
+        "ZmEzNDk2MWFIMzAwODJkY2E5YzMxY2Jm; wangpan_session=ch0m3tgh3a4b6grhjeaf7dh84g")
+    assert result == "wangpan_session=ch0m3tgh3a4b6grhjeaf7dh84g"
+
+
+def test_zhenying_parse_cookie_tolerates_empty_fragments():
+    # 首尾多余分号 + 空片段 + 合法键值对共存
+    result = ZhenyingSigner.parse_cookie(
+        "; ; wangpan_session=xyz ; _security_token=abc;;")
+    assert "wangpan_session=xyz" in result
+    assert "_security_token=abc" in result
+
+
 def _main():
     """无 pytest 时直接运行。"""
     failed = 0
