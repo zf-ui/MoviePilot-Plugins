@@ -86,7 +86,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.8.1"
+    plugin_version = "1.8.2"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -744,10 +744,16 @@ class Subx115(_PluginBase):
                                     "text", "", "mdi-history"),
                 ],
             },
+            # 预留一行空白：供「签到与抽奖记录」等内联提示条显示，避免紧贴保存按钮
+            {
+                "component": "VRow",
+                "props": {"class": "my-1", "style": {"min-height": "36px"}},
+                "content": [],
+            },
             {
                 "component": "VBtn",
                 "props": {"color": "deep-purple", "block": True,
-                          "class": "mt-4",
+                          "class": "mt-2",
                           "prepend-icon": "mdi-content-save"},
                 "text": "保存聚影配置",
             },
