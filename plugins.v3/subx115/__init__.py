@@ -85,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.5"
+    plugin_version = "1.7.6"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -539,8 +539,9 @@ class Subx115(_PluginBase):
     @staticmethod
     def _f_header(text: str) -> dict:
         # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
-        return {"component": "VCardTitle", "props": {"class": "px-0 py-1 mt-1"},
-                "text": text}
+        # pt-1 缩小标题与上方内容的距离，pb-3 拉开标题与下方输入框的间距
+        return {"component": "VCardTitle",
+                "props": {"class": "px-0 pt-1 pb-3 mt-1"}, "text": text}
 
     @staticmethod
     def _f_switch(model: str, label: str, color: str = "deep-purple") -> dict:
@@ -827,8 +828,15 @@ class Subx115(_PluginBase):
                         type="password",
                         placeholder="wangpan_session=...; _security_token=...;",
                         hint="浏览器登录 framehdr.com 后复制的完整 Cookie"
-                             "（必须含 wangpan_session）；失效后需手动更新。"),
+                             "（必须含 wangpan_session）。"),
             cls._f_switch("zhenying_sign_notify", "签到结果通知", c),
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact", "class": "mt-3",
+                          "text": "优先使用 Cookie；Cookie 失效时自动使用账号密码"
+                                  "重新登录获取。"},
+            },
         ]
 
     @classmethod
