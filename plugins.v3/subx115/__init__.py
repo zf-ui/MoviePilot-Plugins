@@ -85,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -1822,7 +1822,10 @@ class Subx115(_PluginBase):
             self._zy_sign_notice(
                 "【SubX115】帧影签到成功",
                 "；".join(detail) if detail else "签到成功")
-            return {"success": True, "message": "签到成功", "data": result}
+            return {"success": True,
+                    "message": "签到成功" + ("：" + "；".join(detail)
+                                            if detail else ""),
+                    "data": result}
         except ZhenyingSignError as exc:
             logger.warning(f"SubX115：帧影签到未完成：{exc}")
             self._zy_sign_notice("【SubX115】帧影签到待核对", str(exc))
@@ -1856,6 +1859,18 @@ class Subx115(_PluginBase):
             logger.warning("SubX115：帧影登录测试异常："
                            f"{type(exc).__name__}")
             return {"ok": False, "message": "请求异常，请检查网络与代理配置"}
+        if result.get("ok"):
+            user = result.get("user") or {}
+            parts = ["帧影登录态有效"]
+            if user.get("points") is not None:
+                parts.append(f"积分 {user['points']}")
+            if user.get("total_days") is not None:
+                parts.append(f"累计签到 {user['total_days']} 天")
+            if user.get("continuous_days") is not None:
+                parts.append(f"连续 {user['continuous_days']} 天")
+            if user.get("checkin_today"):
+                parts.append("今日已签到")
+            result["message"] = "；".join(parts)
         return result
 
     # =====================================================================

@@ -289,6 +289,108 @@ def test_zhenying_parse_cookie_tolerates_empty_fragments():
     assert "_security_token=abc" in result
 
 
+# ---------------------------------------------------------------------------
+# 签到流程（_init_state / check_login / signin）：用假 session 模拟 HTTP 响应
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    """模拟 httpx/requests 响应对象。"""
+    def __init__(self, payload: dict, status_code: int = 200, url: str = ""):
+        self._payload = payload
+        self.status_code = status_code
+        self.url = url
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """记录请求并返回预设响应的假 session。"""
+    def __init__(self, init_resp: dict, post_resp: dict | None = None):
+        self.init_resp = init_resp
+        self.post_resp = post_resp
+        self.gets: list = []
+        self.posts: list = []
+
+    def get(self, url, params=None, **kwargs):
+        self.gets.append((url, params))
+        return _FakeResp(self.init_resp)
+
+    def post(self, url, params=None, **kwargs):
+        self.posts.append((url, params, kwargs))
+        return _FakeResp(self.post_resp or self.init_resp)
+
+    def close(self):
+        pass
+
+
+def _signer_with_session(init_resp, post_resp=None):
+    signer = ZhenyingSigner("wangpan_session=xyz")
+    fake = _FakeSession(init_resp, post_resp)
+    signer._session = lambda: fake  # 注入假 session
+    return signer, fake
+
+
+def test_zhenying_init_state_parses_csrf_and_status():
+    signer, fake = _signer_with_session({
+        "success": True,
+        "data": {"csrf_token": "tok123", "points": 193, "total_days": 33,
+                 "continuous_days": 1, "has_checked_today": True},
+    })
+    state = signer._init_state(fake)
+    assert state["csrf_token"] == "tok123"
+    assert state["has_checked_today"] is True
+    assert state["points"] == 193
+    # 应调用 GET ?action=init 且带 year/month
+    url, params = fake.gets[0]
+    assert url.endswith("/api/checkin.php")
+    assert params["action"] == "init"
+    assert "year" in params and "month" in params
+
+
+def test_zhenying_signin_already_checked():
+    signer, fake = _signer_with_session({
+        "success": True,
+        "data": {"csrf_token": "tok", "points": 193, "continuous_days": 1,
+                 "has_checked_today": True},
+    })
+    result = signer.signin()
+    assert result["state"] == "success"
+    assert result["already"] is True
+    assert result["points"] == 193
+    assert result["streak"] == 1
+    assert fake.posts == []  # 已签到不应发起 POST
+
+
+def test_zhenying_signin_submits_with_csrf():
+    init = {"success": True,
+            "data": {"csrf_token": "tokABC", "points": 100,
+                     "continuous_days": 2, "has_checked_today": False}}
+    post = {"success": True, "data": {"points": 5}}
+    signer, fake = _signer_with_session(init, post)
+    result = signer.signin()
+    assert result["state"] == "success"
+    assert result["earned"] == 5
+    # 应发起 POST ?action=checkin，且带 csrf_token
+    assert len(fake.posts) == 1
+    url, params, kwargs = fake.posts[0]
+    assert params["action"] == "checkin"
+    # csrf_token 应通过 files= 以 multipart 提交
+    assert "files" in kwargs and kwargs["files"]["csrf_token"][1] == "tokABC"
+
+
+def test_zhenying_signin_site_error():
+    init = {"success": True,
+            "data": {"csrf_token": "tok", "has_checked_today": False}}
+    post = {"success": False, "message": "无效的操作"}
+    signer, fake = _signer_with_session(init, post)
+    try:
+        signer.signin()
+        assert False, "站点返回失败应抛异常"
+    except ZhenyingSignError as exc:
+        assert "无效的操作" in str(exc)
+
+
 def _main():
     """无 pytest 时直接运行。"""
     failed = 0

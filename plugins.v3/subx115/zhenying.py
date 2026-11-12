@@ -7,12 +7,21 @@
 会话 Cookie 维护。签到接口为 `api/checkin.php`，未登录时返回 302 跳转到
 `/api/login.php`，登录后返回 JSON `{"success": ..., "data": {...}}`。
 
+签到接口约定（已通过抓包站点前端 JS + 真实 Cookie 实测确认）：
+- `GET /api/checkin.php?action=init&year=Y&month=M`
+  返回签到状态与本次会话的 `csrf_token`（data 内含 points/total_days/
+  continuous_days/has_checked_today/records/csrf_token 等）；
+- `POST /api/checkin.php?action=checkin`（multipart/form-data，body 带
+  `csrf_token`）执行签到，成功返回 `{success:true, data:{points, rewards[]}}`。
+- 注意：`login_status.php` 是登录防暴力破解的状态查询（返回 is_locked 等），
+  **不是**登录预检，不能用于判断会话是否有效。
+
 本模块不依赖 MoviePilot 宿主，可独立导入与测试。HTTP 走 httpx（宿主自带）
 优先、requests 兜底，与 channels.py 的封装保持一致，因此**不依赖 curl_cffi**
 （帧影没有 HDHaven 那种 TLS 指纹校验，普通 HTTPS 即可）。
 
 安全设计（与 HDHaven 对齐）：
-- 每次签到前先做登录预检（api/login_status.php），确认会话有效；
+- 每次签到前先 GET ?action=init 做状态预检（顺带拿 csrf_token），确认会话有效；
 - 只有站点明确返回成功（HTTP 200 + JSON success=true）才记成功；
 - 异常消息统一脱敏（不携带 Cookie / 代理地址原文）。
 """
@@ -136,36 +145,49 @@ class ZhenyingSigner:
             raise ZhenyingSignError("站点响应结构异常；请人工核对")
         return data
 
-    # -- 登录预检 ------------------------------------------------------------
+    # -- 状态查询 / 登录预检 --------------------------------------------------
+
+    def _init_state(self, session) -> dict:
+        """GET api/checkin.php?action=init 获取签到状态与 csrf_token。
+
+        返回站点的 data 字典（含 csrf_token、points、total_days、
+        continuous_days、has_checked_today、records 等）；未登录或异常抛
+        ZhenyingSignError。
+        """
+        now = datetime.now()
+        resp = session.get(
+            self.BASE + "/api/checkin.php",
+            params={"action": "init",
+                    "year": str(now.year), "month": str(now.month)},
+        )
+        if resp.status_code == 302 or (hasattr(resp, "url")
+                                       and str(resp.url).endswith("login.php")):
+            raise ZhenyingSignError("会话未通过登录预检，请重新登录并更新 Cookie")
+        data = self._decode(resp)
+        if data.get("success") is not True:
+            raise ZhenyingSignError("会话未通过登录预检，请重新登录并更新 Cookie")
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            raise ZhenyingSignError("站点签到状态结构异常；请人工核对")
+        return inner
 
     def check_login(self) -> dict:
-        """仅做登录预检（只读请求 api/login_status.php），供「测试登录」按钮。
+        """登录预检（GET ?action=init），供「测试登录」按钮。
 
         :return: {"ok": True, "user": {...}} 或 {"ok": False, "message": ...}
         :raises ZhenyingSignError: 请求/解析异常（不泄露 Cookie）
         """
         session = self._session()
         try:
-            resp = session.get(
-                self.BASE + "/api/login_status.php",
-                params={"action": "login_status"},
-            )
-            # 未登录时站点会 302 到 /api/login.php；已登录返回 200 JSON
-            if resp.status_code == 302 or (hasattr(resp, "url")
-                                           and str(resp.url).endswith("login.php")):
-                return {"ok": False,
-                        "message": "会话未通过登录预检，请重新登录并更新 Cookie"}
-            data = self._decode(resp)
-            if data.get("success") is not True:
-                return {"ok": False,
-                        "message": "会话未通过登录预检，请重新登录并更新 Cookie"}
-            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            inner = self._init_state(session)
             return {"ok": True, "user": {
-                "username": inner.get("username") or inner.get("name"),
-                "checkin_today": inner.get("checkin_today")
-                                 or inner.get("checkin")
-                                 or inner.get("is_checked_in"),
+                "points": inner.get("points"),
+                "total_days": inner.get("total_days"),
+                "continuous_days": inner.get("continuous_days"),
+                "checkin_today": inner.get("has_checked_today"),
             }}
+        except ZhenyingSignError as exc:
+            return {"ok": False, "message": str(exc)}
         finally:
             self._close(session)
 
@@ -182,34 +204,35 @@ class ZhenyingSigner:
         try:
             today = datetime.now().date().isoformat()
 
-            # 1) 登录预检（只读）
-            resp = session.get(
-                self.BASE + "/api/login_status.php",
-                params={"action": "login_status"},
-            )
-            if resp.status_code == 302 or (hasattr(resp, "url")
-                                           and str(resp.url).endswith("login.php")):
-                raise ZhenyingSignError("会话未通过登录预检，请重新登录并更新 Cookie")
-            login = self._decode(resp)
-            if login.get("success") is not True:
-                raise ZhenyingSignError("会话未通过登录预检，请重新登录并更新 Cookie")
+            # 1) 查询签到状态 + csrf_token（只读）
+            state = self._init_state(session)
 
-            # 2) 查询今日签到状态（若 login_status 带 checkin 字段）
-            inner = login.get("data") if isinstance(login.get("data"), dict) else {}
-            checked = inner.get("checkin_today") or inner.get("checkin") \
-                or inner.get("is_checked_in")
-            if checked is True or checked == today or str(checked) == "1":
-                return {"state": "success", "already": True}
+            # 2) 今日已签到 → 直接返回
+            if state.get("has_checked_today") is True:
+                return {"state": "success", "already": True,
+                        "points": state.get("points"),
+                        "streak": state.get("continuous_days")}
 
             # 3) 提交前写 pending 标记（防重复）
             if mark_pending is not None:
                 mark_pending()
 
-            # 4) 提交签到：帧影签到为 POST api/checkin.php（浏览器为表单提交）
+            # 4) 提交签到：POST ?action=checkin，multipart 表单带 csrf_token
+            #    （前端用 FormData 即 multipart/form-data，实测 urlencoded 会被
+            #    站点判「操作过于频繁」，必须用 files= 发 multipart 才正确）
+            csrf = state.get("csrf_token") or ""
             if httpx is not None:
-                resp2 = session.post(self.BASE + "/api/checkin.php")
+                resp2 = session.post(
+                    self.BASE + "/api/checkin.php",
+                    params={"action": "checkin"},
+                    files={"csrf_token": (None, csrf)},
+                )
             else:
-                resp2 = session.post(self.BASE + "/api/checkin.php")
+                resp2 = session.post(
+                    self.BASE + "/api/checkin.php",
+                    params={"action": "checkin"},
+                    files={"csrf_token": (None, csrf)},
+                )
             if resp2.status_code == 302 or (hasattr(resp2, "url")
                                             and str(resp2.url).endswith("login.php")):
                 raise ZhenyingSignError("签到请求被重定向到登录页，请更新 Cookie")
@@ -220,13 +243,23 @@ class ZhenyingSigner:
             result = data.get("data")
             if isinstance(result, dict):
                 earned = result.get("points") or result.get("earned") \
-                    or result.get("reward") or result.get("score")
-                points = result.get("total_points") or result.get("points") \
-                    or result.get("score")
-                streak = result.get("streak") or result.get("continuous_days") \
+                    or result.get("reward")
+                points = result.get("total_points") or result.get("points")
+                streak = result.get("continuous_days") or result.get("streak") \
                     or result.get("days")
             else:
                 earned = points = streak = None
+
+            # 5) 签到成功后再拉一次状态，回读准确的总积分/连续天数
+            try:
+                after = self._init_state(session)
+                if points is None:
+                    points = after.get("points")
+                if streak is None:
+                    streak = after.get("continuous_days")
+            except ZhenyingSignError:
+                pass  # 回读失败不阻断，保留已确认的签到成功
+
             return {"state": "success",
                     "earned": earned, "points": points, "streak": streak}
         finally:
