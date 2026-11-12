@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -361,33 +361,62 @@ class Subx115(_PluginBase):
 
     @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
-        """生成单个渠道配置页的字段（版式参照 subx：账号认证 | 搜索与设置）。"""
+        """按渠道分发到各自专属字段方法（版式对应 subx 原版各渠道页）。"""
+        key = ch["key"]
+        builder = {
+            "juying": cls._juying_fields,
+            "jumi": cls._jumi_fields,
+            "guanying": cls._guanying_fields,
+            "zhenying": cls._zhenying_fields,
+            "woniu": cls._woniu_fields,
+            "quanyi": cls._quanyi_fields,
+        }.get(key)
+        if builder is not None:
+            return builder(ch)
+        return cls._default_channel_fields(ch)
+
+    # ---- 表单构造 helper ---------------------------------------------------
+
+    @staticmethod
+    def _f_text(model: str, label: str, **props) -> dict:
+        return {"component": "VTextField",
+                "props": {"model": model, "label": label, **props}}
+
+    @staticmethod
+    def _f_area(model: str, label: str, rows: int = 3, **props) -> dict:
+        return {"component": "VTextarea",
+                "props": {"model": model, "label": label, "rows": rows, **props}}
+
+    @staticmethod
+    def _f_col(cols: int, md: int, node: dict) -> dict:
+        return {"component": "VCol", "props": {"cols": cols, "md": md},
+                "content": [node]}
+
+    @staticmethod
+    def _f_header(text: str) -> dict:
+        # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
+        return {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
+                "text": text}
+
+    @staticmethod
+    def _f_switch(model: str, label: str) -> dict:
+        return {"component": "VSwitch",
+                "props": {"model": model, "label": label, "color": "deep-purple"}}
+
+    @classmethod
+    def _default_channel_fields(cls, ch: dict) -> list[dict]:
+        """未单独定制的渠道（栖影/癫影）使用的通用版式。"""
         key = ch["key"]
         short = ch.get("short", ch["name"])
 
         def _text(model: str, label: str, **props) -> dict:
-            return {"component": "VTextField",
-                    "props": {"model": model, "label": label, **props}}
+            return cls._f_text(model, label, **props)
 
         def _area(model: str, label: str, rows: int = 3) -> dict:
-            return {"component": "VTextarea",
-                    "props": {"model": model, "label": label, "rows": rows}}
+            return cls._f_area(model, label, rows)
 
         def _col(cols: int, md: int, node: dict) -> dict:
-            return {"component": "VCol", "props": {"cols": cols, "md": md},
-                    "content": [node]}
-
-        def _header(text: str) -> dict:
-            # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
-            return {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
-                    "text": text}
-
-        def _area_cookie(k: str, s: str) -> tuple[dict]:
-            # 癫影页 Cookie 放在下方专属区块（OpenAPI Key / UA 之后），此处跳过
-            if k == "dianying":
-                return ()
-            return (_area(f"{k}_cookie",
-                          f"{s} Cookie（可选，浏览器登录后复制）", rows=2),)
+            return cls._f_col(cols, md, node)
 
         fields = [
             {
@@ -404,8 +433,7 @@ class Subx115(_PluginBase):
                     _col(12, 4, cls._site_action_buttons()),
                 ],
             },
-            # 账号认证（与 subx 渠道页一致：用户名 / 密码 / Cookie）
-            _header("账号认证"),
+            cls._f_header("账号认证"),
             {
                 "component": "VRow",
                 "content": [
@@ -415,17 +443,15 @@ class Subx115(_PluginBase):
                                       type="password", placeholder=f"{short}密码")),
                 ],
             },
-            *_area_cookie(key, short),
-            # 搜索与设置（转存目录统一在「115设置」页；包含/排除关键词
-            # 统一在「资源搜索」页，渠道页不再重复）
-            _header("搜索与设置"),
+            *([] if key == "dianying" else
+              [_area(f"{key}_cookie",
+                     f"{short} Cookie（可选，浏览器登录后复制）", rows=2)]),
+            cls._f_header("搜索与设置"),
             {
                 "component": "VRow",
                 "content": [
-                    _col(12, 6, {"component": "VSwitch",
-                                 "props": {"model": f"{key}_enabled",
-                                           "label": f"启用{short}搜索",
-                                           "color": "deep-purple"}}),
+                    _col(12, 6, cls._f_switch(f"{key}_enabled",
+                                              f"启用{short}搜索")),
                     _col(12, 6, _text(f"{key}_limit", "单次处理条数",
                                       placeholder="20")),
                 ],
@@ -438,6 +464,171 @@ class Subx115(_PluginBase):
         if key == "dianying":
             fields.extend(cls._dianying_fields())
         return fields
+
+    # ---- 各渠道专属字段（版式对应 subx 原版各渠道配置页） -------------------
+
+    @classmethod
+    def _juying_fields(cls, ch: dict) -> list[dict]:
+        """聚影：App Key / 账号密码 / 签到（普通|幸运）+ 抽奖。"""
+        return [
+            cls._f_text("juying_apikey", "聚影 App Key",
+                        placeholder="填入你的聚影 App Key"),
+            cls._f_text("juying_username", "聚影账号", placeholder="用户名"),
+            cls._f_text("juying_password", "聚影密码", type="password",
+                        placeholder="密码"),
+            cls._f_switch("juying_enabled", "启用聚影搜索"),
+            cls._f_switch("juying_sign_enabled", "启用每日自动签到"),
+            cls._f_switch("juying_sign_draw", "签到后自动抽奖"),
+            {
+                "component": "VSelect",
+                "props": {
+                    "model": "juying_sign_mode", "label": "签到方式",
+                    "items": [
+                        {"title": "普通签到", "value": "normal"},
+                        {"title": "幸运签到", "value": "lucky"},
+                    ],
+                },
+            },
+            cls._f_text("juying_sign_cron", "签到 Cron 表达式",
+                        placeholder="12 8 * * *",
+                        hint="默认每天 08:12 执行一次，按北京时间"
+                             "（Asia/Shanghai）解释。"),
+        ]
+
+    @classmethod
+    def _jumi_fields(cls, ch: dict) -> list[dict]:
+        """剧迷：站点地址 / 用户名密码 / Cookie / 显示标签 + 签到。"""
+        return [
+            {
+                "component": "VAlert",
+                "props": {"type": "warning", "variant": "tonal",
+                          "density": "compact",
+                          "text": "剧迷登录需要验证码，自动签到建议使用浏览器登录后"
+                                  "的 Cookie；若后端或 Docker 网络被 Cloudflare"
+                                  "拦截，搜索和签到会返回防护提示。"},
+            },
+            cls._f_text("jumi_site", "站点地址",
+                        placeholder="https://www.gimy115.top/"),
+            cls._f_text("jumi_username", "用户名", placeholder="剧迷账号"),
+            cls._f_text("jumi_password", "密码", type="password",
+                        placeholder="剧迷密码"),
+            cls._f_area("jumi_cookie", "Cookie", rows=3,
+                        placeholder="PHPSESSID=...; ...",
+                        hint="在浏览器登录剧迷后，从请求头复制 Cookie；账号密码"
+                             "因验证码限制通常不能直接自动登录。"),
+            cls._f_switch("jumi_show_tag", "在影视资源站中显示“剧迷”标签"),
+            cls._f_switch("jumi_sign_enabled", "启用每日自动签到"),
+            cls._f_text("jumi_sign_cron", "签到 Cron 表达式",
+                        placeholder="15 9 * * *",
+                        hint="默认每天 09:15 执行一次，按北京时间"
+                             "（Asia/Shanghai）解释。"),
+        ]
+
+    @classmethod
+    def _guanying_fields(cls, ch: dict) -> list[dict]:
+        """观影：用户名密码 / Cookie / 显示标签（镜像自动切换 + 保活）。"""
+        return [
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact",
+                          "text": "观影会自动选择可用镜像并在后台刷新登录态；搜索会优先"
+                                  "使用上次成功的镜像，失败时再尝试备用地址。"},
+            },
+            cls._f_text("guanying_username", "用户名", placeholder="观影账号"),
+            cls._f_text("guanying_password", "密码", type="password",
+                        placeholder="观影密码"),
+            cls._f_area("guanying_cookie", "Cookie", rows=3,
+                        placeholder="浏览器登录观影后，从请求头复制 Cookie；"
+                                    "遇到验证码或风控时可使用",
+                        hint="账号密码登录遇到验证码时，可手动填 Cookie；保存后"
+                             "搜索和后台保活会优先使用 Cookie。"),
+            cls._f_switch("guanying_show_tag", "在影视资源站中显示“观影”标签"),
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact",
+                          "text": "测试登录态成功后，系统会保存后台 Cookie；定时保活"
+                                  "会继续刷新 Cookie。验证码场景可用上方 Cookie"
+                                  "兜底。"},
+            },
+        ]
+
+    @classmethod
+    def _zhenying_fields(cls, ch: dict) -> list[dict]:
+        """帧影：站点地址 / 邮箱密码 / Cookie / 显示标签 + 签到。"""
+        return [
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact",
+                          "text": "帧影搜索会读取详情页中的 115、磁力和 ed2k 链接，"
+                                  "并过滤其他网盘；积分资源不会自动购买。"},
+            },
+            cls._f_text("zhenying_site", "站点地址",
+                        placeholder="https://framehdr.com/"),
+            cls._f_text("zhenying_username", "用户名 / 邮箱",
+                        placeholder="帧影账号邮箱"),
+            cls._f_text("zhenying_password", "密码", type="password",
+                        placeholder="帧影密码"),
+            cls._f_area("zhenying_cookie", "Cookie", rows=3,
+                        placeholder="wangpan_session=...; remember_me=...;",
+                        hint="可使用账号密码自动登录；如果遇到验证码或风控，"
+                             "可在浏览器登录后复制 Cookie。"),
+            cls._f_switch("zhenying_show_tag", "在影视资源站中显示“帧影”标签"),
+            cls._f_switch("zhenying_sign_enabled", "启用每日自动签到"),
+            cls._f_text("zhenying_sign_cron", "签到 Cron 表达式",
+                        placeholder="18 9 * * *",
+                        hint="默认每天 09:18 执行一次，按北京时间"
+                             "（Asia/Shanghai）解释。"),
+        ]
+
+    @classmethod
+    def _woniu_fields(cls, ch: dict) -> list[dict]:
+        """蜗牛4K：账号认证 | 搜索与签到（两分区卡片）。"""
+        return [
+            cls._f_header("账号认证"),
+            cls._f_text("woniu_username", "用户名"),
+            cls._f_text("woniu_password", "密码", type="password",
+                        placeholder="填写登录密码"),
+            cls._f_area("woniu_cookie", "Cookie（可选）", rows=3,
+                        placeholder="浏览器 Cookie"),
+            cls._f_header("搜索与签到"),
+            cls._f_switch("woniu_show_tag", "在影视资源站中显示"),
+            cls._f_switch("woniu_sign_enabled", "自动签到"),
+            cls._f_text("woniu_sign_cron", "签到 Cron",
+                        placeholder="20 8 * * *"),
+        ]
+
+    @classmethod
+    def _quanyi_fields(cls, ch: dict) -> list[dict]:
+        """权益宝：账号认证 | 搜索与签到（邮箱用户名 / 密码 / Cookie）。"""
+        return [
+            cls._f_header("账号认证"),
+            cls._f_text("quanyi_username", "邮箱 / 用户名"),
+            cls._f_text("quanyi_password", "密码", type="password",
+                        placeholder="填写登录密码"),
+            cls._f_area("quanyi_cookie", "Cookie（可选）", rows=3,
+                        placeholder="可补充浏览器登录后的完整 Cookie",
+                        hint="先保存并测试账号。如遇网站登录验证，可在浏览器完成"
+                             "验证后补充 Cookie。密码和 Cookie 保存后不会回填。"),
+            cls._f_header("搜索与签到"),
+            cls._f_switch("quanyi_show_tag", "在影视资源站中显示"),
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "density": "compact",
+                          "text": "先匹配 TMDb 影视信息，再检索站内资源；只展示 115"
+                                  "分享、115 秒传、磁力和 ED2K 链接。115 分享、"
+                                  "磁力和 ED2K 可转存；秒传链接请复制后使用秒传"
+                                  "工具。需积分的资源会先显示价格，由你确认解锁。"
+                                  "也可从「资源搜索 → 资源站聚合」选择权益宝。"},
+            },
+            cls._f_switch("quanyi_sign_enabled", "自动签到"),
+            cls._f_text("quanyi_sign_cron", "签到 Cron",
+                        placeholder="25 8 * * *",
+                        hint="默认每天 08:25，按 SubX 配置的时区执行。"),
+        ]
 
     @staticmethod
     def _dianying_fields() -> list[dict]:
@@ -801,6 +992,38 @@ class Subx115(_PluginBase):
             "dianying_sign_mode": "normal",
             "dianying_proxy_enabled": False,
             "dianying_proxy": "",
+        })
+
+        # 其余 6 个渠道专属默认值（版式对应 subx 原版各渠道页）
+        defaults.update({
+            # 聚影
+            "juying_apikey": "",
+            "juying_username": "",
+            "juying_password": "",
+            "juying_sign_enabled": False,
+            "juying_sign_draw": False,
+            "juying_sign_mode": "normal",
+            "juying_sign_cron": "12 8 * * *",
+            # 剧迷
+            "jumi_site": "https://www.gimy115.top/",
+            "jumi_show_tag": False,
+            "jumi_sign_enabled": False,
+            "jumi_sign_cron": "15 9 * * *",
+            # 观影
+            "guanying_show_tag": False,
+            # 帧影
+            "zhenying_site": "https://framehdr.com/",
+            "zhenying_show_tag": False,
+            "zhenying_sign_enabled": False,
+            "zhenying_sign_cron": "18 9 * * *",
+            # 蜗牛4K
+            "woniu_show_tag": False,
+            "woniu_sign_enabled": False,
+            "woniu_sign_cron": "20 8 * * *",
+            # 权益宝
+            "quanyi_show_tag": False,
+            "quanyi_sign_enabled": False,
+            "quanyi_sign_cron": "25 8 * * *",
         })
 
         defaults["tab"] = "search"
