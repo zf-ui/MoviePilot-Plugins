@@ -4,17 +4,14 @@ SubX115 — 网盘聚合签到（subx 的 MoviePilot 原生实现）
 ==========================================================
 
 把 subx（115 订阅工具，Docker 镜像 lmhhj/subx）的渠道配置原生搬进 MoviePilot。
-配置页只有 subx 原版的 8 个渠道页：聚影 / 栖影 / 剧迷 / 癫影 / 观影 /
-帧影 / 蜗牛4K / 权益宝（VTabs 垂直侧栏 + VWindow 面板，参照 subx 侧栏
-布局）；插件运行必需的全局参数（启用 / 通知 / 轮询周期 / 115 Cookie /
-默认转存目录）收敛为配置页顶部一条紧凑的全局设置栏，不占渠道页签。
-
-另整合了 JinxJie/MoviePilot-Plugins 的 hdhavensign：栖影（HDHaven）
-自动签到（预检 -> 查状态 -> 提交），配置放在「栖影配置」页内。
+配置页侧栏：资源搜索 / 115设置 / 8 个渠道页（聚影 / 栖影 / 剧迷 / 癫影 /
+观影 / 帧影 / 蜗牛4K / 权益宝），渠道页版式与 subx 原版一致
+（站点地址 / 账号 / 密码 / Cookie / 搜索开关），VTabs 垂直侧栏实现。
 
 运行流程：
   定时轮询（cron） -> 各启用渠道拉取最新 115 分享
-  -> 与 MoviePilot 订阅（片名+季）匹配 -> 去重 -> 转存到 115 -> 消息通知
+  -> 与 MoviePilot 订阅（片名+季）/ 资源搜索关键词匹配 -> 去重
+  -> 转存到 115 -> 消息通知
   栖影签到（cron） -> 登录预检 -> 查询今日状态 -> 未签到才提交 -> 通知
 """
 
@@ -69,7 +66,8 @@ try:
 except Exception:  # pragma: no cover
     _NT_PLUGIN = None
 
-from .channels import ADAPTER_CLASSES, ShareInfo, match_subscribes
+from .channels import (ADAPTER_CLASSES, ShareInfo, match_keywords,
+                       match_subscribes, split_lines)
 from .hdhaven import HDHavenSigner, HDHavenSignError, curl_cffi_available
 from .p115 import P115Client, P115Error
 
@@ -78,37 +76,46 @@ _HISTORY_MAX = 200
 
 
 class Subx115(_PluginBase):
-    """网盘聚合签到：subx 原版 8 个渠道配置页 + 栖影签到 + 自动转存 115。"""
+    """网盘聚合签到：资源搜索 + subx 原版 8 渠道配置页 + 栖影签到 + 自动转存。"""
 
     # ---- 插件元信息（与 package.v3.json 保持一致） ----
     plugin_name = "网盘聚合签到"
-    plugin_desc = ("聚影/栖影/剧迷/癫影/观影/帧影/蜗牛4K/权益宝八渠道配置页 + "
-                   "栖影（HDHaven）签到，匹配 MoviePilot 订阅并自动转存 115。")
+    plugin_desc = ("资源搜索 + 聚影/栖影/剧迷/癫影/观影/帧影/蜗牛4K/权益宝"
+                   "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
+                   "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.2.1"
-    plugin_author = "zf-ui"
-    author_url = "https://github.com/zf-ui"
+    plugin_version = "1.3.0"
+    plugin_author = "z0812"
+    author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
     plugin_order = 50
     auth_level = 1
 
     # ---- 渠道定义（对应 subx 侧栏的 8 个配置页） ----
     CHANNEL_DEFS = [
-        {"key": "juying", "name": "聚影配置", "icon": "mdi-movie-open",
+        {"key": "juying", "name": "聚影配置", "short": "聚影", "en": "JYing",
+         "color": "teal", "icon": "mdi-movie-open",
          "tip": "聚影资源站：填写 RSS / 导出接口地址；无 115 分享的消息自动忽略。"},
-        {"key": "hdhive", "name": "栖影配置", "icon": "mdi-earth",
+        {"key": "hdhive", "name": "栖影配置", "short": "栖影", "en": "HDHive",
+         "color": "green", "icon": "mdi-earth",
          "tip": "栖影（HDHaven）：填写 JSON 接口地址，需要账号时填 Cookie。"},
-        {"key": "jumi", "name": "剧迷配置", "icon": "mdi-movie-filter",
+        {"key": "jumi", "name": "剧迷配置", "short": "剧迷", "en": "Gimy",
+         "color": "orange", "icon": "mdi-movie-filter",
          "tip": "剧迷渠道：填写 RSS / 接口地址（一行一个可配多个来源）。"},
-        {"key": "dianying", "name": "癫影配置", "icon": "mdi-filmstrip",
+        {"key": "dianying", "name": "癫影配置", "short": "癫影", "en": "Dian115",
+         "color": "purple", "icon": "mdi-filmstrip",
          "tip": "癫影渠道：填写 RSS / 接口地址。"},
-        {"key": "guanying", "name": "观影配置", "icon": "mdi-cinema",
+        {"key": "guanying", "name": "观影配置", "short": "观影", "en": "GuanYing",
+         "color": "blue", "icon": "mdi-cinema",
          "tip": "观影渠道：填写 RSS / 接口地址。"},
-        {"key": "zhenying", "name": "帧影配置", "icon": "mdi-image-multiple",
+        {"key": "zhenying", "name": "帧影配置", "short": "帧影", "en": "FrameHDR",
+         "color": "indigo", "icon": "mdi-image-multiple",
          "tip": "帧影渠道：填写 RSS / 接口地址。"},
-        {"key": "woniu", "name": "蜗牛4K", "icon": "mdi-turtle",
+        {"key": "woniu", "name": "蜗牛4K", "short": "蜗牛4K", "en": "WN4K",
+         "color": "green", "icon": "mdi-turtle",
          "tip": "蜗牛4K：填写 JSON 接口地址（优先 4K 高画质资源）。"},
-        {"key": "quanyi", "name": "权益宝", "icon": "mdi-gift",
+        {"key": "quanyi", "name": "权益宝", "short": "权益宝", "en": "QuanYiBao",
+         "color": "orange", "icon": "mdi-gift",
          "tip": "权益宝：填写 JSON 接口地址。"},
     ]
 
@@ -119,6 +126,7 @@ class Subx115(_PluginBase):
     _cron = "0 */2 * * *"
     _p115_cookie = ""
     _p115_cid = "0"
+    _keywords: list[str] = []          # 资源搜索页配置的关键词
 
     # ---- 栖影（HDHaven）签到状态 ----
     _sign_enabled = False
@@ -148,6 +156,7 @@ class Subx115(_PluginBase):
         self._cron = str(config.get("cron") or "0 */2 * * *").strip()
         self._p115_cookie = str(config.get("p115_cookie") or "").strip()
         self._p115_cid = str(config.get("p115_cid") or "0").strip() or "0"
+        self._keywords = split_lines(config.get("search_keywords"))
 
         # 栖影（HDHaven）签到配置
         self._sign_enabled = bool(config.get("hdhive_sign_enabled"))
@@ -301,8 +310,9 @@ class Subx115(_PluginBase):
 
     @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
-        """生成单个渠道配置页的字段。"""
+        """生成单个渠道配置页的字段（版式参照 subx 原版渠道卡片）。"""
         key = ch["key"]
+        short = ch.get("short", ch["name"])
 
         def _text(model: str, label: str, **props) -> dict:
             return {"component": "VTextField",
@@ -315,7 +325,8 @@ class Subx115(_PluginBase):
         fields = [
             {
                 "component": "VSwitch",
-                "props": {"model": f"{key}_enabled", "label": f"启用{ch['name']}",
+                "props": {"model": f"{key}_enabled",
+                          "label": f"启用{short}搜索",
                           "color": "deep-purple"},
             },
             {
@@ -323,10 +334,28 @@ class Subx115(_PluginBase):
                 "props": {"type": "info", "variant": "tonal", "density": "compact",
                           "text": ch["tip"]},
             },
+            _text(f"{key}_site", "站点地址",
+                  placeholder=f"https://{ch.get('en', '').lower()}.com/  （可选）"),
             _text(f"{key}_api", "接口地址（API / RSS）",
-                  placeholder="https://...  留空则该渠道不参与轮询"),
-            _text(f"{key}_cookie", "凭证（Cookie / Token，可选）",
-                  type="password", hint="渠道需要登录时填写"),
+                  placeholder="https://...  留空则该渠道不参与搜索"),
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                        "content": [_text(f"{key}_username",
+                                          f"{short}账号 / 用户名",
+                                          placeholder=f"{short}账号")],
+                    },
+                    {
+                        "component": "VCol", "props": {"cols": 12, "md": 6},
+                        "content": [_text(f"{key}_password", f"{short}密码",
+                                          type="password",
+                                          placeholder=f"{short}密码")],
+                    },
+                ],
+            },
+            _area(f"{key}_cookie", "Cookie（可选，浏览器登录后复制）", rows=2),
             _area(f"{key}_channels", "订阅来源（一行一个，可选；与接口地址并用）"),
             _text(f"{key}_target", "转存目录（cid 或目录名，留空用全局）"),
             _area(f"{key}_include", "包含关键词（正则，一行一个，可选）", rows=2),
@@ -394,7 +423,7 @@ class Subx115(_PluginBase):
         ]
 
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
-        """返回配置页面 JSON 与默认配置模型（仅 subx 原版的 8 个渠道页）。"""
+        """返回配置页面 JSON 与默认配置模型（资源搜索 + 115设置 + 8 渠道页）。"""
         tabs: list[dict] = []
         windows: list[dict] = []
         defaults: dict[str, Any] = {
@@ -403,6 +432,7 @@ class Subx115(_PluginBase):
             "cron": "0 */2 * * *",
             "p115_cookie": "",
             "p115_cid": "0",
+            "search_keywords": "",
             # 栖影（HDHaven）签到
             "hdhive_sign_enabled": False,
             "hdhive_sign_onlyonce": False,
@@ -413,7 +443,121 @@ class Subx115(_PluginBase):
             "hdhive_sign_proxy": "",
         }
 
-        # 8 个渠道页（对应 subx 侧栏，仅此 8 个页签）
+        # ---- 页签 1：资源搜索（侧栏最上面） ----
+        site_checks: list[dict] = []
+        for ch in self.CHANNEL_DEFS:
+            defaults[f"search_{ch['key']}"] = True
+            site_checks.append({
+                "component": "VCol",
+                "props": {"cols": 6, "md": 3},
+                "content": [{
+                    "component": "VCheckbox",
+                    "props": {"model": f"search_{ch['key']}",
+                              "label": f"{ch['short']} {ch['en']}",
+                              "color": ch["color"], "density": "compact"},
+                }],
+            })
+        tabs.append({
+            "component": "VTab",
+            "props": {"value": "search", "prepend-icon": "mdi-magnify",
+                      "text": "资源搜索"},
+        })
+        windows.append({
+            "component": "VWindowItem",
+            "props": {"value": "search"},
+            "content": [
+                {
+                    "component": "VAlert",
+                    "props": {"type": "info", "variant": "tonal",
+                              "density": "compact",
+                              "text": "填写订阅关键词（一行一个）并勾选搜索站点后，"
+                                      "定时轮询会在勾选的站点中按关键词匹配资源"
+                                      "并自动转存 115；与 MoviePilot 订阅监控"
+                                      "并用，命中任一即转存。"},
+                },
+                {
+                    "component": "VTextarea",
+                    "props": {"model": "search_keywords", "rows": 4,
+                              "label": "搜索关键词（一行一个，留空则仅按订阅匹配）",
+                              "placeholder": "流浪地球 3\n三体 第二季"},
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol", "props": {"cols": 12},
+                            "content": [{
+                                "component": "VAlert",
+                                "props": {"type": "success", "variant": "tonal",
+                                          "density": "compact",
+                                          "text": "搜索站点 8/8：勾选参与"
+                                                  "关键词搜索的站点（默认全部）"},
+                            }],
+                        },
+                        *site_checks,
+                    ],
+                },
+            ],
+        })
+
+        # ---- 页签 2：115设置（全局参数，对应 subx「基础与账号」） ----
+        tabs.append({
+            "component": "VTab",
+            "props": {"value": "p115", "prepend-icon": "mdi-cloud-outline",
+                      "text": "115设置"},
+        })
+        windows.append({
+            "component": "VWindowItem",
+            "props": {"value": "p115"},
+            "content": [
+                {
+                    "component": "VAlert",
+                    "props": {"type": "warning", "variant": "tonal",
+                              "density": "compact",
+                              "text": "115 Cookie 属账号登录凭证，切勿外发；"
+                                      "失效后需在浏览器重新登录并复制。"},
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 3},
+                            "content": [{"component": "VSwitch", "props": {
+                                "model": "enabled", "label": "启用插件",
+                                "color": "deep-purple"}}],
+                        },
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 3},
+                            "content": [{"component": "VSwitch", "props": {
+                                "model": "notify", "label": "消息通知",
+                                "color": "deep-purple"}}],
+                        },
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 3},
+                            "content": [{"component": "VTextField", "props": {
+                                "model": "cron", "label": "轮询周期（cron）",
+                                "placeholder": "0 */2 * * *"}}],
+                        },
+                        {
+                            "component": "VCol", "props": {"cols": 12, "md": 3},
+                            "content": [{"component": "VTextField", "props": {
+                                "model": "p115_cid", "label": "默认转存目录 cid",
+                                "placeholder": "0（根目录）"}}],
+                        },
+                        {
+                            "component": "VCol", "props": {"cols": 12},
+                            "content": [{"component": "VTextField", "props": {
+                                "model": "p115_cookie", "label": "115 Cookie",
+                                "type": "password",
+                                "hint": "浏览器登录 115 后复制的完整 Cookie，"
+                                        "仅用于转存；渠道留空转存目录时落到上面的 cid"}}],
+                        },
+                    ],
+                },
+            ],
+        })
+
+        # ---- 页签 3+：8 个渠道页（对应 subx 侧栏「资源网站」） ----
         for ch in self.CHANNEL_DEFS:
             tabs.append({
                 "component": "VTab",
@@ -427,7 +571,10 @@ class Subx115(_PluginBase):
             })
             defaults.update({
                 f"{ch['key']}_enabled": False,
+                f"{ch['key']}_site": "",
                 f"{ch['key']}_api": "",
+                f"{ch['key']}_username": "",
+                f"{ch['key']}_password": "",
                 f"{ch['key']}_cookie": "",
                 f"{ch['key']}_channels": "",
                 f"{ch['key']}_target": "",
@@ -436,52 +583,12 @@ class Subx115(_PluginBase):
                 f"{ch['key']}_limit": "20",
             })
 
-        defaults["tab"] = "juying"
+        defaults["tab"] = "search"
 
         form = [{
             "component": "VForm",
             "content": [
-                # 顶部全局设置栏（不占渠道页签，渠道页与 subx 原版一致）
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                            "content": [{"component": "VSwitch", "props": {
-                                "model": "enabled", "label": "启用插件",
-                                "color": "deep-purple", "density": "compact"}}],
-                        },
-                        {
-                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                            "content": [{"component": "VSwitch", "props": {
-                                "model": "notify", "label": "消息通知",
-                                "color": "deep-purple", "density": "compact"}}],
-                        },
-                        {
-                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                            "content": [{"component": "VTextField", "props": {
-                                "model": "cron", "label": "轮询周期（cron）",
-                                "placeholder": "0 */2 * * *",
-                                "density": "compact"}}],
-                        },
-                        {
-                            "component": "VCol", "props": {"cols": 12, "md": 3},
-                            "content": [{"component": "VTextField", "props": {
-                                "model": "p115_cid", "label": "默认转存目录 cid",
-                                "placeholder": "0（根目录）",
-                                "density": "compact"}}],
-                        },
-                        {
-                            "component": "VCol", "props": {"cols": 12},
-                            "content": [{"component": "VTextField", "props": {
-                                "model": "p115_cookie", "label": "115 Cookie",
-                                "type": "password", "density": "compact",
-                                "hint": "浏览器登录 115 后复制的完整 Cookie，"
-                                        "仅用于转存；渠道留空转存目录时落到上面的 cid"}}],
-                        },
-                    ],
-                },
-                # 8 个渠道页（VTabs 垂直侧栏，参照 subx 侧栏布局）
+                # 左侧导航 + 右侧面板（参照 subx 侧栏布局）
                 {
                     "component": "VRow",
                     "content": [
@@ -604,13 +711,17 @@ class Subx115(_PluginBase):
             return
         logger.info("SubX115：开始渠道轮询")
 
-        # 1) 收集可用渠道适配器
+        # 1) 收集可用渠道适配器（渠道启用开关 + 资源搜索页站点勾选同时生效）
         adapters = []
         for key, adapter_cls in ADAPTER_CLASSES.items():
             adapter = adapter_cls(self._config)
+            if not bool(self._config.get(f"{key}_enabled")):
+                continue
+            if not bool(self._config.get(f"search_{key}", True)):
+                continue
             if adapter.available():
                 adapters.append(adapter)
-            elif bool(self._config.get(f"{key}_enabled")):
+            else:
                 logger.warning(f"SubX115：渠道 {adapter.name} 已启用但未配置"
                                f"接口地址/来源，跳过")
         if not adapters:
@@ -630,10 +741,11 @@ class Subx115(_PluginBase):
             logger.info("SubX115：本轮各渠道均无新资源")
             return
 
-        # 3) 匹配目标（MoviePilot 订阅：片名 + 季）
+        # 3) 匹配目标（MoviePilot 订阅：片名 + 季；资源搜索页关键词并用）
         subscribes = self._get_subscribes()
-        if not subscribes:
-            logger.warning("SubX115：未能读取 MoviePilot 订阅列表，本轮跳过匹配")
+        if not subscribes and not self._keywords:
+            logger.warning("SubX115：未能读取 MoviePilot 订阅列表，且资源搜索"
+                           "未配置关键词，本轮跳过匹配")
             return
         history = self.get_data("history") or []
         done_keys = {h.get("key") for h in history}
@@ -641,11 +753,13 @@ class Subx115(_PluginBase):
         for share in shares:
             if share.key in done_keys:
                 continue
-            hits = match_subscribes(share, subscribes)
+            hits = match_subscribes(share, subscribes) if subscribes else []
             if hits:
                 matched.append((share, hits[0]))
+            elif self._keywords and match_keywords(share, self._keywords):
+                matched.append((share, None))
         if not matched:
-            logger.info("SubX115：本轮没有匹配到订阅的新资源")
+            logger.info("SubX115：本轮没有匹配到订阅/关键词的新资源")
             return
 
         # 4) 转存（限流防风控）
