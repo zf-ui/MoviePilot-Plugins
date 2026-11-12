@@ -1,0 +1,10 @@
+[project]
+name = "subx115"
+description = "网盘聚合签到（SubX115）：八渠道订阅 + 栖影（HDHaven）签到 + 115 自动转存"
+dynamic = ["version"]
+requires-python = ">=3.11"
+dependencies = [
+    # 栖影（HDHaven）签到需要 chrome TLS 指纹模拟；未安装时签到自动禁用，
+    # 渠道订阅功能不受影响（延迟导入，非核心依赖降级）。
+    "curl_cffi>=0.6",
+]

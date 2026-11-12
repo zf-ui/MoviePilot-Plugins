@@ -1,4 +1,20 @@
 {
+  "Subx115": {
+    "name": "网盘聚合签到",
+    "description": "聚影/栖影/剧迷/癫影/观影/帧影/蜗牛4K/权益宝八渠道配置页 + 栖影（HDHaven）自动签到，匹配 MoviePilot 订阅并自动转存 115。",
+    "labels": "115,订阅,网盘,签到",
+    "version": "1.2.1",
+    "icon": "Moviepilot_A.png",
+    "author": "zf-ui",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.2.1": "插件更名为「网盘聚合签到」；渠道「影巢」统一更名为「栖影」（HDHaven）。",
+      "v1.2.0": "整合 hdhavensign：栖影（HDHaven）自动签到（预检/防重复扣账/通知），配置在栖影配置页；新增 /subx_sign 命令与 curl_cffi 依赖。",
+      "v1.1.0": "配置页收敛为 subx 原版的 8 个渠道页；全局参数移至顶部设置栏；移除订阅监控/通用设置/115网盘独立页签。",
+      "v1.0.0": "首次发布：八渠道配置 + MoviePilot 订阅监控 + 115 自动转存 + 消息通知。"
+    }
+  },
   "CnlangSigninV3": {
     "name": "国语视界签到V3",
     "description": "国语视界（cnlang.org）自动签到助手：支持定时签到、随机延迟、系统代理、多种通知样式与签到历史统计。",
