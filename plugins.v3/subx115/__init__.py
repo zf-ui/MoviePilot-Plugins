@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -310,7 +310,7 @@ class Subx115(_PluginBase):
 
     @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
-        """生成单个渠道配置页的字段（版式参照 subx 原版渠道卡片）。"""
+        """生成单个渠道配置页的字段（版式参照 subx：账号认证 | 搜索与设置）。"""
         key = ch["key"]
         short = ch.get("short", ch["name"])
 
@@ -322,45 +322,71 @@ class Subx115(_PluginBase):
             return {"component": "VTextarea",
                     "props": {"model": model, "label": label, "rows": rows}}
 
+        def _col(cols: int, md: int, node: dict) -> dict:
+            return {"component": "VCol", "props": {"cols": cols, "md": md},
+                    "content": [node]}
+
+        def _header(text: str) -> dict:
+            # 分区标题：顶层 text 渲染为插槽内容（FormRender 通用机制）
+            return {"component": "VCardTitle", "props": {"class": "px-0 py-2"},
+                    "text": text}
+
         fields = [
-            {
-                "component": "VSwitch",
-                "props": {"model": f"{key}_enabled",
-                          "label": f"启用{short}搜索",
-                          "color": "deep-purple"},
-            },
             {
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal", "density": "compact",
                           "text": ch["tip"]},
             },
-            _text(f"{key}_site", "站点地址",
-                  placeholder=f"https://{ch.get('en', '').lower()}.com/  （可选）"),
-            _text(f"{key}_api", "接口地址（API / RSS）",
-                  placeholder="https://...  留空则该渠道不参与搜索"),
+            # 站点与接口
             {
                 "component": "VRow",
                 "content": [
-                    {
-                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                        "content": [_text(f"{key}_username",
-                                          f"{short}账号 / 用户名",
-                                          placeholder=f"{short}账号")],
-                    },
-                    {
-                        "component": "VCol", "props": {"cols": 12, "md": 6},
-                        "content": [_text(f"{key}_password", f"{short}密码",
-                                          type="password",
-                                          placeholder=f"{short}密码")],
-                    },
+                    _col(12, 6, _text(f"{key}_site", "站点地址",
+                                      placeholder="https://...")),
+                    _col(12, 6, _text(f"{key}_api", "接口地址（API / RSS）",
+                                      placeholder="https://...  留空则该渠道不参与搜索")),
+                ],
+            },
+            # 账号认证（与 subx 渠道页一致：用户名 / 密码 / Cookie）
+            _header("账号认证"),
+            {
+                "component": "VRow",
+                "content": [
+                    _col(12, 6, _text(f"{key}_username", f"{short}账号 / 用户名",
+                                      placeholder=f"{short}账号")),
+                    _col(12, 6, _text(f"{key}_password", f"{short}密码",
+                                      type="password", placeholder=f"{short}密码")),
                 ],
             },
             _area(f"{key}_cookie", "Cookie（可选，浏览器登录后复制）", rows=2),
+            # 搜索与设置
+            _header("搜索与设置"),
+            {
+                "component": "VRow",
+                "content": [
+                    _col(12, 6, {"component": "VSwitch",
+                                 "props": {"model": f"{key}_enabled",
+                                           "label": f"启用{short}搜索",
+                                           "color": "deep-purple"}}),
+                    _col(12, 6, _text(f"{key}_target", "转存目录（cid 或目录名，留空用全局）")),
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    _col(12, 6, _text(f"{key}_limit", "单次处理条数", placeholder="20")),
+                ],
+            },
             _area(f"{key}_channels", "订阅来源（一行一个，可选；与接口地址并用）"),
-            _text(f"{key}_target", "转存目录（cid 或目录名，留空用全局）"),
-            _area(f"{key}_include", "包含关键词（正则，一行一个，可选）", rows=2),
-            _area(f"{key}_exclude", "排除关键词（正则，一行一个，可选）", rows=2),
-            _text(f"{key}_limit", "单次处理条数", placeholder="20"),
+            {
+                "component": "VRow",
+                "content": [
+                    _col(12, 6, _area(f"{key}_include",
+                                      "包含关键词（正则，一行一个，可选）", rows=2)),
+                    _col(12, 6, _area(f"{key}_exclude",
+                                      "排除关键词（正则，一行一个，可选）", rows=2)),
+                ],
+            },
         ]
         # 栖影（HDHaven）页额外包含签到配置（整合自 hdhavensign 插件）
         if key == "hdhive":
@@ -444,6 +470,15 @@ class Subx115(_PluginBase):
         }
 
         # ---- 页签 1：资源搜索（侧栏最上面） ----
+        # 注意：MoviePilot 渲染器把节点顶层 text 渲染为插槽内容（见
+        # FormRender.vue 的 {{ formItem.text }}），VTab 文字必须用顶层
+        # text 而不是 props.text，否则在部分宿主上不显示。
+        tabs.append({
+            "component": "VTab",
+            "props": {"value": "search", "prepend-icon": "mdi-magnify",
+                      "style": {"text-transform": "none"}},
+            "text": "资源搜索",
+        })
         site_checks: list[dict] = []
         for ch in self.CHANNEL_DEFS:
             defaults[f"search_{ch['key']}"] = True
@@ -504,7 +539,8 @@ class Subx115(_PluginBase):
         tabs.append({
             "component": "VTab",
             "props": {"value": "p115", "prepend-icon": "mdi-cloud-outline",
-                      "text": "115设置"},
+                      "style": {"text-transform": "none"}},
+            "text": "115设置",
         })
         windows.append({
             "component": "VWindowItem",
@@ -562,7 +598,8 @@ class Subx115(_PluginBase):
             tabs.append({
                 "component": "VTab",
                 "props": {"value": ch["key"], "prepend-icon": ch["icon"],
-                          "text": ch["name"]},
+                          "style": {"text-transform": "none"}},
+                "text": ch["name"],
             })
             windows.append({
                 "component": "VWindowItem",
@@ -603,6 +640,7 @@ class Subx115(_PluginBase):
                                     "color": "deep-purple",
                                     "density": "comfortable",
                                     "align-tabs": "start",
+                                    "style": {"width": "100%"},
                                 },
                                 "content": tabs,
                             }],
