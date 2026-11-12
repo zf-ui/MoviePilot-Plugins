@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.2"
+    plugin_version = "1.6.3"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -353,8 +353,7 @@ class Subx115(_PluginBase):
                 "component": "VBtn",
                 "props": {
                     "color": color, "variant": variant,
-                    "prepend-icon": "mdi-check", "size": "small",
-                    "class": extra_class,
+                    "size": "small", "class": extra_class,
                     "onclick": (
                         "(e) => { window.MoviePilotAPI.get('plugin/" + plugin
                         + "/" + api + "').then(function(r){ "
@@ -372,7 +371,7 @@ class Subx115(_PluginBase):
                             "ml-2" if has_sign else ""))
         return {
             "component": "VRow",
-            "props": {"justify": "end", "align": "center"},
+            "props": {"justify": "end", "align": "center", "class": "mb-3"},
             "content": buttons,
         }
 
@@ -383,20 +382,18 @@ class Subx115(_PluginBase):
         # 仅「观影」无签到功能，只显示「测试登录」
         has_sign = key != "guanying"
         tip = ch.get("tip", "")
-        lines = [ln.strip() for ln in tip.split("\n") if ln.strip()]
-        tip_content = [
-            {"component": "div",
-             "props": {"class": "mb-1" if i < len(lines) - 1 else ""},
-             "text": ln}
-            for i, ln in enumerate(lines)
-        ]
+        # 用 text + white-space: pre-line 让 \\n 正确换行，两行在信息图标右侧
+        # 同一左边界对齐（比 content 多 div 更稳定，不会第二行错位）
         return [
             cls._site_action_buttons(has_sign),
             {
                 "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal",
-                          "density": "compact"},
-                "content": tip_content,
+                "props": {
+                    "type": "info", "variant": "tonal", "density": "compact",
+                    "text": tip,
+                    "style": {"white-space": "pre-line"},
+                    "class": "mb-2",
+                },
             },
         ]
 
