@@ -217,6 +217,8 @@ class ChannelAdapter:
         config = config or {}
         self.config = config
         self.enabled = bool(config.get(f"{self.key}_enabled"))
+        # 站点地址为主来源；兼容旧配置的接口地址（{key}_api）作为附加来源
+        self.site = str(config.get(f"{self.key}_site") or "").strip()
         self.api = str(config.get(f"{self.key}_api") or "").strip()
         self.cookie = str(config.get(f"{self.key}_cookie") or "").strip()
         self.sources = split_lines(config.get(f"{self.key}_channels"))
@@ -233,11 +235,11 @@ class ChannelAdapter:
     # -- 基础判断 ----------------------------------------------------------
 
     def available(self) -> bool:
-        """启用且至少配置了接口地址或来源列表。"""
-        return self.enabled and bool(self.api or self.sources)
+        """启用且至少配置了站点地址、接口地址或来源列表。"""
+        return self.enabled and bool(self.site or self.api or self.sources)
 
     def _urls(self) -> list[str]:
-        urls = [u for u in ([self.api] + self.sources) if u]
+        urls = [u for u in ([self.site, self.api] + self.sources) if u]
         # 去重保序
         return list(dict.fromkeys(urls))
 

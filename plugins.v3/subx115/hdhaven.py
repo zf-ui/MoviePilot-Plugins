@@ -123,6 +123,34 @@ class HDHavenSigner:
 
     # -- 主流程 ------------------------------------------------------------
 
+    def check_login(self) -> dict:
+        """
+        仅做登录预检（只读请求 /api/auth/me），用于「测试登录」按钮。
+
+        :return: {"ok": True, "user": {...}} 或 {"ok": False, "message": ...}
+        :raises HDHavenSignError: 请求/解析异常（不泄露 Cookie）
+        """
+        session = self._session()
+        try:
+            me = session.get(self.BASE + "/api/auth/me", timeout=self.timeout)
+            account = self._decode(me)
+            data = account.get("data") if isinstance(account, dict) else None
+            has_account = isinstance(data, dict) and bool(data.get("id"))
+            if me.status_code != 200 or account.get("success") is not True \
+                    or not has_account:
+                return {"ok": False,
+                        "message": "会话未通过登录预检，请重新登录并更新 Cookie"}
+            return {"ok": True, "user": {
+                "id": data.get("id"),
+                "name": data.get("username") or data.get("name"),
+                "checkin_today": data.get("checkin_today"),
+            }}
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
     def signin(self, mark_pending: Optional[Callable[[], None]] = None) -> dict:
         """
         执行签到。

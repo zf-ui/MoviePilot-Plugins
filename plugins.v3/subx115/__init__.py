@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -94,31 +94,32 @@ class Subx115(_PluginBase):
     # ---- 渠道定义（对应 subx 侧栏的 8 个配置页） ----
     CHANNEL_DEFS = [
         {"key": "juying", "name": "聚影配置", "short": "聚影", "en": "JYing",
-         "color": "teal", "icon": "mdi-movie-open",
-         "tip": "聚影资源站：填写 RSS / 导出接口地址；无 115 分享的消息自动忽略。"},
+         "color": "teal", "icon": "mdi-movie-open", "site": "https://jying.top",
+         "tip": "聚影资源站：填写站点地址与账号即可参与搜索，"
+                "无 115 分享的消息自动忽略。"},
         {"key": "hdhive", "name": "栖影配置", "short": "栖影", "en": "HDHive",
-         "color": "green", "icon": "mdi-earth",
-         "tip": "栖影（HDHaven）：填写 JSON 接口地址，需要账号时填 Cookie。"},
+         "color": "green", "icon": "mdi-earth", "site": "https://hdhaven.com",
+         "tip": "栖影（HDHaven）：填写站点地址与登录会话 Cookie（含 hdh_session）。"},
         {"key": "jumi", "name": "剧迷配置", "short": "剧迷", "en": "Gimy",
-         "color": "orange", "icon": "mdi-movie-filter",
-         "tip": "剧迷渠道：填写 RSS / 接口地址（一行一个可配多个来源）。"},
+         "color": "orange", "icon": "mdi-movie-filter", "site": "",
+         "tip": "剧迷渠道：填写站点地址与账号。"},
         {"key": "dianying", "name": "癫影配置", "short": "癫影", "en": "Dian115",
-         "color": "purple", "icon": "mdi-filmstrip",
+         "color": "purple", "icon": "mdi-filmstrip", "site": "https://m.dian115.com",
          "tip": "OpenAPI Key 优先用于癫影搜索、解锁和签到；没有 Key 时可填写"
                 "浏览器 Cookie 作为普通网页模式兜底，遇到站点防护会提示重新登录。"
                 "普通 Cookie 模式只提取网页已返回的 115、磁力、ed2k 明文链接。"},
         {"key": "guanying", "name": "观影配置", "short": "观影", "en": "GuanYing",
-         "color": "blue", "icon": "mdi-cinema",
-         "tip": "观影渠道：填写 RSS / 接口地址。"},
+         "color": "blue", "icon": "mdi-cinema", "site": "",
+         "tip": "观影渠道：填写站点地址与账号。"},
         {"key": "zhenying", "name": "帧影配置", "short": "帧影", "en": "FrameHDR",
-         "color": "indigo", "icon": "mdi-image-multiple",
-         "tip": "帧影渠道：填写 RSS / 接口地址。"},
+         "color": "indigo", "icon": "mdi-image-multiple", "site": "https://framehdr.com",
+         "tip": "帧影渠道：填写站点地址与账号。"},
         {"key": "woniu", "name": "蜗牛4K", "short": "蜗牛4K", "en": "WN4K",
-         "color": "green", "icon": "mdi-turtle",
-         "tip": "蜗牛4K：填写 JSON 接口地址（优先 4K 高画质资源）。"},
+         "color": "green", "icon": "mdi-turtle", "site": "",
+         "tip": "蜗牛4K：填写站点地址与账号（优先 4K 高画质资源）。"},
         {"key": "quanyi", "name": "权益宝", "short": "权益宝", "en": "QuanYiBao",
-         "color": "orange", "icon": "mdi-gift",
-         "tip": "权益宝：填写 JSON 接口地址。"},
+         "color": "orange", "icon": "mdi-gift", "site": "",
+         "tip": "权益宝：填写站点地址与账号。"},
     ]
 
     # ---- 运行状态 ----
@@ -292,8 +293,22 @@ class Subx115(_PluginBase):
             self._send_message("【SubX115】栖影签到", str(result.get("message")))
 
     def get_api(self) -> list[dict[str, Any]]:
-        """对外注册只读 API（外部系统用 apikey 鉴权）。"""
+        """对外注册 API（配置页按钮 / 外部系统调用）。"""
         return [
+            {
+                "path": "/sign",
+                "endpoint": self.api_sign,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "立即执行栖影（HDHaven）签到",
+            },
+            {
+                "path": "/test_login",
+                "endpoint": self.api_test_login,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "测试栖影（HDHaven）登录态",
+            },
             {
                 "path": "/history",
                 "endpoint": self.api_history,
@@ -313,6 +328,36 @@ class Subx115(_PluginBase):
     # =====================================================================
     # 配置页面（Vuetify：VTabs 垂直侧栏，参照胖虎媒体中心布局）
     # =====================================================================
+
+    @staticmethod
+    def _site_action_buttons() -> dict:
+        """渠道页右上角「立即签到 / 测试登录」按钮（VBtn href 指向插件 API）。"""
+        return {
+            "component": "VRow",
+            "props": {"justify": "end"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "deep-purple", "variant": "tonal",
+                        "prepend-icon": "mdi-check", "size": "small",
+                        "href": "/api/v1/plugin/Subx115/sign",
+                        "target": "_blank",
+                    },
+                    "text": "立即签到",
+                },
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "grey", "variant": "outlined",
+                        "prepend-icon": "mdi-check", "size": "small",
+                        "href": "/api/v1/plugin/Subx115/test_login",
+                        "target": "_blank",
+                    },
+                    "text": "测试登录态",
+                },
+            ],
+        }
 
     @classmethod
     def _channel_fields(cls, ch: dict) -> list[dict]:
@@ -350,14 +395,13 @@ class Subx115(_PluginBase):
                 "props": {"type": "info", "variant": "tonal", "density": "compact",
                           "text": ch["tip"]},
             },
-            # 站点与接口
+            # 站点地址（右上角为「立即签到 / 测试登录」按钮）
             {
                 "component": "VRow",
                 "content": [
-                    _col(12, 6, _text(f"{key}_site", "站点地址",
+                    _col(12, 8, _text(f"{key}_site", "站点地址",
                                       placeholder="https://...")),
-                    _col(12, 6, _text(f"{key}_api", "接口地址（API / RSS）",
-                                      placeholder="https://...  留空则该渠道不参与搜索")),
+                    _col(12, 4, cls._site_action_buttons()),
                 ],
             },
             # 账号认证（与 subx 渠道页一致：用户名 / 密码 / Cookie）
@@ -738,8 +782,7 @@ class Subx115(_PluginBase):
             })
             defaults.update({
                 f"{ch['key']}_enabled": False,
-                f"{ch['key']}_site": "",
-                f"{ch['key']}_api": "",
+                f"{ch['key']}_site": ch.get("site", ""),
                 f"{ch['key']}_username": "",
                 f"{ch['key']}_password": "",
                 f"{ch['key']}_cookie": "",
@@ -865,6 +908,19 @@ class Subx115(_PluginBase):
         """GET /api/v1/plugin/Subx115/history。"""
         return {"code": 0, "data": self.get_data("history") or []}
 
+    def api_sign(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/sign（配置页「立即签到」按钮）。"""
+        result = self._hdhaven_sign(manual=True)
+        return {"code": 0 if result.get("success") else 1,
+                "message": result.get("message", "")}
+
+    def api_test_login(self) -> dict:
+        """GET/POST /api/v1/plugin/Subx115/test_login（配置页「测试登录」按钮）。"""
+        result = self._hdhaven_test_login()
+        return {"code": 0 if result.get("ok") else 1,
+                "message": result.get("message", ""),
+                "data": result.get("user")}
+
     def api_status(self) -> dict:
         """GET /api/v1/plugin/Subx115/status。"""
         return {"code": 0, "data": {
@@ -901,7 +957,7 @@ class Subx115(_PluginBase):
                 adapters.append(adapter)
             else:
                 logger.warning(f"SubX115：渠道 {adapter.name} 已启用但未配置"
-                               f"接口地址/来源，跳过")
+                               f"站点地址，跳过")
         if not adapters:
             logger.info("SubX115：没有可用渠道，结束本轮轮询")
             return
@@ -1092,6 +1148,25 @@ class Subx115(_PluginBase):
         """签到结果通知（受签到通知开关控制）。"""
         if self._sign_notify:
             self._send_message(title, text)
+
+    def _hdhaven_test_login(self) -> dict:
+        """测试栖影登录态（只读预检，供「测试登录」按钮）。"""
+        if not self._sign_cookie:
+            return {"ok": False, "message": "未配置栖影登录会话 Cookie"}
+        if not curl_cffi_available():
+            return {"ok": False, "message": "宿主缺少 curl_cffi 依赖，无法测试"}
+        proxy = (self._proxy_from_settings()
+                 if self._sign_use_system_proxy else self._sign_proxy)
+        try:
+            signer = HDHavenSigner(self._sign_cookie, proxy=proxy, timeout=20)
+            result = signer.check_login()
+        except HDHavenSignError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            logger.warning("SubX115：栖影登录测试异常："
+                           f"{type(exc).__name__}")
+            return {"ok": False, "message": "请求异常，请检查网络与代理配置"}
+        return result
 
     # =====================================================================
     # 宿主集成（订阅读取、通知）
