@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -329,34 +329,23 @@ class Subx115(_PluginBase):
     # 配置页面（Vuetify：VTabs 垂直侧栏，参照胖虎媒体中心布局）
     # =====================================================================
 
-    @staticmethod
-    def _site_action_buttons() -> dict:
-        """渠道页右上角「立即签到 / 测试登录」按钮（VBtn href 指向插件 API）。"""
+    @classmethod
+    def _site_action_buttons(cls) -> dict:
+        """渠道页右上角操作区。
+
+        MoviePilot 前端的插件后端 API 只能在「详情页」（get_page）通过
+        events 的 click -> api 相对路径调用；配置页（get_form）的 VBtn 只
+        支持 Vue 事件，无法直接调后端接口（href 打开的是不带登录态 token
+        的裸 JSON，会被 401 拦截）。因此这里提示用户到插件详情页操作，
+        详情页顶部提供「立即签到 / 测试登录态」可用按钮。
+        """
         return {
-            "component": "VRow",
-            "props": {"justify": "end"},
-            "content": [
-                {
-                    "component": "VBtn",
-                    "props": {
-                        "color": "deep-purple", "variant": "tonal",
-                        "prepend-icon": "mdi-check", "size": "small",
-                        "href": "/api/v1/plugin/Subx115/sign",
-                        "target": "_blank",
-                    },
-                    "text": "立即签到",
-                },
-                {
-                    "component": "VBtn",
-                    "props": {
-                        "color": "grey", "variant": "outlined",
-                        "prepend-icon": "mdi-check", "size": "small",
-                        "href": "/api/v1/plugin/Subx115/test_login",
-                        "target": "_blank",
-                    },
-                    "text": "测试登录态",
-                },
-            ],
+            "component": "VAlert",
+            "props": {
+                "type": "info", "variant": "tonal", "density": "compact",
+                "text": "「立即签到 / 测试登录」请在插件详情页执行："
+                        "返回插件列表点击本插件卡片进入详情页即可。",
+            },
         }
 
     @classmethod
@@ -1082,10 +1071,48 @@ class Subx115(_PluginBase):
         summary = (f"累计转存 {total} 次（成功 {ok_count}），今日 {today_count} 次。"
                    f"启用渠道：{self._enabled_channels_text()}")
 
-        page: list[dict] = [{
-            "component": "VAlert",
-            "props": {"type": "info", "variant": "tonal", "text": summary},
-        }]
+        page: list[dict] = [
+            # 右上角操作按钮：详情页 events 才能调用插件后端 API（配置页不支持）
+            {
+                "component": "VRow",
+                "props": {"justify": "end"},
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "deep-purple", "variant": "tonal",
+                            "prepend-icon": "mdi-check", "size": "small",
+                        },
+                        "text": "立即签到",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{self.__class__.__name__}/sign",
+                                "method": "get",
+                            },
+                        },
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "grey", "variant": "outlined",
+                            "prepend-icon": "mdi-check", "size": "small",
+                            "class": "ml-2",
+                        },
+                        "text": "测试登录态",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{self.__class__.__name__}/test_login",
+                                "method": "get",
+                            },
+                        },
+                    },
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "text": summary},
+            },
+        ]
         # 栖影签到状态
         sign_record = self.get_data("sign_last") or {}
         if self._sign_enabled or sign_record:
