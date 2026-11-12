@@ -62,10 +62,13 @@ class ZhenyingSigner:
 
     BASE = "https://framehdr.com"
 
-    def __init__(self, cookie: str, proxy: str = "", timeout: int = 20):
+    def __init__(self, cookie: str, proxy: str = "", timeout: int = 20,
+                 username: str = "", password: str = ""):
         self.cookie = (cookie or "").strip()
         self.proxy = (proxy or "").strip()
         self.timeout = timeout
+        self.username = (username or "").strip()
+        self.password = (password or "").strip()
 
     # -- Cookie 校验 ---------------------------------------------------------
 
@@ -99,37 +102,43 @@ class ZhenyingSigner:
 
     # -- 会话 / 请求 ---------------------------------------------------------
 
-    def _session(self):
-        cookie = self.parse_cookie(self.cookie)
+    def _session(self, cookie: str = ""):
+        """构造会话。cookie 为空时用于登录（此时无 wangpan_session）。"""
+        if cookie:
+            cookie = self.parse_cookie(cookie)
         if httpx is not None:
             client = httpx.Client(timeout=self.timeout,
                                   follow_redirects=True)
             if self.proxy:
                 client.proxies = {"http://": self.proxy,
                                   "https://": self.proxy}
-            client.headers.update({
-                "Cookie": cookie,
+            headers = {
                 "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/124.0 Safari/537.36"),
                 "Accept": "application/json, text/plain, */*",
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": self.BASE + "/",
-            })
+            }
+            if cookie:
+                headers["Cookie"] = cookie
+            client.headers.update(headers)
             return client
         # requests 兜底
         session = requests.Session()
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
-        session.headers.update({
-            "Cookie": cookie,
+        headers = {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/124.0 Safari/537.36"),
             "Accept": "application/json, text/plain, */*",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": self.BASE + "/",
-        })
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        session.headers.update(headers)
         return session
 
     def _decode(self, response) -> dict:
@@ -177,7 +186,7 @@ class ZhenyingSigner:
         :return: {"ok": True, "user": {...}} 或 {"ok": False, "message": ...}
         :raises ZhenyingSignError: 请求/解析异常（不泄露 Cookie）
         """
-        session = self._session()
+        session = self._session(self.cookie)
         try:
             inner = self._init_state(session)
             return {"ok": True, "user": {
@@ -191,6 +200,76 @@ class ZhenyingSigner:
         finally:
             self._close(session)
 
+    # -- 账号密码登录（Cookie 失效时兜底） -----------------------------------
+
+    def login(self) -> str:
+        """用账号密码登录帧影，返回新的 wangpan_session Cookie。
+
+        帧影登录接口为 `POST /login.php`（form 字段 login_mode=password、
+        username、password、remember_me），成功后响应 `Set-Cookie` 下发新的
+        `wangpan_session` 与 `_security_token`。登录成功与否通过「随后用新
+        Cookie 预检 `api/checkin.php?action=init` 能否通过」来判定，比判断
+        302 Location 更可靠。
+
+        :return: 新会话 Cookie 字符串（含 wangpan_session）
+        :raises ZhenyingSignError: 未配置账号密码 / 登录失败 / 预检失败
+        """
+        if not self.username or not self.password:
+            raise ZhenyingSignError("未配置帧影账号密码，无法自动重新登录")
+        session = self._session()  # 不带 Cookie，让站点下发新会话
+        try:
+            resp = session.post(
+                self.BASE + "/login.php",
+                data={"login_mode": "password",
+                      "username": self.username,
+                      "password": self.password,
+                      "remember_me": "1"},
+            )
+            # 登录成功后站点会通过 Set-Cookie 下发新的 wangpan_session。
+            # 优先从响应头提取；httpx 会话对象已把 Cookie 存入 cookies jar。
+            new_cookie = self._extract_session_cookie(session)
+            if not new_cookie:
+                raise ZhenyingSignError("登录失败：站点未返回会话 Cookie"
+                                        "（账号密码可能有误）")
+            # 用新 Cookie 预检，确认会话已生效
+            self.cookie = new_cookie
+            check = self._session(new_cookie)
+            try:
+                self._init_state(check)
+            finally:
+                self._close(check)
+            return new_cookie
+        except ZhenyingSignError:
+            raise
+        except Exception:
+            raise ZhenyingSignError("登录请求异常，请检查网络与账号密码") from None
+        finally:
+            self._close(session)
+
+    def _extract_session_cookie(self, session) -> str:
+        """从登录响应提取新的会话 Cookie（wangpan_session + _security_token）。"""
+        pairs: list[str] = []
+
+        def _collect(cookies) -> None:
+            for c in cookies:
+                name = getattr(c, "name", None) or getattr(c, "key", None)
+                value = getattr(c, "value", None)
+                if name in ("wangpan_session", "_security_token") and value:
+                    pairs.append(f"{name}={value}")
+
+        # httpx：session.cookies（Cookies 对象，可迭代 Cookie）
+        jar = getattr(session, "cookies", None)
+        if jar is not None:
+            _collect(jar)
+        # requests：session.cookies 同结构，上面已处理；兜底再读响应历史
+        if not pairs:
+            history = getattr(session, "history", None) or []
+            for resp in history:
+                _collect(getattr(resp, "cookies", None) or [])
+        if not any(p.startswith("wangpan_session=") for p in pairs):
+            return ""
+        return "; ".join(pairs)
+
     # -- 签到 ----------------------------------------------------------------
 
     def signin(self, mark_pending: Optional[Callable[[], None]] = None) -> dict:
@@ -200,7 +279,7 @@ class ZhenyingSigner:
                  或 {"state": "success", "earned", "points", "streak"}
         :raises ZhenyingSignError: 任一阶段失败
         """
-        session = self._session()
+        session = self._session(self.cookie)
         try:
             today = datetime.now().date().isoformat()
 

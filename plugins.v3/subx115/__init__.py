@@ -85,7 +85,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.7.3"
+    plugin_version = "1.7.4"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -155,6 +155,8 @@ class Subx115(_PluginBase):
     _zy_sign_cookie = ""
     _zy_sign_cron = "18 9 * * *"
     _zy_sign_notify = True
+    _zy_username = ""
+    _zy_password = ""
     _zy_sign_lock: threading.Lock = threading.Lock()   # 防并发签到
     _zy_sign_timer: threading.Timer | None = None      # 兜底一次性签到定时器
 
@@ -201,6 +203,9 @@ class Subx115(_PluginBase):
         self._zy_sign_cron = str(
             config.get("zhenying_sign_cron") or "18 9 * * *").strip()
         self._zy_sign_notify = bool(config.get("zhenying_sign_notify", True))
+        # 账号密码兜底登录（Cookie 失效时自动重新登录）
+        self._zy_username = str(config.get("zhenying_username") or "").strip()
+        self._zy_password = str(config.get("zhenying_password") or "").strip()
 
         # 勾选「保存后立即签到一次」：先清除一次性开关再执行，避免宿主
         # 重启后再次触发
@@ -776,10 +781,12 @@ class Subx115(_PluginBase):
                 "content": [
                     cls._f_col(12, 6, cls._f_text(
                         "zhenying_username", "用户名 / 邮箱",
-                        placeholder="帧影账号邮箱")),
+                        placeholder="帧影账号邮箱",
+                        hint="Cookie 失效时自动重新登录兜底用")),
                     cls._f_col(12, 6, cls._f_text(
                         "zhenying_password", "密码", type="password",
-                        placeholder="帧影密码")),
+                        placeholder="帧影密码",
+                        hint="Cookie 失效时自动重新登录兜底用")),
                 ],
             },
             cls._f_header("搜索与签到"),
@@ -1746,6 +1753,43 @@ class Subx115(_PluginBase):
         self._zy_sign_timer.daemon = True
         self._zy_sign_timer.start()
 
+    def _zy_resolve_signer(self) -> "ZhenyingSigner":
+        """构造帧影 signer；Cookie 失效时尝试账号密码自动重新登录兜底。
+
+        :raises ZhenyingSignError: Cookie 与账号密码均不可用
+        """
+        proxy = self._proxy_from_settings()
+        if not proxy:
+            logger.info("SubX115：帧影签到未读到代理配置，将直连")
+        signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
+                                timeout=20, username=self._zy_username,
+                                password=self._zy_password)
+        # 先尝试 Cookie 预检；失败且已配账号密码则自动重新登录
+        try:
+            check = signer.check_login()
+        except ZhenyingSignError as exc:
+            raise exc
+        if check.get("ok"):
+            return signer
+        if not self._zy_username or not self._zy_password:
+            raise ZhenyingSignError(check.get("message") or "登录会话已失效")
+        logger.info("SubX115：帧影 Cookie 已失效，尝试账号密码自动重新登录")
+        new_cookie = signer.login()
+        self._zy_sign_cookie = new_cookie
+        self._update_zy_cookie(new_cookie)
+        return ZhenyingSigner(new_cookie, proxy=proxy, timeout=20,
+                              username=self._zy_username,
+                              password=self._zy_password)
+
+    def _update_zy_cookie(self, cookie: str) -> None:
+        """把自动登录得到的新 Cookie 回写到插件配置（下次重载仍有效）。"""
+        try:
+            cfg = dict(self.get_config() or {})
+            cfg["zhenying_sign_cookie"] = cookie
+            self.update_config(cfg)
+        except Exception as exc:
+            logger.warning(f"SubX115：帧影新 Cookie 回写配置失败：{exc}")
+
     def _zhenying_sign(self, manual: bool = False) -> dict:
         """帧影签到主流程（线程锁防并发；预检 -> 提交 -> 保存 -> 通知）。"""
         if not manual and not self._zy_sign_enabled:
@@ -1753,14 +1797,10 @@ class Subx115(_PluginBase):
         if not self._zy_sign_lock.acquire(blocking=False):
             return {"success": False, "message": "签到正在运行"}
         try:
-            if not self._zy_sign_cookie:
-                raise ZhenyingSignError("未配置帧影登录会话 Cookie")
+            if not self._zy_sign_cookie and not self._zy_username:
+                raise ZhenyingSignError("未配置帧影登录会话 Cookie 或账号密码")
             today = datetime.now().date().isoformat()
-            proxy = self._proxy_from_settings()
-            if not proxy:
-                logger.info("SubX115：帧影签到未读到代理配置，将直连")
-            signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
-                                    timeout=20)
+            signer = self._zy_resolve_signer()
 
             def _mark_pending() -> None:
                 self.save_data("zy_sign_last",
@@ -1818,13 +1858,14 @@ class Subx115(_PluginBase):
             self._send_message(title, text)
 
     def _zhenying_test_login(self) -> dict:
-        """测试帧影登录态（只读预检，供「测试登录」按钮）。"""
-        if not self._zy_sign_cookie:
-            return {"ok": False, "message": "未配置帧影登录会话 Cookie"}
-        proxy = self._proxy_from_settings()
+        """测试帧影登录态（只读预检，供「测试登录」按钮）。
+
+        Cookie 失效时同样尝试账号密码自动登录兜底。
+        """
+        if not self._zy_sign_cookie and not self._zy_username:
+            return {"ok": False, "message": "未配置帧影登录会话 Cookie 或账号密码"}
         try:
-            signer = ZhenyingSigner(self._zy_sign_cookie, proxy=proxy,
-                                    timeout=20)
+            signer = self._zy_resolve_signer()
             result = signer.check_login()
         except ZhenyingSignError as exc:
             return {"ok": False, "message": str(exc)}

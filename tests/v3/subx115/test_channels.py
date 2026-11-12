@@ -306,9 +306,11 @@ class _FakeResp:
 
 class _FakeSession:
     """记录请求并返回预设响应的假 session。"""
-    def __init__(self, init_resp: dict, post_resp: dict | None = None):
+    def __init__(self, init_resp: dict, post_resp: dict | None = None,
+                 cookies=None):
         self.init_resp = init_resp
         self.post_resp = post_resp
+        self.cookies = cookies or []
         self.gets: list = []
         self.posts: list = []
 
@@ -327,7 +329,7 @@ class _FakeSession:
 def _signer_with_session(init_resp, post_resp=None):
     signer = ZhenyingSigner("wangpan_session=xyz")
     fake = _FakeSession(init_resp, post_resp)
-    signer._session = lambda: fake  # 注入假 session
+    signer._session = lambda cookie="": fake  # 注入假 session
     return signer, fake
 
 
@@ -389,6 +391,68 @@ def test_zhenying_signin_site_error():
         assert False, "站点返回失败应抛异常"
     except ZhenyingSignError as exc:
         assert "无效的操作" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# 账号密码登录兜底（login / _extract_session_cookie）
+# ---------------------------------------------------------------------------
+
+class _FakeCookie:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+
+def test_zhenying_login_returns_new_cookie():
+    # 登录成功后站点下发新的 wangpan_session + _security_token
+    signer = ZhenyingSigner("wangpan_session=old", username="u@x.com",
+                            password="secret")
+    login_session = _FakeSession(
+        {"success": True, "data": {"csrf_token": "t", "points": 0}},
+        cookies=[_FakeCookie("wangpan_session", "new_session"),
+                 _FakeCookie("_security_token", "new_token")])
+    # 预检会话返回成功（login 会用新 cookie 再做一次预检）
+    precheck_session = _FakeSession(
+        {"success": True, "data": {"csrf_token": "t2", "points": 0}})
+    sessions = [login_session, precheck_session]
+
+    def fake_session(cookie=""):
+        return sessions.pop(0)
+
+    signer._session = fake_session
+    new_cookie = signer.login()
+    assert "wangpan_session=new_session" in new_cookie
+    assert "_security_token=new_token" in new_cookie
+
+
+def test_zhenying_login_requires_credentials():
+    signer = ZhenyingSigner("wangpan_session=old")  # 未配账号密码
+    try:
+        signer.login()
+        assert False, "未配账号密码应抛异常"
+    except ZhenyingSignError as exc:
+        assert "账号密码" in str(exc)
+
+
+def test_zhenying_login_no_session_cookie_fails():
+    # 登录响应未下发 wangpan_session → 视为登录失败
+    signer = ZhenyingSigner("", username="u@x.com", password="secret")
+    login_session = _FakeSession(
+        {"success": False, "message": "用户名或密码错误"},
+        cookies=[_FakeCookie("_security_token", "only_token")])
+    signer._session = lambda cookie="": login_session
+    try:
+        signer.login()
+        assert False, "无 wangpan_session 应抛异常"
+    except ZhenyingSignError as exc:
+        assert "会话 Cookie" in str(exc)
+
+
+def test_zhenying_extract_session_cookie_requires_wangpan():
+    signer = ZhenyingSigner("wangpan_session=old")
+    session = _FakeSession({}, cookies=[_FakeCookie("_security_token", "abc")])
+    # 只有 _security_token 没有 wangpan_session → 返回空串
+    assert signer._extract_session_cookie(session) == ""
 
 
 def _main():
