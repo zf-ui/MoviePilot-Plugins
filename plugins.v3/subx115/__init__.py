@@ -84,7 +84,7 @@ class Subx115(_PluginBase):
                    "八渠道配置页 + 栖影（HDHaven）签到，按订阅/关键词"
                    "自动转存 115。")
     plugin_icon = "Moviepilot_A.png"        # 占位图标，可替换市场已有图标
-    plugin_version = "1.6.11"
+    plugin_version = "1.6.12"
     plugin_author = "z0812"
     author_url = "https://github.com/z0812"
     plugin_config_prefix = "subx115_"
@@ -380,7 +380,7 @@ class Subx115(_PluginBase):
             return [{
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
-                          "class": "mb-4 mt-3 pr-3"},
+                          "class": "pt-6 mb-4 pr-3"},
                 "content": [cls._action_btn(
                     "测试聚影账号", "test_login", "green", "outlined",
                     icon="mdi-account-check")],
@@ -389,12 +389,12 @@ class Subx115(_PluginBase):
         has_sign = key != "guanying"
         # 提示单行展示：去掉换行符，让文字自然流动（不再强制两行）
         tip = ch.get("tip", "").replace("\n", " ")
-        # 按钮行在上（右对齐）+ 顶部留白 mt-3 避免贴顶被裁切；提示条在下
+        # 按钮行在上（右对齐），用 pt-6 内边距把按钮从面板顶边推下来，避免贴顶被裁切；提示条在下
         return [
             {
                 "component": "VRow",
                 "props": {"justify": "end", "align": "center",
-                          "class": "mt-3 mb-3 pr-3"},
+                          "class": "pt-6 mb-3 pr-3"},
                 "content": cls._site_action_btn_list(has_sign),
             },
             {
