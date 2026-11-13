@@ -4329,7 +4329,11 @@ def test_signin_by_browserless_passes_reconnect_timeout(host, monkeypatch):
 
 
 def test_signin_by_browserless_retries_with_solve_token_after_human_check(host, monkeypatch):
-    """首次提交被人机验证拒绝时，应带 solve token 回同一会话再提交一次。"""
+    """首次提交被人机验证拒绝时，应回同一会话**重新 solve** 再提交一次。
+
+    旧 token 只能作为「废 token」传给脚本比对，绝不能回填进表单：
+    Turnstile token 一次性，重复提交必被站点判 duplicate。
+    """
     module = host.module
     plugin = _enabled_plugin(host, browserless_token="T")
     requests = []
@@ -4378,11 +4382,15 @@ def test_signin_by_browserless_retries_with_solve_token_after_human_check(host, 
 
     assert len(requests) == 2
     assert requests[1]["operation"] == "CnlangInject"
-    # 第二段必须打到 session 地址，并且带上 token、重新注入 Cookie 与 URL
+    # 第二段必须打到 session 地址，重新注入 Cookie 与 URL，并**重新 solve**
     assert "sessionId=abc" in requests[1]["endpoint"]
-    assert '"0.TOKEN"' in requests[1]["variables"]["submit"]
     assert requests[1]["variables"]["url"] == module.SIGN_PAGE_URL
     assert requests[1]["variables"]["cookies"]
+    assert requests[1]["variables"]["solveTimeout"] == float(plugin._browserless_solve_timeout * 1000)
+    submit = requests[1]["variables"]["submit"]
+    # 旧 token 不再作为可用 token 回填，只作为「已消费的废 token」供脚本跳过
+    assert 'const solveToken = "";' in submit
+    assert 'const staleToken = "0.TOKEN";' in submit
     assert result["success"] is True
     assert result["money"] == "272"
     # 第二段页面上的「本月已累计」已含本次，直接采用不再 +1
@@ -4663,7 +4671,7 @@ def test_signin_by_browserless_second_stage_failure_keeps_its_own_reason(host, m
     assert plugin._signin_by_browserless() is None
     assert calls["n"] == 2
     error = plugin._browserless_error
-    assert "回填 solve token 重试也没跑成" in error
+    assert "重新 solve 重试也没跑成" in error
     assert "HTTP 404" in error
     # 不能把两件事混成一句「站点仍判定未完成人机验证」，那会误导排查方向
     assert "站点仍判定未完成人机验证" not in error
@@ -4888,3 +4896,140 @@ def test_signin_reads_streak_from_page_after_submit(host, monkeypatch):
 
     assert result["success"] is True
     assert result["streak"] == 18
+
+
+# ---------------------------------------------------------------------------
+# 3.9.6：第二段必须重新 solve + 失败通知不再把人机验证误报成 Cookie 失效
+#
+# 实战日志（2026-11-13 22:50）：第一段 solve 成功、token 837 字节，提交被拒；
+# 第二段「token 来源=solve」仍被拒——因为回填的是**同一枚已消费的 token**，
+# Turnstile 对重复提交只会回 timeout-or-duplicate。最后通知还写成「Cookie已失效」，
+# 原因是失败详情里附带的排查指引含有「请更新配置里的 Cookie」字样。
+# ---------------------------------------------------------------------------
+
+
+def test_bql_inject_mutation_re_solves_instead_of_reusing_token(host):
+    """第二段 mutation 必须自带 solve，否则只能拿到一枚已消费的旧 token。"""
+    module = host.module
+
+    assert "solve: solve(timeout: $solveTimeout)" in module.BQL_INJECT_MUTATION
+    assert "$solveTimeout: Float!" in module.BQL_INJECT_MUTATION
+    # solve 必须发生在提交之前
+    assert module.BQL_INJECT_MUTATION.index("solve: solve") < module.BQL_INJECT_MUTATION.index(
+        "submit: evaluate"
+    )
+
+
+def test_bql_submit_script_marks_stale_token(host):
+    """脚本要知道哪枚 token 已经用过，才能拒绝重复提交它。"""
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错", "", stale_token="0.OLD")
+
+    assert "__STALE_TOKEN__" not in script
+    assert 'const staleToken = "0.OLD";' in script
+    assert 'const solveToken = "";' in script
+    # 旧 token 不得成为提交用的 token 来源
+    assert "candidate !== staleToken" in script
+    assert 'out.why = "no-fresh-token";' in script
+
+
+def test_bql_submit_script_without_stale_token_keeps_stage1_behaviour(host):
+    """第一段没有废 token：不启用 no-fresh-token 提前返回，照常提交。"""
+    module = host.module
+
+    script = module._bql_submit_script("今天心情不错")
+
+    assert 'const staleToken = "";' in script
+    assert "if (!token && staleToken)" in script
+
+
+def test_signin_by_browserless_reports_no_fresh_token(host, monkeypatch):
+    """重新 solve 后页面上仍只有旧 token：如实说明，且不再发注定失败的 POST。"""
+    plugin = _enabled_plugin(host, browserless_token="T")
+    requests = []
+
+    def fake_post(endpoint, variables, query=None, operation="CnlangSign"):
+        requests.append(operation)
+        if operation == "CnlangSign":
+            return {
+                "solve": {"found": True, "solved": True, "time": 6, "token": "0.TOKEN"},
+                "submit": {"value": json.dumps(
+                    {"ok": True, "why": "human-check", "username": "luobop",
+                     "content": "请先完成人机安全验证后再签到！"}, ensure_ascii=False)},
+                "session": {"browserQLEndpoint": "https://x.io/stealth/bql?sessionId=abc"},
+            }
+        return {
+            "solve": {"found": True, "solved": True, "time": 5, "token": "0.TOKEN"},
+            "submit": {"value": json.dumps(
+                {"ok": False, "why": "no-fresh-token", "username": "luobop",
+                 "tokenFrom": "", "widget": True, "form": True, "fields": 6}, ensure_ascii=False)},
+        }
+
+    monkeypatch.setattr(
+        plugin.__class__,
+        "_bql_post",
+        lambda self, endpoint, variables, query=None, operation="CnlangSign": fake_post(
+            endpoint, variables, query, operation
+        ),
+    )
+    monkeypatch.setattr(plugin.__class__, "_build_say", lambda self: "今天心情不错")
+
+    assert plugin._signin_by_browserless() is None
+    assert len(requests) == 2
+    error = plugin._browserless_error
+    assert "仍只有上一段已用过的 token" in error
+    assert "解验证超时" in error
+    # 不能落回那句笼统的「站点仍判定未完成人机验证」
+    assert "站点仍判定未完成人机验证" not in error
+
+
+def test_human_check_failure_is_not_reported_as_cookie_expired(host):
+    """人机验证失败（附带的排查指引里有 Cookie 字样）不能误报成 Cookie 失效。"""
+    module = host.module
+    plugin = _enabled_plugin(host, notify=True)
+    reason = (
+        "云端浏览器已提交签到，但站点仍判定未完成人机验证"
+        "（token 来源=solve，页面有验证组件=True，表单字段数=6）。"
+        "若 token 已取到仍被拒绝，多为节点出口 IP 与该 token 不匹配，换节点再试。"
+        "\n\n" + module.BROWSERLESS_ADVICE
+    )
+
+    plugin._record_failure(reason)
+
+    message = plugin.messages[-1]
+    assert message["title"] == "【❌ 国语视界签到失败】"
+    assert "✨ 状态：签到失败" in message["text"]
+    assert "Cookie已失效" not in message["title"]
+    assert "🔑 请更新Cookie后重试" not in message["text"]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Cookie 已失效（签到页未显示用户名）",
+        "Cookie已失效",
+        "cookie 已过期，请重新登录",
+        "Cookie 已失效（云端浏览器打开签到页未显示用户名）",
+        "未配置有效 Cookie，云端浏览器无法登录站点",
+        "登录态已失效",
+    ],
+)
+def test_cookie_expired_detection_accepts_real_signals(host, detail):
+    """真正的失效结论仍然要被识别出来，通知继续引导更新 Cookie。"""
+    assert host.module.CnlangSigninV3._looks_like_cookie_expired(detail) is True
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "云端浏览器已提交签到，但站点仍判定未完成人机验证",
+        "Browserless 未能通过 Cloudflare 验证。请按下面步骤更新配置里的 Cookie",
+        "请更新Cookie后重试",
+        "获取签到页面失败，状态码：502",
+        "",
+    ],
+)
+def test_cookie_expired_detection_rejects_advice_text(host, detail):
+    """排查建议里的 Cookie 措辞不算失效证据。"""
+    assert host.module.CnlangSigninV3._looks_like_cookie_expired(detail) is False

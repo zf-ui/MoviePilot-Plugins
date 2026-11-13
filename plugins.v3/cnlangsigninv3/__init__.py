@@ -391,6 +391,11 @@ BQL_SUBMIT_SCRIPT = r"""
   //    Browserless 的 solve 只负责产出 token，**不会**触发站点挂在 widget 上的回调，
   //    所以必须由我们把 token 显式回填进表单，页面不会自己写进去。
   const solveToken = __TOKEN__;
+  // 已经提交过、被服务端消费掉的 token。**Turnstile token 是一次性的**：同一枚 token
+  // 第二次提交时 siteverify 只会回 timeout-or-duplicate，必败。第二段重试因此必须
+  // 重新 solve 拿新 token，而不是把上一段那枚回填回去——v3.9.5 就是栽在这里，
+  // 日志里「token 来源=solve」看着很美好，其实提交的是一枚废 token。
+  const staleToken = __STALE_TOKEN__;
   const readPageToken = () => {
     try {
       if (window.turnstile && typeof window.turnstile.getResponse === "function") {
@@ -411,9 +416,18 @@ BQL_SUBMIT_SCRIPT = r"""
     const deadline = Date.now() + 15000;
     while (!token && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 300));
-      token = readPageToken();
+      const candidate = readPageToken();
+      // 页面上读到的若还是上一段那枚已消费的 token，继续等新 token，绝不拿来提交
+      if (candidate && candidate !== staleToken) token = candidate;
     }
     if (token) out.tokenFrom = "page";
+  }
+
+  // 重新 solve 之后页面上依然只有那枚旧 token（或压根没 token）：直接如实上报，
+  // 不要发出一次注定被 duplicate 拒掉的 POST——那只会把真实原因盖成「人机验证未通过」。
+  if (!token && staleToken) {
+    out.why = "no-fresh-token";
+    return JSON.stringify(out);
   }
 
   // E) 用真实表单的字段提交：站点可能在表单里塞了额外隐藏字段，手工拼字段名迟早会漏。
@@ -505,22 +519,28 @@ mutation CnlangSign($cookies: [CookieInput!]!, $url: String!, $beforeWait: Float
 }
 """
 
-# 第二段：把第一段 solve 拿到的 token 回填页面并提交。
+# 第二段：回到第一段会话，**重新 solve 一枚新 token** 后再提交。
 #
 # 为什么需要它：``solve`` 的 token 只在响应里，而 ``evaluate`` 的脚本内容必须在请求
 # 发出前就确定——单次请求里没法「用后一步的产物去填前一步的参数」。若第一段提交后
-# 站点仍判「人机验证未通过」，就带着 token 回到同一会话（``reconnect``）再提交一次。
+# 站点仍判「人机验证未通过」，就回到同一会话（``reconnect``）再试一次。
+#
+# 关键：第二段**必须重新 solve**，不能把第一段的 token 回填回去。Turnstile token 是
+# 一次性的，第一段已经把它提交给站点消费掉了，再提交一次只会得到
+# timeout-or-duplicate。v3.9.5 的「token 来源=solve 却仍被判人机验证」就是这个原因。
+# 新 token 由页面 widget 自己写进 cf-turnstile-response，脚本从页面读取并跳过旧值。
 #
 # 复用会话必须重新 ``goto``：实测 ``reconnect`` 只保住浏览器与 cookie / cf_clearance，
 # 页面本身是新的，第一段那个页面不会保留。
 BQL_INJECT_MUTATION = """
 mutation CnlangInject($cookies: [CookieInput!]!, $url: String!, $beforeWait: Float!,
-                      $afterWait: Float!, $submit: String!) {
+                      $solveTimeout: Float!, $afterWait: Float!, $submit: String!) {
   cookies(cookies: $cookies) { cookies { name } }
   goto(url: $url, waitUntil: domContentLoaded) { status }
   waitBefore: waitForTimeout(time: $beforeWait) { time }
-  submit: evaluate(content: $submit) { value }
+  solve: solve(timeout: $solveTimeout) { found solved time token }
   waitAfter: waitForTimeout(time: $afterWait) { time }
+  submit: evaluate(content: $submit) { value }
 }
 """
 
@@ -1073,7 +1093,7 @@ def _bql_error_text(payload: Any) -> str:
     return f"{message}（步骤：{path}）" if path else message
 
 
-def _bql_submit_script(say: str, token: str = "") -> str:
+def _bql_submit_script(say: str, token: str = "", stale_token: str = "") -> str:
     """生成页面内提交脚本（替换占位符）。
 
     寄语用 ``json.dumps`` 序列化成 JS 字符串字面量再替换，而不是手工拼引号：
@@ -1082,14 +1102,18 @@ def _bql_submit_script(say: str, token: str = "") -> str:
     :param say: 签到寄语，必须已满足站点 6~50 字的要求
     :param token: ``solve`` 返回的 Turnstile token，会被回填进签到表单；
         为空时脚本会尝试从页面 widget 自己读一次
+    :param stale_token: 上一段已经提交过的 token。脚本会拒绝再次使用它，
+        只接受页面上的新 token（Turnstile token 一次性，重复提交必被 duplicate 拒绝）
     :return: 可直接作为 ``evaluate(content:)`` 参数的脚本
     """
     literal = json.dumps(str(say or SAY_FALLBACK), ensure_ascii=False)
     token_literal = json.dumps(str(token or "").strip())
+    stale_literal = json.dumps(str(stale_token or "").strip())
     hints_literal = json.dumps(list(HUMAN_CHECK_HINTS), ensure_ascii=False)
     return (
         BQL_SUBMIT_SCRIPT.replace("__SAY__", literal)
         .replace("__TOKEN__", token_literal)
+        .replace("__STALE_TOKEN__", stale_literal)
         .replace("__HUMAN_HINTS__", hints_literal)
         .replace("__SIGN_PAGE_URL__", SIGN_PAGE_URL)
         .replace("__SUBMIT_URL__", SIGN_SUBMIT_URL)
@@ -1267,7 +1291,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.5"
+    plugin_version = "3.9.6"
     # 插件作者（本仓库维护者；不再沿用上游 xijin285）
     plugin_author = "zf-ui"
     # 作者主页
@@ -2672,16 +2696,20 @@ class CnlangSigninV3(_PluginBase):
         token: str,
         say: str,
     ) -> Optional[Dict[str, Any]]:
-        """第二段：回到第一段 solve 所在的会话，回填 token 后再提交一次。
+        """第二段：回到第一段 solve 所在的会话，**重新 solve** 后再提交一次。
 
         ``solve`` 产出的 token 只在响应里，而 ``evaluate`` 的脚本必须在请求发出前就
         确定，所以单次请求没法把自己的产物喂给自己的参数——被站点判「人机验证未通过」
         时只能开第二段。会话由第一段的 ``reconnect`` 保住；页面本身不会保留，因此
         第二段必须重新 ``goto``。
 
+        第一段的 token 只作为「废 token」传给脚本用于比对，**绝不回填**：Turnstile
+        token 一次性，重复提交必被站点判 duplicate。第二段自己再 solve 一次，脚本从
+        页面上读新 token 提交。
+
         :param data: 第一段的响应（从中取 ``session.browserQLEndpoint``）
         :param cookies: 第一段注入的 Cookie，第二段要重新注入
-        :param token: ``solve`` 返回的 Turnstile token
+        :param token: 第一段已消费的 Turnstile token（仅用于识别并跳过旧值）
         :param say: 签到寄语
         :return: 页面脚本结果；无法复用会话或请求失败时返回 None
         """
@@ -2703,22 +2731,32 @@ class CnlangSigninV3(_PluginBase):
             return None
 
         logger.info(
-            "Browserless：复用 solve 会话，回填 Turnstile token 后重新提交"
-            f"（会话端点 {_mask_token(endpoint)}）"
+            "Browserless：复用 solve 会话，重新解人机验证后再次提交"
+            f"（旧 token 已消费、不再回填；会话端点 {_mask_token(endpoint)}）"
         )
         variables = {
             "cookies": cookies,
             "url": SIGN_PAGE_URL,
             "beforeWait": float(BQL_NAV_WAIT),
+            "solveTimeout": float(self._browserless_solve_timeout * 1000),
             "afterWait": float(BQL_AFTER_WAIT),
-            "submit": _bql_submit_script(say, token),
+            "submit": _bql_submit_script(say, "", stale_token=token),
         }
         second = self._bql_post(
             endpoint, variables, query=BQL_INJECT_MUTATION, operation="CnlangInject"
         )
         if second is None:
             return None
+        solve = second.get("solve") if isinstance(second.get("solve"), dict) else {}
+        if solve:
+            logger.info(
+                f"Browserless 第二段 solve 结果：found={solve.get('found')} "
+                f"solved={solve.get('solved')} 耗时={solve.get('time')}"
+            )
+        fresh_token = str(solve.get("token") or "").strip()
         page = self._bql_page_of(second)
+        if page:
+            self._log_bql_diag(page, fresh_token, stage=2)
         return page or None
 
     def _signin_by_browserless(self) -> Optional[Dict[str, Any]]:
@@ -2791,21 +2829,21 @@ class CnlangSigninV3(_PluginBase):
         why = str(page.get("why") or "")
         self._log_bql_diag(page, token)
 
-        # 站点仍判人机验证未通过：只有 solve 真的产出了 token 才值得开第二段
+        # 站点仍判人机验证未通过：只有 solve 真的产出了 token 才值得开第二段。
+        # 第二段会**重新 solve**——旧 token 已被第一次提交消费，回填它必然 duplicate。
         second_error = ""
         if why == "human-check" and token:
-            logger.warning("云端浏览器首次提交仍被人机验证拒绝，改用 solve token 回填后重试")
+            logger.warning("云端浏览器首次提交仍被人机验证拒绝，复用会话重新 solve 后重试")
             self._browserless_error = None
             second = self._bql_inject_token(data, cookies, token, say)
             if second is not None:
                 page = second
                 why = str(page.get("why") or "")
-                self._log_bql_diag(page, token, stage=2)
             else:
                 # 第二段整体没跑成（会话接不回来 / 网络失败）：留着原因，别被后面的
                 # 「站点仍判定人机验证」覆盖掉——那是两回事，排查方向完全不同
                 second_error = self._browserless_error or "未知原因"
-                logger.error(f"Browserless 第二段（回填 token 重试）未执行完：{second_error}")
+                logger.error(f"Browserless 第二段（重新 solve 重试）未执行完：{second_error}")
                 self._browserless_error = None
         elif why == "human-check" and not token:
             logger.warning(
@@ -2837,10 +2875,18 @@ class CnlangSigninV3(_PluginBase):
             self._browserless_error = "云端浏览器已进入签到页但未找到 formhash，页面结构可能已变化"
             logger.error(self._browserless_error)
             return None
+        if why == "no-fresh-token":
+            self._browserless_error = (
+                "云端浏览器重新解人机验证后，页面上仍只有上一段已用过的 token，"
+                "本次未重复提交（Turnstile token 一次性，重复提交必然被拒绝）。"
+                "请把「解验证超时」调大到 120 秒，或更换 Browserless 节点后重试。"
+            )
+            logger.error(self._browserless_error)
+            return None
         if why == "human-check":
             if second_error:
                 self._browserless_error = (
-                    "云端浏览器首次提交被人机验证拒绝，回填 solve token 重试也没跑成："
+                    "云端浏览器首次提交被人机验证拒绝，重新 solve 重试也没跑成："
                     f"{second_error}。"
                     "（切会话复用属于加分项，不走它也能签到成功——"
                     "实战中多数节点第一段就能过；这一段失败通常只是云端不接受会话复用。）"
@@ -2853,7 +2899,8 @@ class CnlangSigninV3(_PluginBase):
                 f"页面有验证组件={page.get('widget')}，表单字段数={page.get('fields')}）。"
                 "若「token 来源=无」，说明 solve 没能在页面上解出验证，"
                 "可把「解验证超时」调大到 120 秒后重试；"
-                "若 token 已取到仍被拒绝，多为节点出口 IP 与该 token 不匹配，换节点再试。"
+                "若 token 已取到仍被拒绝，是站点没认可这次验证（多为节点出口 IP 信誉问题），"
+                "换节点再试；这与 Cookie 是否有效无关，不需要更新 Cookie。"
             )
             logger.error(self._browserless_error)
             return None
@@ -3886,10 +3933,38 @@ class CnlangSigninV3(_PluginBase):
         return title, "\n".join(lines)
 
 
-    @staticmethod
-    def _looks_like_cookie_expired(detail: str) -> bool:
-        """判断失败原因是否属于 Cookie 失效，用于选择更明确的通知文案。"""
-        return "cookie" in detail.lower() or "未获取到用户名" in detail
+    # 真正的登录态失效信号。**不能**用「文本里有没有 cookie」来判断：
+    # Browserless 失败时附带的排查指引里本身就有「请更新配置里的 Cookie」，
+    # 会把「人机验证没通过」误报成「Cookie 已失效」，引导用户去更新一份其实还有效的
+    # Cookie（v3.9.5 实战日志里那条【❌ 国语视界Cookie已失效】就是这么来的）。
+    _COOKIE_EXPIRED_HINTS = (
+        "cookie 已失效",
+        "cookie已失效",
+        "cookie 失效",
+        "cookie失效",
+        "cookie 已过期",
+        "cookie已过期",
+        "cookie 过期",
+        "cookie过期",
+        "未配置有效 cookie",
+        "未配置有效cookie",
+        "未配置 cookie",
+        "未配置cookie",
+        "未获取到用户名",
+        "未显示用户名",
+        "登录态已失效",
+        "登录状态已失效",
+        "请先登录",
+    )
+
+    @classmethod
+    def _looks_like_cookie_expired(cls, detail: str) -> bool:
+        """判断失败原因是否属于 Cookie 失效，用于选择更明确的通知文案。
+
+        只认明确的失效结论，不认「更新 Cookie」这类排查建议里的措辞。
+        """
+        text = str(detail or "").lower()
+        return any(hint in text for hint in cls._COOKIE_EXPIRED_HINTS)
 
     # ------------------------------------------------------------------
     # 配置与工具方法
