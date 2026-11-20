@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "Hermes Agent"
     # 作者主页
@@ -59,7 +59,29 @@ class HermesNotify(_PluginBase):
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [
+            {
+                "path": "/test",
+                "endpoint": self.test_push,
+                "methods": ["GET"],
+                "summary": "发送一条测试通知到已配置的通道",
+            }
+        ]
+
+    def test_push(self):
+        if not self.get_state():
+            return {"success": False, "message": "插件未启用或密钥未配置"}
+        import time as _t
+        sent = []
+        title = "【测试】HermesNotify 端到端"
+        content = "MoviePilot→Hermes→企微/QQ 链路验证 " + _t.strftime("%H:%M:%S")
+        if self._wecom_url and self._wecom_secret:
+            self._push(self._wecom_url, self._wecom_secret, title, content)
+            sent.append("wecom")
+        if self._qq_url and self._qq_secret:
+            self._push(self._qq_url, self._qq_secret, title, content)
+            sent.append("qq")
+        return {"success": True, "message": "已推送: " + ",".join(sent)}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         MsgTypeOptions = []
@@ -108,7 +130,7 @@ class HermesNotify(_PluginBase):
                                         'props': {
                                             'model': 'wecom_url',
                                             'label': '企业微信路由URL',
-                                            'placeholder': 'http://127.0.0.1:8644/webhooks/moviepilot',
+                                            'placeholder': 'http://172.17.0.7:8644/webhooks/moviepilot',
                                         }
                                     }
                                 ]
@@ -147,7 +169,7 @@ class HermesNotify(_PluginBase):
                                         'props': {
                                             'model': 'qq_url',
                                             'label': 'QQ路由URL',
-                                            'placeholder': 'http://127.0.0.1:8644/webhooks/moviepilot-qq',
+                                            'placeholder': 'http://172.17.0.7:8644/webhooks/moviepilot-qq',
                                         }
                                     }
                                 ]
@@ -196,9 +218,9 @@ class HermesNotify(_PluginBase):
         ], {
             "enabled": False,
             "msgtypes": [],
-            "wecom_url": "http://127.0.0.1:8644/webhooks/moviepilot",
+            "wecom_url": "http://172.17.0.7:8644/webhooks/moviepilot",
             "wecom_secret": "",
-            "qq_url": "http://127.0.0.1:8644/webhooks/moviepilot-qq",
+            "qq_url": "http://172.17.0.7:8644/webhooks/moviepilot-qq",
             "qq_secret": "",
         }
 

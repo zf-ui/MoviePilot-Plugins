@@ -68,13 +68,14 @@
     "name": "Hermes 通知转发",
     "description": "将 MoviePilot 消息事件经 HMAC 签名推送到 Hermes Agent（企业微信 / QQ），零 LLM 消耗直投。",
     "labels": "消息通知",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "https://hermes-agent.nousresearch.com/img/icon.png",
     "author": "Hermes Agent",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
-      "v1.0": "首次发布：NoticeMessage 事件签名直投 Hermes webhook 路由，支持企微 + QQ 双通道、消息类型过滤。"
+      "v1.0": "首次发布：NoticeMessage 事件签名直投 Hermes webhook 路由，支持企微 + QQ 双通道、消息类型过滤。",
+      "v1.1": "新增 GET /test 端点：一键向已配置通道发送测试通知，便于验证签名与投递链路。"
     }
   }
 }
