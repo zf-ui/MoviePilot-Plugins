@@ -122,7 +122,7 @@ class HermesNotify(_PluginBase):
                 "value": item.name
             })
 
-        def _btn(text: str, icon: str, color: str, api: str, okmsg: str) -> dict:
+        def _btn(text: str, icon: str, color: str, api: str) -> dict:
             return {
                 'component': 'VBtn',
                 'props': {
@@ -130,15 +130,14 @@ class HermesNotify(_PluginBase):
                     'variant': 'tonal',
                     'prepend-icon': icon,
                     'block': True,
-                    'onclick': (
-                        "function(e) { window.MoviePilotAPI.get('" + api + "')"
-                        ".then(function(r) { if (r && r.success === false) {"
-                        " alert(r.message || '发送失败') } else {"
-                        " alert('" + okmsg + "') } })"
-                        ".catch(function(err) { console.error(err); alert('发送失败') }) }"
-                    ),
                 },
                 'text': text,
+                'events': {
+                    'click': {
+                        'api': api,
+                        'method': 'get',
+                    }
+                },
             }
 
         return [
@@ -275,7 +274,7 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试企业微信', 'mdi-wechat', 'success',
-                                         'plugin/HermesNotify/test/wecom', '已发送到企业微信'),
+                                         'plugin/HermesNotify/test/wecom'),
                                 ]
                             },
                             {
@@ -286,7 +285,7 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试QQ', 'mdi-qqchat', 'primary',
-                                         'plugin/HermesNotify/test/qq', '已发送到QQ'),
+                                         'plugin/HermesNotify/test/qq'),
                                 ]
                             },
                             {
@@ -297,7 +296,7 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试全部通道', 'mdi-check-all', 'warning',
-                                         'plugin/HermesNotify/test', '已发送到全部通道'),
+                                         'plugin/HermesNotify/test'),
                                 ]
                             }
                         ]
