@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     # 插件作者
     plugin_author = "Hermes Agent"
     # 作者主页
@@ -34,6 +34,8 @@ class HermesNotify(_PluginBase):
 
     # 私有属性
     _enabled = False
+    _wecom_enabled = True
+    _qq_enabled = True
     _wecom_url = None
     _wecom_secret = None
     _qq_url = None
@@ -44,6 +46,8 @@ class HermesNotify(_PluginBase):
         if config:
             self._enabled = config.get("enabled")
             self._msgtypes = config.get("msgtypes") or []
+            self._wecom_enabled = config.get("wecom_enabled", True)
+            self._qq_enabled = config.get("qq_enabled", True)
             self._wecom_url = config.get("wecom_url")
             self._qq_url = config.get("qq_url")
             self._wecom_secret = config.get("wecom_secret")
@@ -51,8 +55,8 @@ class HermesNotify(_PluginBase):
 
     def get_state(self) -> bool:
         return bool(self._enabled
-                    and ((self._wecom_url and self._wecom_secret)
-                         or (self._qq_url and self._qq_secret)))
+                    and ((self._wecom_enabled and self._wecom_url and self._wecom_secret)
+                         or (self._qq_enabled and self._qq_url and self._qq_secret)))
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -92,11 +96,15 @@ class HermesNotify(_PluginBase):
         return {"success": bool(ok), "message": f"{channel} 推送{'成功' if ok else '失败'}", "data": None}
 
     def test_wecom(self):
+        if not self._wecom_enabled:
+            return {"success": False, "message": "企业微信通道已被关闭（wecom_enabled）", "data": None}
         if not self._wecom_url or not self._wecom_secret:
             return {"success": False, "message": "企业微信通道未配置", "data": None}
         return self._send_test(self._wecom_url, self._wecom_secret, "企业微信")
 
     def test_qq(self):
+        if not self._qq_enabled:
+            return {"success": False, "message": "QQ 通道已被关闭（qq_enabled）", "data": None}
         if not self._qq_url or not self._qq_secret:
             return {"success": False, "message": "QQ 通道未配置", "data": None}
         return self._send_test(self._qq_url, self._qq_secret, "QQ")
@@ -105,16 +113,18 @@ class HermesNotify(_PluginBase):
         if not self.get_state():
             return {"success": False, "message": "插件未启用或密钥未配置", "data": None}
         sent = []
-        if self._wecom_url and self._wecom_secret:
+        if self._wecom_enabled and self._wecom_url and self._wecom_secret:
             self._push(self._wecom_url, self._wecom_secret,
                       "【测试】HermesNotify 端到端",
                       "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
             sent.append("企业微信")
-        if self._qq_url and self._qq_secret:
+        if self._qq_enabled and self._qq_url and self._qq_secret:
             self._push(self._qq_url, self._qq_secret,
                        "【测试】HermesNotify 端到端",
                        "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
             sent.append("QQ")
+        if not sent:
+            return {"success": False, "message": "没有已开启且已配置的通道", "data": None}
         return {"success": True, "message": "已推送到: " + "、".join(sent), "data": None}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -164,6 +174,45 @@ class HermesNotify(_PluginBase):
                                         'props': {
                                             'model': 'enabled',
                                             'label': '启用插件',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'wecom_enabled',
+                                            'label': '启用企业微信通道',
+                                            'color': 'success'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'qq_enabled',
+                                            'label': '启用QQ通道',
+                                            'color': 'primary'
                                         }
                                     }
                                 ]
@@ -314,6 +363,8 @@ class HermesNotify(_PluginBase):
         ], {
             "enabled": False,
             "msgtypes": [],
+            "wecom_enabled": True,
+            "qq_enabled": False,
             "wecom_url": "http://172.17.0.7:8644/webhooks/moviepilot",
             "wecom_secret": "",
             "qq_url": "http://172.17.0.7:8644/webhooks/moviepilot-qq",
@@ -378,9 +429,9 @@ class HermesNotify(_PluginBase):
         channel = msg_type.value if msg_type else ""
         full_title = f"{title}（{channel}）" if channel else title
 
-        if self._wecom_url and self._wecom_secret:
+        if self._wecom_enabled and self._wecom_url and self._wecom_secret:
             self._push(self._wecom_url, self._wecom_secret, full_title, content)
-        if self._qq_url and self._qq_secret:
+        if self._qq_enabled and self._qq_url and self._qq_secret:
             self._push(self._qq_url, self._qq_secret, full_title, content)
 
     def stop_service(self):

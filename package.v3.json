@@ -68,7 +68,7 @@
     "name": "Hermes 通知转发",
     "description": "将 MoviePilot 消息事件经 HMAC 签名推送到 Hermes Agent（企业微信 / QQ），零 LLM 消耗直投。",
     "labels": "消息通知",
-    "version": "1.4",
+    "version": "1.5",
     "icon": "https://hermes-agent.nousresearch.com/img/icon.png",
     "author": "Hermes Agent",
     "level": 1,
@@ -78,7 +78,8 @@
       "v1.1": "新增 GET /test 端点：一键向已配置通道发送测试通知，便于验证签名与投递链路。",
       "v1.2": "配置页新增「测试企业微信 / 测试QQ / 测试全部通道」三个独立按钮，一键验证单通道链路。",
       "v1.3": "修复配置页测试按钮无反应/误报失败：改用 onclick 字符串事件（FormRender 兼容），API 响应补齐 data 字段以通过前端 envelope 校验。",
-      "v1.4": "修复按钮点击报失败：路由 auth 改为 bear（前端会自动携带登录令牌），不再要求 apikey。"
+      "v1.4": "修复按钮点击报失败：路由 auth 改为 bear（前端会自动携带登录令牌），不再要求 apikey。",
+      "v1.5": "新增企业微信/QQ 独立通道开关（wecom_enabled/qq_enabled），QQ 默认关闭。"
     }
   }
 }
