@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "Hermes Agent"
     # 作者主页
@@ -65,21 +65,52 @@ class HermesNotify(_PluginBase):
                 "endpoint": self.test_push,
                 "methods": ["GET"],
                 "summary": "发送一条测试通知到已配置的通道",
-            }
+            },
+            {
+                "path": "/test/wecom",
+                "endpoint": self.test_wecom,
+                "methods": ["GET"],
+                "summary": "向企业微信通道发送测试通知",
+            },
+            {
+                "path": "/test/qq",
+                "endpoint": self.test_qq,
+                "methods": ["GET"],
+                "summary": "向 QQ 通道发送测试通知",
+            },
         ]
+
+    def _send_test(self, url: str, secret: str, channel: str) -> Dict[str, Any]:
+        title = "【测试】HermesNotify"
+        content = f"MoviePilot→Hermes→{channel} 独立按钮链路验证 " + time.strftime("%H:%M:%S")
+        ok = self._push(url, secret, title, content)
+        if ok is None:
+            return {"success": False, "message": f"{channel} 通道未配置"}
+        return {"success": bool(ok), "message": f"{channel} 推送{'成功' if ok else '失败'}"}
+
+    def test_wecom(self):
+        if not self._wecom_url or not self._wecom_secret:
+            return {"success": False, "message": "企业微信通道未配置"}
+        return self._send_test(self._wecom_url, self._wecom_secret, "企业微信")
+
+    def test_qq(self):
+        if not self._qq_url or not self._qq_secret:
+            return {"success": False, "message": "QQ 通道未配置"}
+        return self._send_test(self._qq_url, self._qq_secret, "QQ")
 
     def test_push(self):
         if not self.get_state():
             return {"success": False, "message": "插件未启用或密钥未配置"}
-        import time as _t
         sent = []
-        title = "【测试】HermesNotify 端到端"
-        content = "MoviePilot→Hermes→企微/QQ 链路验证 " + _t.strftime("%H:%M:%S")
         if self._wecom_url and self._wecom_secret:
-            self._push(self._wecom_url, self._wecom_secret, title, content)
+            self._push(self._wecom_url, self._wecom_secret,
+                      "【测试】HermesNotify 端到端",
+                      "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
             sent.append("wecom")
         if self._qq_url and self._qq_secret:
-            self._push(self._qq_url, self._qq_secret, title, content)
+            self._push(self._qq_url, self._qq_secret,
+                       "【测试】HermesNotify 端到端",
+                       "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
             sent.append("qq")
         return {"success": True, "message": "已推送: " + ",".join(sent)}
 
@@ -90,6 +121,26 @@ class HermesNotify(_PluginBase):
                 "title": item.value,
                 "value": item.name
             })
+
+        def _btn(text: str, icon: str, color: str, api: str, okmsg: str) -> dict:
+            return {
+                'component': 'VBtn',
+                'props': {
+                    'color': color,
+                    'variant': 'tonal',
+                    'prepend-icon': icon,
+                    'block': True,
+                    'onclick': (
+                        "function(e) { window.MoviePilotAPI.get('" + api + "')"
+                        ".then(function(r) { if (r && r.success === false) {"
+                        " alert(r.message || '发送失败') } else {"
+                        " alert('" + okmsg + "') } })"
+                        ".catch(function(err) { console.error(err); alert('发送失败') }) }"
+                    ),
+                },
+                'text': text,
+            }
+
         return [
             {
                 'component': 'VForm',
@@ -213,6 +264,44 @@ class HermesNotify(_PluginBase):
                             }
                         ]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    _btn('测试企业微信', 'mdi-wechat', 'success',
+                                         'plugin/HermesNotify/test/wecom', '已发送到企业微信'),
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    _btn('测试QQ', 'mdi-qqchat', 'primary',
+                                         'plugin/HermesNotify/test/qq', '已发送到QQ'),
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    _btn('测试全部通道', 'mdi-check-all', 'warning',
+                                         'plugin/HermesNotify/test', '已发送到全部通道'),
+                                ]
+                            }
+                        ]
+                    },
                 ]
             }
         ], {
@@ -239,7 +328,9 @@ class HermesNotify(_PluginBase):
             "X-Webhook-Signature-V2": sig,
         }
 
-    def _push(self, url: str, secret: str, title: str, content: str) -> None:
+    def _push(self, url: str, secret: str, title: str, content: str) -> bool | None:
+        if not url or not secret:
+            return None
         try:
             payload = json.dumps({"title": title, "content": content},
                                  ensure_ascii=False).encode("utf-8")
@@ -248,11 +339,13 @@ class HermesNotify(_PluginBase):
                                 timeout=10)
             if res.status_code == 200:
                 logger.info(f"HermesNotify 推送成功: {url}")
-            else:
-                logger.warn(f"HermesNotify 推送失败 {url}: "
-                            f"{res.status_code} {res.text[:100]}")
+                return True
+            logger.warn(f"HermesNotify 推送失败 {url}: "
+                        f"{res.status_code} {res.text[:100]}")
+            return False
         except Exception as e:
             logger.error(f"HermesNotify 推送异常 {url}: {e}")
+            return False
 
     @eventmanager.register(EventType.NoticeMessage)
     def send(self, event: Event):
