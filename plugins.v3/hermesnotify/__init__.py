@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "Hermes Agent"
     # 作者主页
@@ -85,34 +85,34 @@ class HermesNotify(_PluginBase):
         content = f"MoviePilot→Hermes→{channel} 独立按钮链路验证 " + time.strftime("%H:%M:%S")
         ok = self._push(url, secret, title, content)
         if ok is None:
-            return {"success": False, "message": f"{channel} 通道未配置"}
-        return {"success": bool(ok), "message": f"{channel} 推送{'成功' if ok else '失败'}"}
+            return {"success": False, "message": f"{channel} 通道未配置", "data": None}
+        return {"success": bool(ok), "message": f"{channel} 推送{'成功' if ok else '失败'}", "data": None}
 
     def test_wecom(self):
         if not self._wecom_url or not self._wecom_secret:
-            return {"success": False, "message": "企业微信通道未配置"}
+            return {"success": False, "message": "企业微信通道未配置", "data": None}
         return self._send_test(self._wecom_url, self._wecom_secret, "企业微信")
 
     def test_qq(self):
         if not self._qq_url or not self._qq_secret:
-            return {"success": False, "message": "QQ 通道未配置"}
+            return {"success": False, "message": "QQ 通道未配置", "data": None}
         return self._send_test(self._qq_url, self._qq_secret, "QQ")
 
     def test_push(self):
         if not self.get_state():
-            return {"success": False, "message": "插件未启用或密钥未配置"}
+            return {"success": False, "message": "插件未启用或密钥未配置", "data": None}
         sent = []
         if self._wecom_url and self._wecom_secret:
             self._push(self._wecom_url, self._wecom_secret,
                       "【测试】HermesNotify 端到端",
                       "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
-            sent.append("wecom")
+            sent.append("企业微信")
         if self._qq_url and self._qq_secret:
             self._push(self._qq_url, self._qq_secret,
                        "【测试】HermesNotify 端到端",
                        "MoviePilot→Hermes→企微/QQ 链路验证 " + time.strftime("%H:%M:%S"))
-            sent.append("qq")
-        return {"success": True, "message": "已推送: " + ",".join(sent)}
+            sent.append("QQ")
+        return {"success": True, "message": "已推送到: " + "、".join(sent), "data": None}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         MsgTypeOptions = []
@@ -122,7 +122,14 @@ class HermesNotify(_PluginBase):
                 "value": item.name
             })
 
-        def _btn(text: str, icon: str, color: str, api: str) -> dict:
+        def _btn(text: str, icon: str, color: str, api: str, okmsg: str, failmsg: str) -> dict:
+            onclick = (
+                "function(e) { window.MoviePilotAPI.get('" + api + "')"
+                ".then(function(r) { if (r && r.success === false) {"
+                " alert(r.message || '" + failmsg + "') } else {"
+                " alert('" + okmsg + "') } })"
+                ".catch(function(err) { console.error(err); alert('" + failmsg + "') }) }"
+            )
             return {
                 'component': 'VBtn',
                 'props': {
@@ -130,14 +137,9 @@ class HermesNotify(_PluginBase):
                     'variant': 'tonal',
                     'prepend-icon': icon,
                     'block': True,
+                    'onclick': onclick,
                 },
                 'text': text,
-                'events': {
-                    'click': {
-                        'api': api,
-                        'method': 'get',
-                    }
-                },
             }
 
         return [
@@ -274,7 +276,8 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试企业微信', 'mdi-wechat', 'success',
-                                         'plugin/HermesNotify/test/wecom'),
+                                         'plugin/HermesNotify/test/wecom',
+                                         '已发送到企业微信', '企业微信发送失败'),
                                 ]
                             },
                             {
@@ -285,7 +288,8 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试QQ', 'mdi-qqchat', 'primary',
-                                         'plugin/HermesNotify/test/qq'),
+                                         'plugin/HermesNotify/test/qq',
+                                         '已发送到QQ', 'QQ发送失败'),
                                 ]
                             },
                             {
@@ -296,7 +300,8 @@ class HermesNotify(_PluginBase):
                                 },
                                 'content': [
                                     _btn('测试全部通道', 'mdi-check-all', 'warning',
-                                         'plugin/HermesNotify/test'),
+                                         'plugin/HermesNotify/test',
+                                         '已发送到全部通道', '发送失败'),
                                 ]
                             }
                         ]
