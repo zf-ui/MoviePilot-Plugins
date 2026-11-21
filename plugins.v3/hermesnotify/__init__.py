@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "Hermes Agent"
     # 作者主页
@@ -64,18 +64,21 @@ class HermesNotify(_PluginBase):
                 "path": "/test",
                 "endpoint": self.test_push,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "发送一条测试通知到已配置的通道",
             },
             {
                 "path": "/test/wecom",
                 "endpoint": self.test_wecom,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "向企业微信通道发送测试通知",
             },
             {
                 "path": "/test/qq",
                 "endpoint": self.test_qq,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "向 QQ 通道发送测试通知",
             },
         ]
