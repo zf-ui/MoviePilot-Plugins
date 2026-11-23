@@ -70,7 +70,7 @@
     "labels": "消息通知",
     "version": "1.5",
     "icon": "https://hermes-agent.nousresearch.com/img/icon.png",
-    "author": "Hermes Agent",
+    "author": "zf-ui",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {

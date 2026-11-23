@@ -22,9 +22,9 @@ class HermesNotify(_PluginBase):
     # 插件版本
     plugin_version = "1.5"
     # 插件作者
-    plugin_author = "Hermes Agent"
+    plugin_author = "zf-ui"
     # 作者主页
-    author_url = "https://github.com/NousResearch/hermes-agent"
+    author_url = "https://github.com/zf-ui"
     # 插件配置项ID前缀
     plugin_config_prefix = "hermes_notify_"
     # 加载顺序
