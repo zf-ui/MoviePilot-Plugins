@@ -5,10 +5,11 @@ from collections import namedtuple
 from concurrent.futures import as_completed, ThreadPoolExecutor
 from itertools import batched
 from pathlib import Path
-from os import makedirs
+from os import makedirs, walk
 from queue import Empty, Queue
+from re import compile as re_compile
 from secrets import token_hex
-from threading import Thread
+from threading import Lock, Thread
 from time import perf_counter, sleep
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -47,6 +48,8 @@ from .interaction import strm_cleanup_interaction
 ProcessResult = namedtuple(
     "ProcessResult", ["status", "path", "message", "data", "path_entry"]
 )
+
+_PICKCODE_IN_STRM_PATTERN = re_compile(r"(?:pickcode|pick_code)=([0-9a-zA-Z]{17})")
 
 
 class FullSyncStrmHelper:
@@ -100,6 +103,13 @@ class FullSyncStrmHelper:
         self.strm_cleanup_deferred_count = 0
         self.databasehelper = FileDbHelper()
         self.download_mediainfo_list = []
+        # 本轮全量扫描到的网盘文件 pickcode 集合，用于清理时判断 STRM 指向的网盘文件是否仍存活
+        self._pan_pickcodes: Set[str] = set()
+        # 本地 STRM 内容中已引用的 pickcode 索引（按 target_dir 缓存），用于跳过重复生成
+        self._local_pickcodes: Dict[str, Set[str]] = {}
+        self._local_pickcode_lock = Lock()
+        self.remove_pickcode_skip_count = 0
+        self.generate_pickcode_skip_count = 0
 
         self.mediaserver_helper = MediaServerRefresh(
             func_name="【全量STRM生成】",
@@ -247,6 +257,66 @@ class FullSyncStrmHelper:
                 logger.warning(
                     "【全量STRM生成】清理二次验证为 Telegram 但通知开关关闭，未发送按钮消息；请在插件界面处理待删队列"
                 )
+
+    def _local_pickcode_index(self, target_dir: str) -> Set[str]:
+        """
+        构建指定本地目录下 STRM 文件已引用的 pickcode 集合（单轮运行内缓存）
+
+        用于跳过同一网盘文件被重复生成 STRM 的情况（如本地整理后路径发生变化）
+
+        :param target_dir (str): 本地 STRM 目标目录
+
+        :return set: 该目录下 STRM 文件中已引用的 pickcode 集合
+        """
+        with self._local_pickcode_lock:
+            cached = self._local_pickcodes.get(target_dir)
+            if cached is not None:
+                return cached
+
+        pickcodes: Set[str] = set()
+        for root, _, files in walk(target_dir):
+            for name in files:
+                if not name.lower().endswith(".strm"):
+                    continue
+                try:
+                    with open(
+                        Path(root) / name, "r", encoding="utf-8", errors="ignore"
+                    ) as file:
+                        content = file.read(8192)
+                except Exception:
+                    continue
+                match = _PICKCODE_IN_STRM_PATTERN.search(content)
+                if match:
+                    pickcodes.add(match.group(1))
+
+        with self._local_pickcode_lock:
+            self._local_pickcodes.setdefault(target_dir, pickcodes)
+        return self._local_pickcodes[target_dir]
+
+    def _strm_pickcode_is_live(self, remove_path: str) -> bool:
+        """
+        判断待清理 STRM 指向的网盘文件本轮扫描是否仍然存在
+
+        STRM 文件被本地整理移动后不在网盘映射树内，路径比对会误判为失效；
+        读取其内容中的 pickcode，与本轮网盘 pickcode 集合比对。
+
+        :param remove_path (str): 待清理的本地 STRM 路径
+
+        :return bool: True 表示网盘文件仍存在，应跳过清理
+        """
+        try:
+            with open(remove_path, "r", encoding="utf-8", errors="ignore") as file:
+                content = file.read(8192)
+        except Exception:
+            return False
+        match = _PICKCODE_IN_STRM_PATTERN.search(content)
+        if match and match.group(1) in self._pan_pickcodes:
+            self.remove_pickcode_skip_count += 1
+            logger.warn(
+                f"【全量STRM生成】{remove_path} 指向的网盘文件仍存在，跳过清理"
+            )
+            return True
+        return False
 
     def __remove_unless_strm_local(self, target_dir: str) -> Thread:
         """
@@ -653,6 +723,25 @@ class FullSyncStrmHelper:
                     status="fail",
                     path=str(new_file_path),
                     message=f"错误的 pickcode 值 {pickcode}",
+                    data=None,
+                    path_entry=path_entry,
+                )
+
+            self._pan_pickcodes.add(pickcode)
+
+            local_index = self._local_pickcode_index(str(file_target_dir))
+            if pickcode in local_index:
+                self.generate_pickcode_skip_count += 1
+                self.__base_logger(
+                    "warn",
+                    "【全量STRM生成】本地已存在指向同一网盘文件的 STRM，跳过生成: %s <- %s",
+                    new_file_path,
+                    item_path,
+                )
+                return ProcessResult(
+                    status="skip",
+                    path=None,
+                    message=None,
                     data=None,
                     path_entry=path_entry,
                 )
@@ -1155,6 +1244,8 @@ class FullSyncStrmHelper:
                                 for remove_path in self.local_tree.compare_trees(
                                     self.pan_tree
                                 ):
+                                    if self._strm_pickcode_is_live(remove_path):
+                                        continue
                                     if self.cleanup_confirm_mode == "none":
                                         self.__apply_remove_unless_strm_path(remove_path)
                                     else:
