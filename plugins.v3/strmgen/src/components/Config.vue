@@ -83,6 +83,109 @@
       density="compact"
       class="mb-2"
     />
+    <!-- MediaWarp 中间件 -->
+    <div class="d-flex align-center ga-2 mb-3 mt-4">
+      <v-icon icon="mdi-server-network" size="18" color="primary" />
+      <span class="text-subtitle-2">MediaWarp 中间件（直链重定向 / 共同观影 / 客户端黑名单）</span>
+    </div>
+    <v-switch
+      v-model="form.warp_enabled"
+      label="启用 MediaWarp 中间件"
+      color="primary"
+      density="compact"
+      class="mb-2"
+    />
+    <template v-if="form.warp_enabled">
+      <v-text-field
+        v-model="form.warp_port"
+        label="中间件监听端口"
+        placeholder="9096"
+        prepend-inner-icon="mdi-numeric"
+        class="mb-2"
+      />
+      <v-text-field
+        v-model="form.warp_mediaserver"
+        label="媒体服务器名称（Emby/Jellyfin，与 MoviePilot 中配置一致）"
+        placeholder="Emby"
+        prepend-inner-icon="mdi-server"
+        hint="用于解析媒体服务器地址与 API Key；留空则不启动中间件"
+        persistent-hint
+        class="mb-2"
+      />
+      <v-switch
+        v-model="form.httpstrm_enabled"
+        label="启用 HTTPStrm 直链重定向（Strm 内容为 HTTP URL）"
+        color="primary"
+        density="compact"
+        class="mb-2"
+      />
+      <template v-if="form.httpstrm_enabled">
+        <v-switch
+          v-model="form.httpstrm_final_url"
+          label="FinalURL：重定向到最终直链（适用于公网播放局域网地址）"
+          density="compact"
+          hide-details
+          class="mb-2"
+        />
+        <v-textarea
+          v-model="form.media_strm_path"
+          label="Strm 文件前缀（每行一个，符合该前缀的 Strm 才会走 HTTPStrm）"
+          placeholder="/data"
+          rows="1"
+          auto-grow
+          class="mb-2"
+        />
+      </template>
+      <v-switch
+        v-model="form.aliststrm_enabled"
+        label="启用 AlistStrm 直链重定向（Strm 内容为 Alist 路径）"
+        color="primary"
+        density="compact"
+        class="mb-2"
+      />
+      <template v-if="form.aliststrm_enabled">
+        <v-textarea
+          v-model="form.alist_list"
+          label="Alist 服务列表（YAML）"
+          rows="5"
+          auto-grow
+          class="mb-2"
+          hint="仅适配 Alist V3；每项含 ADDR 与 Username/Password 或 Token，及 PrefixList；Token 优先级高于账号密码"
+          persistent-hint
+        />
+      </template>
+      <v-switch
+        v-model="form.video_together"
+        label="启用共同观影（VideoTogether）"
+        density="compact"
+        hide-details
+        class="mb-2"
+      />
+      <v-switch
+        v-model="form.client_filter_enabled"
+        label="启用客户端黑白名单过滤"
+        color="warning"
+        density="compact"
+        class="mb-2"
+      />
+      <template v-if="form.client_filter_enabled">
+        <v-select
+          v-model="form.client_filter_mode"
+          label="过滤模式"
+          :items="filterModes"
+          density="compact"
+          class="mb-2"
+        />
+        <v-textarea
+          v-model="form.client_filter_list"
+          label="客户端名单（每行一个）"
+          placeholder="Fileball、Infuse"
+          rows="2"
+          auto-grow
+          class="mb-2"
+        />
+      </template>
+    </template>
     <v-switch
       v-model="form.enabled"
       label="启用插件"
@@ -133,6 +236,11 @@ const props = defineProps({
 });
 const emit = defineEmits(["save"]);
 
+const filterModes = [
+  { title: "黑名单（BlackList）", value: "BlackList" },
+  { title: "白名单（WhiteList）", value: "WhiteList" },
+];
+
 const defaultForm = () => ({
   enabled: false,
   cookies: "",
@@ -142,6 +250,18 @@ const defaultForm = () => ({
   cron: "0 4 * * *",
   video_extensions: "mp4,mkv,ts,iso,avi,wmv,flv,rmvb,m2ts,mov,webm,mpg,mpeg,3gp,vob",
   delete_strm: false,
+  warp_enabled: false,
+  warp_port: "9096",
+  warp_mediaserver: "",
+  media_strm_path: "/data",
+  httpstrm_enabled: true,
+  httpstrm_final_url: true,
+  aliststrm_enabled: false,
+  alist_list: "",
+  video_together: false,
+  client_filter_enabled: false,
+  client_filter_mode: "BlackList",
+  client_filter_list: "Fileball\nInfuse",
 });
 
 const form = ref({ ...defaultForm(), ...(props.initialConfig || {}) });

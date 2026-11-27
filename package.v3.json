@@ -103,14 +103,15 @@
   },
   "StrmGen": {
     "name": "strm生成",
-    "description": "监控指定 115 网盘目录，定时递归扫描并自动生成 STRM 文件到本地输出目录，播放时通过本插件的 302 接口实时获取 115 直链。",
-    "labels": "云盘,115,STRM",
-    "version": "1.2.3",
+    "description": "监控指定 115 网盘目录，定时递归扫描并自动生成 STRM 文件到本地输出目录，播放时通过本插件的 302 接口实时获取 115 直链；内置 MediaWarp 中间件，支持 HTTPStrm/AlistStrm 直链重定向、共同观影与客户端黑名单。",
+    "labels": "云盘,115,STRM,媒体服务器",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
     "author": "zf-ui",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.3.0": "整合 MediaWarp 中间件（复用 DDSRem-Dev/MediaWarp 二进制 v0.1.12，自动下载、生成配置、随插件启停）：① HTTPStrm 直链重定向（可配置是否返回最终直链、STRM 前缀路径列表）；② AlistStrm 直链重定向（自定义 Alist 列表 YAML）；③ 共同观影 VideoTogether 开关；④ 客户端过滤（黑名单/白名单模式 + 客户端列表）。需选择已配置的 Emby/Jellyfin 媒体服务器并填写中间件端口（默认 9096）。新增依赖 ruamel.yaml、psutil。",
       "v1.2.3": "首次发布：监控 115 网盘目录定时生成 STRM，302 接口实时获取直链。"
     }
   }

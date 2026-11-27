@@ -1,9 +1,13 @@
 """strm生成 插件主入口。"""
 
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.helper.mediaserver import MediaServerHelper
 from app.plugins import _PluginBase
 from app.sdk.config import settings
 from app.sdk.logging import logger
@@ -12,6 +16,7 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 from .api import Api
 from .core import DEFAULT_VIDEO_EXTENSIONS, StrmCore, StrmGenError
 from .version import VERSION
+from .warp import MediaWarpManager
 
 
 class StrmGen(_PluginBase):
@@ -20,7 +25,8 @@ class StrmGen(_PluginBase):
     plugin_name = "strm生成"
     plugin_desc = (
         "监控指定 115 网盘目录，定时递归扫描并自动生成 STRM 文件到本地输出目录，"
-        "播放时通过本插件的 302 接口实时获取 115 直链。"
+        "播放时通过本插件的 302 接口实时获取 115 直链；内置 MediaWarp 中间件，"
+        "支持 HTTPStrm/AlistStrm 直链重定向、共同观影与客户端黑名单。"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     plugin_version = VERSION
@@ -37,6 +43,24 @@ class StrmGen(_PluginBase):
     _cron = ""
     _video_extensions = DEFAULT_VIDEO_EXTENSIONS
     _delete_strm = False
+    # MediaWarp 中间件
+    _warp_enabled = False
+    _warp_port = "9096"
+    _warp_mediaserver = ""
+    _media_strm_path = ""
+    _httpstrm_enabled = True
+    _httpstrm_final_url = True
+    _aliststrm_enabled = False
+    _alist_list = ""
+    _video_together = False
+    _client_filter_enabled = False
+    _client_filter_mode = "BlackList"
+    _client_filter_list = ""
+    _warp_manager = None
+    _warp_scheduler = None
+    _emby_type = ""
+    _emby_host = ""
+    _emby_apikey = ""
 
     def init_plugin(self, config: dict = None) -> None:
         """初始化插件，读取并规范化配置。"""
@@ -49,6 +73,19 @@ class StrmGen(_PluginBase):
             self._cron = str(config.get("cron") or "").strip()
             self._video_extensions = str(config.get("video_extensions") or "").strip()
             self._delete_strm = bool(config.get("delete_strm"))
+            # MediaWarp 中间件
+            self._warp_enabled = bool(config.get("warp_enabled", False))
+            self._warp_port = str(config.get("warp_port") or "9096").strip()
+            self._warp_mediaserver = str(config.get("warp_mediaserver") or "").strip()
+            self._media_strm_path = str(config.get("media_strm_path") or "").strip()
+            self._httpstrm_enabled = bool(config.get("httpstrm_enabled", True))
+            self._httpstrm_final_url = bool(config.get("httpstrm_final_url", True))
+            self._aliststrm_enabled = bool(config.get("aliststrm_enabled", False))
+            self._alist_list = str(config.get("alist_list") or "").strip()
+            self._video_together = bool(config.get("video_together", False))
+            self._client_filter_enabled = bool(config.get("client_filter_enabled", False))
+            self._client_filter_mode = str(config.get("client_filter_mode") or "BlackList").strip()
+            self._client_filter_list = str(config.get("client_filter_list") or "").strip()
         self._moviepilot_address = self._moviepilot_address or str(
                 settings.APP_DOMAIN or ""
             ).strip().rstrip("/")
@@ -63,6 +100,8 @@ class StrmGen(_PluginBase):
         )
         # 移除可能残留的一次性手动扫描任务
         self.remove_manual_scan_job()
+        # 启动或停止 MediaWarp 中间件
+        self._setup_mediawarp()
 
     def get_state(self) -> bool:
         """获取插件启用状态。"""
@@ -152,6 +191,18 @@ class StrmGen(_PluginBase):
             "cron": "0 4 * * *",
             "video_extensions": DEFAULT_VIDEO_EXTENSIONS,
             "delete_strm": False,
+            "warp_enabled": False,
+            "warp_port": "9096",
+            "warp_mediaserver": "",
+            "media_strm_path": "/data",
+            "httpstrm_enabled": True,
+            "httpstrm_final_url": True,
+            "aliststrm_enabled": False,
+            "alist_list": "",
+            "video_together": False,
+            "client_filter_enabled": False,
+            "client_filter_mode": "BlackList",
+            "client_filter_list": "Fileball\nInfuse",
         }
 
     @staticmethod
@@ -179,6 +230,14 @@ class StrmGen(_PluginBase):
             "cron": self._cron,
             "video_extensions": self._video_extensions,
             "delete_strm": self._delete_strm,
+            "warp_enabled": self._warp_enabled,
+            "warp_port": self._warp_port,
+            "warp_mediaserver": self._warp_mediaserver,
+            "video_together": self._video_together,
+            "client_filter_enabled": self._client_filter_enabled,
+            "client_filter_mode": self._client_filter_mode,
+            "httpstrm_enabled": self._httpstrm_enabled,
+            "aliststrm_enabled": self._aliststrm_enabled,
         }
 
     def _source_list(self) -> List[str]:
@@ -207,6 +266,109 @@ class StrmGen(_PluginBase):
     def stop_service(self) -> None:
         """停止插件服务。"""
         self.remove_manual_scan_job()
+        self._stop_mediawarp()
+
+    def _setup_mediawarp(self) -> None:
+        """按配置启动或停止 MediaWarp 中间件。"""
+        self._stop_mediawarp()
+        self._resolve_mediawarp_server()
+        if not (self._warp_enabled and self._warp_mediaserver):
+            return
+        self._warp_manager = MediaWarpManager(self.__class__.__name__)
+        try:
+            self._warp_scheduler = BackgroundScheduler(timezone=settings.TZ)
+            self._warp_scheduler.add_job(
+                func=self._start_mediawarp,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ))
+                + timedelta(seconds=2),
+                name="StrmGen启动MediaWarp",
+            )
+            self._warp_scheduler.start()
+        except Exception as e:
+            logger.error(f"【strm生成】MediaWarp 调度器启动失败: {e}", exc_info=True)
+
+    def _resolve_mediawarp_server(self) -> None:
+        """从 MoviePilot 媒体服务器配置解析 Emby/Jellyfin 连接信息。"""
+        self._emby_type = ""
+        self._emby_host = ""
+        self._emby_apikey = ""
+        if not self._warp_mediaserver:
+            return
+        try:
+            helper = MediaServerHelper()
+            services = helper.get_services(name_filters=[self._warp_mediaserver])
+            for _, server in services.items():
+                self._emby_type = server.type
+                self._emby_apikey = server.config.config.get("apikey") or ""
+                self._emby_host = server.config.config.get("host") or ""
+                self._emby_host = self._emby_host.rstrip("/")
+                if not self._emby_host.startswith("http"):
+                    self._emby_host = "http://" + self._emby_host
+                break
+        except Exception as e:
+            logger.error(f"【strm生成】解析媒体服务器失败: {e}", exc_info=True)
+
+    def _start_mediawarp(self) -> None:
+        """启动 MediaWarp 进程，捕获启动异常避免影响调度器。"""
+        try:
+            self._warp_manager.start(self._mediawarp_config())
+        except Exception:
+            logger.error(
+                "【strm生成】MediaWarp 中间件启动失败，请检查配置与磁盘空间",
+                exc_info=True,
+            )
+
+    def _stop_mediawarp(self) -> None:
+        """停止 MediaWarp 调度器与进程。"""
+        if self._warp_scheduler:
+            try:
+                self._warp_scheduler.remove_all_jobs()
+                if self._warp_scheduler.running:
+                    self._warp_scheduler.shutdown()
+            except Exception as e:
+                logger.error(f"【strm生成】关闭 MediaWarp 调度器失败: {e}")
+            self._warp_scheduler = None
+        if self._warp_manager:
+            self._warp_manager.stop()
+            self._warp_manager = None
+
+    def _mediawarp_config(self) -> Dict[str, Any]:
+        """组装传给 MediaWarpManager 的中间件配置。"""
+        return {
+            "port": self._warp_port,
+            "emby_type": self._emby_type,
+            "emby_host": self._emby_host,
+            "emby_apikey": self._emby_apikey,
+            "video_together": self._video_together,
+            "client_filter_enabled": self._client_filter_enabled,
+            "client_filter_mode": self._client_filter_mode,
+            "client_filter_list": self._client_filter_list.splitlines(),
+            "httpstrm_enabled": self._httpstrm_enabled,
+            "httpstrm_transcode": False,
+            "httpstrm_final_url": self._httpstrm_final_url,
+            "httpstrm_prefix_list": self._media_strm_path.splitlines(),
+            "aliststrm_enabled": self._aliststrm_enabled,
+            "aliststrm_transcode": True,
+            "aliststrm_raw_url": False,
+            "aliststrm_list": self._parse_alist_list(),
+        }
+
+    def _parse_alist_list(self) -> List[Dict[str, Any]]:
+        """把用户填写的 Alist 列表 YAML 文本解析为列表。"""
+        if not self._alist_list:
+            return []
+        try:
+            from ruamel.yaml import YAML
+
+            data = YAML().load(self._alist_list)
+            if isinstance(data, list):
+                return data
+            logger.warning("【strm生成】Alist 配置不是列表格式，已忽略")
+            return []
+        except Exception as e:
+            logger.error(f"【strm生成】解析 Alist 配置失败: {e}")
+            return []
 
     def scan(self) -> None:
         """执行一次扫描并持久化统计。"""
