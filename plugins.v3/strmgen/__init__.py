@@ -1,4 +1,4 @@
-"""strm生成 插件主入口。"""
+"""Strm Media 插件主入口。"""
 
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -20,13 +20,13 @@ from .warp import MediaWarpManager
 
 
 class StrmGen(_PluginBase):
-    """监控指定 115 网盘目录，定时扫描并自动生成 STRM 到本地目录。"""
+    """115 网盘 STRM 媒体桥：定时生成 STRM，并经内置 MediaWarp 中间件 302 直链播放。"""
 
-    plugin_name = "strm生成"
+    plugin_name = "Strm Media"
     plugin_desc = (
-        "监控指定 115 网盘目录，定时递归扫描并自动生成 STRM 文件到本地输出目录，"
-        "播放时通过本插件的 302 接口实时获取 115 直链；内置 MediaWarp 中间件，"
-        "支持 HTTPStrm/AlistStrm 直链重定向、共同观影与客户端黑名单。"
+        "115 网盘 STRM 媒体桥：定时扫描 115 目录生成 STRM 到本地；内置 MediaWarp 中间件，"
+        "让 Emby/Jellyfin 播放 STRM 时 302 直链到 115，支持 HTTPStrm/AlistStrm、"
+        "FinalURL、共同观影与客户端名单。"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     plugin_version = VERSION
@@ -118,7 +118,8 @@ class StrmGen(_PluginBase):
             {
                 "path": "/redirect_url",
                 "endpoint": Api.redirect_url_get,
-                "methods": ["GET"],
+                # HEAD 供 MediaWarp 的 FinalURL 探测使用（它用 HEAD 跟踪重定向链）
+                "methods": ["GET", "HEAD"],
                 "summary": "115网盘302跳转",
                 "description": "按 pickcode 实时获取 115 下载直链并 302 跳转",
                 "allow_anonymous": True,

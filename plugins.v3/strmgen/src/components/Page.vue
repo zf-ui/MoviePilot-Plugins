@@ -8,7 +8,7 @@
         </v-avatar>
         <div class="flex-grow-1 hero__text" style="min-width: 220px">
           <div class="d-flex align-center flex-wrap ga-2">
-            <span class="text-h5 font-weight-bold">strm生成</span>
+            <span class="text-h5 font-weight-bold">Strm Media</span>
             <v-chip
               v-if="config"
               size="small"
@@ -22,7 +22,7 @@
             </v-chip>
           </div>
           <div class="text-body-2 mt-1 hero__sub">
-            115 云盘目录 → 本地 STRM → 播放时实时 302 直链
+            115 网盘目录 → 本地 STRM → MediaWarp 播放时实时 302 直链
           </div>
         </div>
         <div class="d-flex ga-2">
@@ -66,7 +66,7 @@
 
     <!-- 流程 -->
     <v-sheet rounded="xl" border class="pipeline pa-4 mb-4">
-      <div class="d-flex align-center">
+      <div class="pipeline__track d-flex align-center flex-wrap">
         <template v-for="(step, i) in pipeline" :key="step.title">
           <div class="pipeline__step d-flex align-center ga-3 px-2 py-1">
             <v-avatar size="36" rounded="lg" :color="step.color" variant="tonal">
@@ -332,14 +332,22 @@ onMounted(loadStatus);
 .hero__btn {
   color: inherit;
 }
-.pipeline {
-  overflow-x: auto;
+.pipeline__track {
+  row-gap: 4px;
 }
 .pipeline__step {
   white-space: nowrap;
 }
 .pipeline__arrow {
   color: rgba(var(--v-theme-on-surface), 0.35);
+}
+@media (max-width: 960px) {
+  .pipeline__arrow {
+    display: none;
+  }
+  .pipeline__track > .pipeline__step {
+    flex: 1 1 45%;
+  }
 }
 .tile {
   background: rgb(var(--v-theme-surface));
