@@ -1,6 +1,7 @@
 """Strm Media 插件主入口。"""
 
 from datetime import datetime, timedelta
+import time
 from typing import Any, Dict, List, Optional
 
 import pytz
@@ -61,6 +62,23 @@ class StrmGen(_PluginBase):
     _emby_type = ""
     _emby_host = ""
     _emby_apikey = ""
+    # 扫描状态：idle 空闲 / queued 已排队 / running 进行中，供前端轮询「扫描完成后自动刷新」
+    _scan_state = "idle"
+    _scan_state_since = 0.0
+
+    def _set_scan_state(self, state: str) -> None:
+        """记录扫描状态与进入该状态的时刻。"""
+        self.__class__._scan_state = state
+        self.__class__._scan_state_since = time.time()
+
+    def is_scanning(self) -> bool:
+        """是否有扫描正在执行或排队中（排队超过 10 分钟视为调度器未触发，不再算扫描中）。"""
+        state = self.__class__._scan_state
+        if state == "running":
+            return True
+        if state == "queued":
+            return time.time() - self.__class__._scan_state_since < 600
+        return False
 
     def init_plugin(self, config: dict = None) -> None:
         """初始化插件，读取并规范化配置。"""
@@ -257,6 +275,7 @@ class StrmGen(_PluginBase):
         )
         if ok:
             logger.info("【Strm Media】已提交手动扫描任务")
+            self._set_scan_state("queued")
             return {"code": 0, "msg": "手动扫描任务已提交，请稍后查看状态"}
         return {"code": 500, "msg": "手动扫描任务提交失败，调度器不可用"}
 
@@ -373,31 +392,34 @@ class StrmGen(_PluginBase):
 
     def scan(self) -> None:
         """执行一次扫描并持久化统计。"""
-        if not Api.core:
-            logger.error("【Strm Media】核心组件未初始化，跳过扫描")
-            return
-        sources = self._source_list()
-        if not sources:
-            logger.warning("【Strm Media】未配置监控目录，跳过扫描")
-            return
+        self._set_scan_state("running")
         try:
-            stats = Api.core.scan(sources)
-        except StrmGenError as e:
-            logger.error(f"【Strm Media】扫描中止: {e}")
-            stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
-                     "error": str(e)}
-        except Exception as e:
-            logger.error(f"【Strm Media】扫描异常: {e}", exc_info=True)
-            stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
-                     "error": str(e)}
-        from datetime import datetime
-        stats["time"] = datetime.now().isoformat(timespec="seconds")
-        self.save_data("last_scan", stats)
-        logger.info(
-            f"【Strm Media】扫描完成: 云端 {stats.get('cloud_files')}，"
-            f"新增 {stats.get('created')}，已存在 {stats.get('skipped')}，"
-            f"删除 {stats.get('deleted')}"
-        )
+            if not Api.core:
+                logger.error("【Strm Media】核心组件未初始化，跳过扫描")
+                return
+            sources = self._source_list()
+            if not sources:
+                logger.warning("【Strm Media】未配置监控目录，跳过扫描")
+                return
+            try:
+                stats = Api.core.scan(sources)
+            except StrmGenError as e:
+                logger.error(f"【Strm Media】扫描中止: {e}")
+                stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
+                         "error": str(e)}
+            except Exception as e:
+                logger.error(f"【Strm Media】扫描异常: {e}", exc_info=True)
+                stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
+                         "error": str(e)}
+            stats["time"] = datetime.now().isoformat(timespec="seconds")
+            self.save_data("last_scan", stats)
+            logger.info(
+                f"【Strm Media】扫描完成: 云端 {stats.get('cloud_files')}，"
+                f"新增 {stats.get('created')}，已存在 {stats.get('skipped')}，"
+                f"删除 {stats.get('deleted')}"
+            )
+        finally:
+            self._set_scan_state("idle")
         self._notify_scan_result(stats)
 
     def _notify_scan_result(self, stats: Dict[str, Any]) -> None:

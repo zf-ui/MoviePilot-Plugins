@@ -9,6 +9,10 @@
         <div class="flex-grow-1 hero__text" style="min-width: 220px">
           <div class="d-flex align-center flex-wrap ga-2">
             <span class="text-h5 font-weight-bold">Strm Media</span>
+            <v-chip v-if="scanning" size="small" label variant="flat" color="info" class="hero__chip">
+              <v-progress-circular indeterminate size="12" width="2" class="mr-1" />
+              扫描中
+            </v-chip>
             <v-chip
               v-if="config"
               size="small"
@@ -162,7 +166,8 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { watchScan } from "../utils/scanWatch";
 
 const props = defineProps({
   pluginId: { type: String, required: true },
@@ -173,6 +178,8 @@ const data = ref(null);
 const loading = ref(false);
 const scanning = ref(false);
 const loadError = ref(false);
+// 扫描状态轮询句柄：提交扫描后盯着后端，结束后自动刷新统计
+let watcher = null;
 
 const config = computed(() => data.value?.config || null);
 const lastScan = computed(() => data.value?.last_scan || null);
@@ -287,6 +294,11 @@ async function loadStatus() {
     const res = await props.api.get(`plugin/${props.pluginId}/status`);
     data.value = res && (res.config || res.last_scan) ? res : null;
     loadError.value = !data.value;
+    // 页面打开时正好有（定时）扫描在跑：跟着盯到结束
+    if (res && res.scanning && !watcher) {
+      scanning.value = true;
+      startWatching();
+    }
   } catch (e) {
     data.value = null;
     loadError.value = true;
@@ -296,19 +308,34 @@ async function loadStatus() {
 }
 
 async function manualScan() {
-  if (!props.api) return;
+  if (!props.api || watcher) return;
   scanning.value = true;
   try {
     await props.api.post(`plugin/${props.pluginId}/manual_scan`);
-    setTimeout(loadStatus, 5000);
+    startWatching();
   } catch (e) {
     /* 错误由框架提示 */
-  } finally {
-    setTimeout(() => (scanning.value = false), 2000);
+    scanning.value = false;
   }
 }
 
+/** 轮询到扫描结束后刷新一次统计。 */
+function startWatching() {
+  watcher = watchScan(props.api, props.pluginId, {
+    onTick: (res) => {
+      if (res && (res.config || res.last_scan)) data.value = res;
+    },
+    onDone: (res) => {
+      watcher = null;
+      scanning.value = false;
+      if (res && (res.config || res.last_scan)) data.value = res;
+      else loadStatus();
+    },
+  });
+}
+
 onMounted(loadStatus);
+onUnmounted(() => watcher && watcher.cancel());
 </script>
 
 <style scoped>

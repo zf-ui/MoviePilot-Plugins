@@ -10,6 +10,10 @@
         <div class="flex-grow-1" style="min-width: 200px">
           <div class="d-flex align-center flex-wrap ga-2">
             <span class="text-h6 font-weight-bold">Strm Media</span>
+            <span v-if="scanning" class="hero__pill">
+              <v-progress-circular indeterminate size="11" width="2" color="white" />
+              扫描中
+            </span>
             <span class="hero__pill">
               <span class="hero__dot" :class="{ 'hero__dot--on': form.enabled }" />
               {{ form.enabled ? "运行中" : "已暂停" }}
@@ -300,7 +304,7 @@
     <div class="actions-wrap">
       <div class="actions d-flex align-center flex-wrap ga-3 px-4 py-3">
         <div class="flex-grow-1 d-flex align-center ga-2 flex-wrap" style="min-width: 200px">
-          <v-icon icon="mdi-history" size="18" class="text-medium-emphasis" />
+          <v-icon :icon="scanning ? 'mdi-sync' : 'mdi-history'" size="18" class="text-medium-emphasis" :class="{ spin: scanning }" />
           <span class="text-caption text-medium-emphasis">{{ scanSummary }}</span>
         </div>
         <span v-if="dirty" class="text-caption text-warning d-flex align-center ga-1 mr-1">
@@ -326,9 +330,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import SectionCard from "./SectionCard.vue";
 import SwitchRow from "./SwitchRow.vue";
+import { watchScan } from "../utils/scanWatch";
 
 const props = defineProps({
   pluginId: { type: String, required: true },
@@ -373,6 +378,8 @@ const dirty = computed(() => JSON.stringify(form.value) !== snapshot.value);
 const status = ref(null);
 const scanning = ref(false);
 const tab = ref("scan");
+// 扫描状态轮询句柄：提交扫描后盯着后端，结束后自动刷新统计
+let watcher = null;
 
 const cookieMasked = computed(() => {
   const c = (props.initialConfig || {}).cookies || "";
@@ -430,22 +437,38 @@ const tabs = computed(() => {
 async function loadStatus() {
   if (!props.api) return;
   try {
-    status.value = await props.api.get(`plugin/${props.pluginId}/status`);
+    const res = await props.api.get(`plugin/${props.pluginId}/status`);
+    status.value = res;
   } catch (e) {
     status.value = null;
   }
 }
 
+/** 轮询到扫描结束后刷新一次统计。 */
+function startWatching() {
+  watcher = watchScan(props.api, props.pluginId, {
+    onDone: (res) => {
+      watcher = null;
+      scanning.value = false;
+      if (res && res.last_scan) status.value = res;
+      else loadStatus();
+    },
+    onError: () => {
+      watcher = null;
+      scanning.value = false;
+    },
+  });
+}
+
 async function manualScan() {
-  if (!props.api) return;
+  if (!props.api || watcher) return;
   scanning.value = true;
   try {
     await props.api.post(`plugin/${props.pluginId}/manual_scan`);
-    setTimeout(loadStatus, 5000);
+    startWatching();
   } catch (e) {
     /* 错误由框架提示 */
-  } finally {
-    setTimeout(() => (scanning.value = false), 2000);
+    scanning.value = false;
   }
 }
 
@@ -454,7 +477,12 @@ function save() {
   emit("save", { ...form.value });
 }
 
-onMounted(loadStatus);
+onMounted(async () => {
+  await loadStatus();
+  // 打开页面时正好有（定时）扫描在跑：跟着盯到结束
+  if (status.value && status.value.scanning) startWatching();
+});
+onUnmounted(() => watcher && watcher.cancel());
 </script>
 
 <style scoped>
@@ -605,6 +633,14 @@ onMounted(loadStatus);
 }
 .tracking-wide {
   letter-spacing: 0.04em;
+}
+.spin {
+  animation: sm-spin 1.2s linear infinite;
+}
+@keyframes sm-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .indent {
   margin: 0 0 2px 14px;

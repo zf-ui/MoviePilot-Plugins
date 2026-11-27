@@ -89,7 +89,13 @@ class Api:
             return {"code": 500, "msg": "插件未完成初始化"}
         last_scan = inst.get_data("last_scan") or {}
         config = inst.get_config_snapshot()
-        return {"code": 0, "config": config, "last_scan": last_scan}
+        return {
+            "code": 0,
+            "config": config,
+            "last_scan": last_scan,
+            "scanning": bool(inst.is_scanning()),
+            "scan_state": inst._scan_state,
+        }
 
     @staticmethod
     def manual_scan_api() -> Dict[str, Any]:
