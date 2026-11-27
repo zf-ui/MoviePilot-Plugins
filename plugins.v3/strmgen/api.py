@@ -1,4 +1,4 @@
-"""strm生成 插件对外 API 端点。"""
+"""Strm Media 插件对外 API 端点。"""
 
 from asyncio import to_thread
 from typing import Any, Dict, Optional
@@ -13,7 +13,7 @@ from .core import StrmCore
 
 
 class Api:
-    """strm生成 插件 API 集合。"""
+    """Strm Media 插件 API 集合。"""
 
     # 当前插件实例与核心组件引用，由 __init__.init_plugin 维护
     instance: Optional[Any] = None
@@ -44,7 +44,7 @@ class Api:
         try:
             url, name = await to_thread(core.get_download_url, pickcode, user_agent)
         except Exception as e:
-            logger.error(f"【strm生成】获取 115 下载地址失败 {pickcode}: {e}", exc_info=True)
+            logger.error(f"【Strm Media】获取 115 下载地址失败 {pickcode}: {e}", exc_info=True)
             return Api._error(f"获取 115 下载地址失败: {e}")
 
         name = name or file_name

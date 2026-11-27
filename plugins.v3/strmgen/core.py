@@ -160,7 +160,7 @@ class StrmCore:
             except StrmGenError:
                 raise
             except Exception as e:
-                logger.error(f"【strm生成】扫描 {source} 失败: {e}", exc_info=True)
+                logger.error(f"【Strm Media】扫描 {source} 失败: {e}", exc_info=True)
                 per_source.append(
                     {"source": source, "created": created, "skipped": skipped,
                      "cloud_files": cloud_files, "error": str(e)}
@@ -171,7 +171,7 @@ class StrmCore:
                  "cloud_files": cloud_files}
             )
             logger.info(
-                f"【strm生成】{source}: 云端视频 {cloud_files}，新增 {created}，已存在 {skipped}"
+                f"【Strm Media】{source}: 云端视频 {cloud_files}，新增 {created}，已存在 {skipped}"
             )
 
         if self._delete_strm and self._dest.exists():
@@ -215,9 +215,9 @@ class StrmCore:
                 try:
                     strm_path.unlink()
                     deleted += 1
-                    logger.info(f"【strm生成】云端已不存在，删除 STRM: {strm_path}")
+                    logger.info(f"【Strm Media】云端已不存在，删除 STRM: {strm_path}")
                 except OSError as e:
-                    logger.error(f"【strm生成】删除 STRM 失败 {strm_path}: {e}")
+                    logger.error(f"【Strm Media】删除 STRM 失败 {strm_path}: {e}")
         return deleted
 
     def get_download_url(self, pickcode: str, user_agent: str) -> Tuple[str, str]:

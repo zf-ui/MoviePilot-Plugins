@@ -62,7 +62,7 @@ class MediaWarpManager:
         temp_file = os.path.join(temp_dir, "MediaWarp.tar.gz")
         try:
             self._config_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"【strm生成】正在下载 MediaWarp 二进制: {url}")
+            logger.info(f"【Strm Media】正在下载 MediaWarp 二进制: {url}")
             response = requests.get(
                 url,
                 stream=True,
@@ -74,7 +74,7 @@ class MediaWarpManager:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            logger.info("【strm生成】正在解压 MediaWarp ...")
+            logger.info("【Strm Media】正在解压 MediaWarp ...")
             with tarfile.open(temp_file, "r:gz") as tar:
                 binary_members = [
                     m for m in tar.getmembers() if m.name.endswith("MediaWarp")
@@ -101,9 +101,9 @@ class MediaWarpManager:
 
             with self._atomic_write(self._version_path) as f:
                 f.write(MEDIAWARP_VERSION)
-            logger.info(f"【strm生成】MediaWarp 已安装到 {self._binary_path}")
+            logger.info(f"【Strm Media】MediaWarp 已安装到 {self._binary_path}")
         except Exception as e:
-            logger.error(f"【strm生成】MediaWarp 安装失败: {e}", exc_info=True)
+            logger.error(f"【Strm Media】MediaWarp 安装失败: {e}", exc_info=True)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -113,11 +113,11 @@ class MediaWarpManager:
     def ensure_binary(self) -> bool:
         """确保 MediaWarp 二进制存在且版本匹配，返回是否可用。"""
         if not self._binary_path.exists():
-            logger.info("【strm生成】尝试自动下载 MediaWarp 二进制 ...")
+            logger.info("【Strm Media】尝试自动下载 MediaWarp 二进制 ...")
             self._download_and_extract()
             if not self._binary_path.exists():
                 logger.error(
-                    "【strm生成】下载失败，MediaWarp 二进制不存在，无法启动中间件"
+                    "【Strm Media】下载失败，MediaWarp 二进制不存在，无法启动中间件"
                 )
                 logger.info(
                     f"请将 MediaWarp 二进制放入 {self._base} 目录后重试"
@@ -127,7 +127,7 @@ class MediaWarpManager:
         if self._version_path.exists():
             version = self._version_path.read_text(encoding="utf-8").strip()
             if version != MEDIAWARP_VERSION:
-                logger.info("【strm生成】检测到 MediaWarp 版本变化，尝试更新 ...")
+                logger.info("【Strm Media】检测到 MediaWarp 版本变化，尝试更新 ...")
                 self._download_and_extract()
         return self._binary_path.exists()
 
@@ -184,10 +184,10 @@ class MediaWarpManager:
 
         self.process = psutil.Popen([str(self._binary_path)])
         if self.process.is_running():
-            logger.info("【strm生成】MediaWarp 中间件服务成功启动！")
+            logger.info("【Strm Media】MediaWarp 中间件服务成功启动！")
             return True
         logger.error(
-            "【strm生成】MediaWarp 进程启动后已退出，请检查 MediaWarp 日志和配置"
+            "【Strm Media】MediaWarp 进程启动后已退出，请检查 MediaWarp 日志和配置"
         )
         return False
 
@@ -197,7 +197,7 @@ class MediaWarpManager:
             try:
                 self.process.terminate()
             except Exception as e:
-                logger.error(f"【strm生成】退出 MediaWarp 进程失败：{e}")
+                logger.error(f"【Strm Media】退出 MediaWarp 进程失败：{e}")
 
     # ------------------------------------------------------------------ #
     # 内部工具
@@ -259,7 +259,7 @@ class MediaWarpManager:
             with config_path.open("r", encoding="utf-8") as file:
                 config = yaml.load(file)
         if config is None:
-            logger.warning("【strm生成】MediaWarp 配置文件为空或不存在，将按插件设置重建")
+            logger.warning("【Strm Media】MediaWarp 配置文件为空或不存在，将按插件设置重建")
             config = {}
         if not isinstance(config, MutableMapping):
             raise TypeError("MediaWarp 配置文件根节点必须是映射")

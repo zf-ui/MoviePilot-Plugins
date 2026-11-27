@@ -163,7 +163,7 @@ class StrmGen(_PluginBase):
         try:
             trigger = CronTrigger.from_crontab(self._cron)
         except ValueError as e:
-            logger.error(f"【strm生成】定时表达式无效: {self._cron} ({e})")
+            logger.error(f"【Strm Media】定时表达式无效: {self._cron} ({e})")
             return None
         return [
             {
@@ -252,11 +252,11 @@ class StrmGen(_PluginBase):
             self.__class__.__name__,
             "StrmGen_manual_scan",
             self.scan,
-            "strm生成-手动扫描",
+            "Strm Media-手动扫描",
             delay_seconds=1,
         )
         if ok:
-            logger.info("【strm生成】已提交手动扫描任务")
+            logger.info("【Strm Media】已提交手动扫描任务")
             return {"code": 0, "msg": "手动扫描任务已提交，请稍后查看状态"}
         return {"code": 500, "msg": "手动扫描任务提交失败，调度器不可用"}
 
@@ -287,7 +287,7 @@ class StrmGen(_PluginBase):
             )
             self._warp_scheduler.start()
         except Exception as e:
-            logger.error(f"【strm生成】MediaWarp 调度器启动失败: {e}", exc_info=True)
+            logger.error(f"【Strm Media】MediaWarp 调度器启动失败: {e}", exc_info=True)
 
     def _resolve_mediawarp_server(self) -> None:
         """从 MoviePilot 媒体服务器配置解析 Emby/Jellyfin 连接信息。"""
@@ -308,7 +308,7 @@ class StrmGen(_PluginBase):
                     self._emby_host = "http://" + self._emby_host
                 break
         except Exception as e:
-            logger.error(f"【strm生成】解析媒体服务器失败: {e}", exc_info=True)
+            logger.error(f"【Strm Media】解析媒体服务器失败: {e}", exc_info=True)
 
     def _start_mediawarp(self) -> None:
         """启动 MediaWarp 进程，捕获启动异常避免影响调度器。"""
@@ -316,7 +316,7 @@ class StrmGen(_PluginBase):
             self._warp_manager.start(self._mediawarp_config())
         except Exception:
             logger.error(
-                "【strm生成】MediaWarp 中间件启动失败，请检查配置与磁盘空间",
+                "【Strm Media】MediaWarp 中间件启动失败，请检查配置与磁盘空间",
                 exc_info=True,
             )
 
@@ -328,7 +328,7 @@ class StrmGen(_PluginBase):
                 if self._warp_scheduler.running:
                     self._warp_scheduler.shutdown()
             except Exception as e:
-                logger.error(f"【strm生成】关闭 MediaWarp 调度器失败: {e}")
+                logger.error(f"【Strm Media】关闭 MediaWarp 调度器失败: {e}")
             self._warp_scheduler = None
         if self._warp_manager:
             self._warp_manager.stop()
@@ -365,36 +365,36 @@ class StrmGen(_PluginBase):
             data = YAML().load(self._alist_list)
             if isinstance(data, list):
                 return data
-            logger.warning("【strm生成】Alist 配置不是列表格式，已忽略")
+            logger.warning("【Strm Media】Alist 配置不是列表格式，已忽略")
             return []
         except Exception as e:
-            logger.error(f"【strm生成】解析 Alist 配置失败: {e}")
+            logger.error(f"【Strm Media】解析 Alist 配置失败: {e}")
             return []
 
     def scan(self) -> None:
         """执行一次扫描并持久化统计。"""
         if not Api.core:
-            logger.error("【strm生成】核心组件未初始化，跳过扫描")
+            logger.error("【Strm Media】核心组件未初始化，跳过扫描")
             return
         sources = self._source_list()
         if not sources:
-            logger.warning("【strm生成】未配置监控目录，跳过扫描")
+            logger.warning("【Strm Media】未配置监控目录，跳过扫描")
             return
         try:
             stats = Api.core.scan(sources)
         except StrmGenError as e:
-            logger.error(f"【strm生成】扫描中止: {e}")
+            logger.error(f"【Strm Media】扫描中止: {e}")
             stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
                      "error": str(e)}
         except Exception as e:
-            logger.error(f"【strm生成】扫描异常: {e}", exc_info=True)
+            logger.error(f"【Strm Media】扫描异常: {e}", exc_info=True)
             stats = {"created": 0, "skipped": 0, "cloud_files": 0, "deleted": 0,
                      "error": str(e)}
         from datetime import datetime
         stats["time"] = datetime.now().isoformat(timespec="seconds")
         self.save_data("last_scan", stats)
         logger.info(
-            f"【strm生成】扫描完成: 云端 {stats.get('cloud_files')}，"
+            f"【Strm Media】扫描完成: 云端 {stats.get('cloud_files')}，"
             f"新增 {stats.get('created')}，已存在 {stats.get('skipped')}，"
             f"删除 {stats.get('deleted')}"
         )
@@ -425,8 +425,8 @@ class StrmGen(_PluginBase):
         try:
             self.post_message(
                 mtype=MessageType.Plugin,
-                title=f"✅【strm生成插件】扫描生成 STRM 文件完成",
+                title=f"✅【Strm Media插件】扫描生成 STRM 文件完成",
                 text=text,
             )
         except Exception as e:
-            logger.error(f"【strm生成】发送扫描结果通知失败: {e}")
+            logger.error(f"【Strm Media】发送扫描结果通知失败: {e}")
