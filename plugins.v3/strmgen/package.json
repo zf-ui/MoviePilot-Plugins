@@ -1,0 +1,18 @@
+{
+  "name": "moviepilot-plugin-strmgen",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vuetify": "^3.7.4"
+  },
+  "devDependencies": {
+    "@originjs/vite-plugin-federation": "^1.3.4",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "vite": "^5.4.10"
+  }
+}

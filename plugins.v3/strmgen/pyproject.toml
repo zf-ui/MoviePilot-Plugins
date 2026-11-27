@@ -1,0 +1,10 @@
+[project]
+name = "moviepilot-plugin-strmgen"
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    "p115client==0.0.9.7.8.3",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "version.VERSION" }
