@@ -1,233 +1,224 @@
 <template>
   <v-form class="strmgen-config">
-    <v-alert variant="tonal" density="compact" color="primary" class="mb-4">
-      <div class="d-flex align-start ga-2">
-        <v-icon icon="mdi-cloud-download-outline" size="20" />
-        <div class="text-body-2">
-          监控指定 115 网盘目录，定时递归扫描并生成 STRM；播放时经本插件 302 接口实时获取 115 直链。
+    <!-- 主开关横幅 -->
+    <v-sheet rounded="xl" class="hero pa-5 mb-4" :class="{ 'hero--off': !form.enabled }">
+      <div class="d-flex align-center ga-4 flex-wrap">
+        <v-avatar size="48" rounded="xl" class="hero__icon">
+          <v-icon icon="mdi-cloud-sync-outline" size="26" />
+        </v-avatar>
+        <div class="flex-grow-1" style="min-width: 200px">
+          <div class="text-h6 font-weight-bold">strm生成</div>
+          <div class="text-body-2 hero__sub">监控 115 网盘目录，定时生成 STRM；播放时经 302 接口实时取直链</div>
+        </div>
+        <div class="hero__switch d-flex align-center ga-3 px-4 py-2 rounded-pill">
+          <span class="text-body-2 font-weight-medium">{{ form.enabled ? "插件已启用" : "插件未启用" }}</span>
+          <v-switch v-model="form.enabled" color="success" hide-details density="compact" inset />
         </div>
       </div>
-    </v-alert>
+    </v-sheet>
 
-    <!-- 基础连接 -->
-    <div class="d-flex align-center ga-2 mb-3">
-      <v-icon icon="mdi-connection" size="18" color="primary" />
-      <span class="text-subtitle-2">网盘连接</span>
-    </div>
-    <v-textarea
-      v-model="form.cookies"
-      :label="`115 Cookie${cookieMasked ? '（已配置，输入新值可覆盖）' : ''}`"
-      :placeholder="cookieMasked ? '已保存 Cookie，输入新值可覆盖' : '粘贴浏览器中的 115 Cookie'"
-      rows="2"
-      auto-grow
-      class="mb-2"
-    />
+    <v-row>
+      <v-col cols="12" md="5">
+        <SectionCard icon="mdi-account-key-outline" title="网盘连接" subtitle="115 网盘身份凭证，用于列目录与取直链" class="fill-height">
+          <template #action>
+            <v-chip size="small" label variant="tonal" :color="cookieMasked ? 'success' : 'warning'">
+              {{ cookieMasked ? "已保存" : "未配置" }}
+            </v-chip>
+          </template>
+          <v-textarea
+            v-model="form.cookies"
+            :label="cookieMasked ? '115 Cookie（已保存，输入新值可覆盖）' : '115 Cookie'"
+            placeholder="粘贴浏览器中的 115 Cookie"
+            rows="4"
+            auto-grow
+          />
+        </SectionCard>
+      </v-col>
 
-    <!-- 扫描范围 -->
-    <div class="d-flex align-center ga-2 mb-3 mt-4">
-      <v-icon icon="mdi-folder-search-outline" size="18" color="primary" />
-      <span class="text-subtitle-2">扫描范围</span>
-    </div>
-    <v-textarea
-      v-model="form.source_paths"
-      label="监控的 115 目录（每行一个，以 / 开头）"
-      placeholder="/影视库/电视剧"
-      rows="2"
-      auto-grow
-      class="mb-2"
-      hint="支持多个目录，按行或逗号分隔"
-      persistent-hint
-    />
-    <v-text-field
-      v-model="form.dest_strm"
-      label="本地 STRM 输出目录"
-      placeholder="/data/strm"
-      prepend-inner-icon="mdi-file-tree-outline"
-      class="mb-2"
-    />
-    <v-text-field
-      v-model="form.video_extensions"
-      label="视频扩展名（逗号分隔）"
-      prepend-inner-icon="mdi-file-video-outline"
-      class="mb-2"
-    />
+      <v-col cols="12" md="7">
+        <SectionCard icon="mdi-folder-search-outline" title="扫描范围" subtitle="扫哪里、输出到哪里、认哪些扩展名">
+          <v-textarea
+            v-model="form.source_paths"
+            label="监控的 115 目录"
+            placeholder="/影视库/电视剧"
+            rows="2"
+            auto-grow
+            hint="每行一个或逗号分隔，以 / 开头"
+            persistent-hint
+            class="mb-1"
+          />
+          <v-text-field
+            v-model="form.dest_strm"
+            label="本地 STRM 输出目录"
+            placeholder="/data/strm"
+            prepend-inner-icon="mdi-file-tree-outline"
+          />
+          <v-text-field
+            v-model="form.video_extensions"
+            label="视频扩展名"
+            placeholder="mp4,mkv,ts"
+            prepend-inner-icon="mdi-file-video-outline"
+            hint="逗号分隔"
+            persistent-hint
+          />
+        </SectionCard>
+      </v-col>
 
-    <!-- 运行设置 -->
-    <div class="d-flex align-center ga-2 mb-3 mt-4">
-      <v-icon icon="mdi-cog-outline" size="18" color="primary" />
-      <span class="text-subtitle-2">运行设置</span>
-    </div>
-    <v-text-field
-      v-model="form.moviepilot_address"
-      label="MoviePilot 外部访问地址（STRM 链接前缀）"
-      placeholder="http://192.168.1.10:3000"
-      prepend-inner-icon="mdi-link-variant"
-      hint="播放器需能访问该地址；留空使用系统 APP_DOMAIN"
-      persistent-hint
-      class="mb-2"
-    />
-    <v-text-field
-      v-model="form.cron"
-      label="定时扫描 Cron"
-      placeholder="0 4 * * *"
-      prepend-inner-icon="mdi-clock-outline"
-      hint="默认每天 04:00"
-      persistent-hint
-      class="mb-3"
-    />
-    <v-switch
-      v-model="form.delete_strm"
-      label="同步删除云端已删除的 STRM（谨慎开启）"
-      color="error"
-      hide-details
-      density="compact"
-      class="mb-2"
-    />
-    <!-- MediaWarp 中间件 -->
-    <div class="d-flex align-center ga-2 mb-3 mt-4">
-      <v-icon icon="mdi-server-network" size="18" color="primary" />
-      <span class="text-subtitle-2">MediaWarp 中间件（直链重定向 / 共同观影 / 客户端黑名单）</span>
-    </div>
-    <v-switch
-      v-model="form.warp_enabled"
-      label="启用 MediaWarp 中间件"
-      color="primary"
-      density="compact"
-      class="mb-2"
-    />
-    <template v-if="form.warp_enabled">
-      <v-text-field
-        v-model="form.warp_port"
-        label="中间件监听端口"
-        placeholder="9096"
-        prepend-inner-icon="mdi-numeric"
-        class="mb-2"
-      />
-      <v-text-field
-        v-model="form.warp_mediaserver"
-        label="媒体服务器名称（Emby/Jellyfin，与 MoviePilot 中配置一致）"
-        placeholder="Emby"
-        prepend-inner-icon="mdi-server"
-        hint="用于解析媒体服务器地址与 API Key；留空则不启动中间件"
-        persistent-hint
-        class="mb-2"
-      />
-      <v-switch
-        v-model="form.httpstrm_enabled"
-        label="启用 HTTPStrm 直链重定向（Strm 内容为 HTTP URL）"
-        color="primary"
-        density="compact"
-        class="mb-2"
-      />
-      <template v-if="form.httpstrm_enabled">
-        <v-switch
-          v-model="form.httpstrm_final_url"
-          label="FinalURL：重定向到最终直链（适用于公网播放局域网地址）"
-          density="compact"
-          hide-details
-          class="mb-2"
-        />
-        <v-textarea
-          v-model="form.media_strm_path"
-          label="Strm 文件前缀（每行一个，符合该前缀的 Strm 才会走 HTTPStrm）"
-          placeholder="/data"
-          rows="1"
-          auto-grow
-          class="mb-2"
-        />
-      </template>
-      <v-switch
-        v-model="form.aliststrm_enabled"
-        label="启用 AlistStrm 直链重定向（Strm 内容为 Alist 路径）"
-        color="primary"
-        density="compact"
-        class="mb-2"
-      />
-      <template v-if="form.aliststrm_enabled">
-        <v-textarea
-          v-model="form.alist_list"
-          label="Alist 服务列表（YAML）"
-          rows="5"
-          auto-grow
-          class="mb-2"
-          hint="仅适配 Alist V3；每项含 ADDR 与 Username/Password 或 Token，及 PrefixList；Token 优先级高于账号密码"
-          persistent-hint
-        />
-      </template>
-      <v-switch
-        v-model="form.video_together"
-        label="启用共同观影（VideoTogether）"
-        density="compact"
-        hide-details
-        class="mb-2"
-      />
-      <v-switch
-        v-model="form.client_filter_enabled"
-        label="启用客户端黑白名单过滤"
-        color="warning"
-        density="compact"
-        class="mb-2"
-      />
-      <template v-if="form.client_filter_enabled">
-        <v-select
-          v-model="form.client_filter_mode"
-          label="过滤模式"
-          :items="filterModes"
-          density="compact"
-          class="mb-2"
-        />
-        <v-textarea
-          v-model="form.client_filter_list"
-          label="客户端名单（每行一个）"
-          placeholder="Fileball、Infuse"
-          rows="2"
-          auto-grow
-          class="mb-2"
-        />
-      </template>
-    </template>
-    <v-switch
-      v-model="form.enabled"
-      label="启用插件"
-      color="primary"
-      density="compact"
-      class="mb-4"
-    />
+      <v-col cols="12">
+        <SectionCard icon="mdi-cog-outline" title="运行设置" subtitle="链接前缀、定时计划与删除策略">
+          <v-row dense>
+            <v-col cols="12" md="6">
+              <v-text-field
+                v-model="form.moviepilot_address"
+                label="MoviePilot 外部访问地址"
+                placeholder="http://192.168.1.10:3000"
+                prepend-inner-icon="mdi-link-variant"
+                hint="STRM 链接前缀，播放器需能访问；留空使用系统 APP_DOMAIN"
+                persistent-hint
+              />
+            </v-col>
+            <v-col cols="12" sm="6" md="3">
+              <v-text-field
+                v-model="form.cron"
+                label="定时扫描 Cron"
+                placeholder="0 4 * * *"
+                prepend-inner-icon="mdi-clock-outline"
+                hint="默认每天 04:00"
+                persistent-hint
+              />
+            </v-col>
+            <v-col cols="12" sm="6" md="3">
+              <SwitchRow
+                v-model="form.delete_strm"
+                title="同步删除 STRM"
+                desc="云端删了本地也删，谨慎开启"
+                color="error"
+                class="pt-3"
+              />
+            </v-col>
+          </v-row>
+        </SectionCard>
+      </v-col>
 
-    <div class="d-flex ga-3 flex-wrap">
-      <v-btn color="primary" variant="flat" prepend-icon="mdi-content-save" @click="save">保存</v-btn>
+      <v-col cols="12">
+        <SectionCard icon="mdi-shuffle-variant" title="MediaWarp 中间件" subtitle="直链重定向、共同观影与客户端黑白名单" class="mb-0">
+          <template #action>
+            <v-chip size="small" label variant="tonal" :color="form.warp_enabled ? 'info' : 'default'">
+              {{ form.warp_enabled ? `监听 :${form.warp_port}` : "未启用" }}
+            </v-chip>
+          </template>
+
+          <SwitchRow
+            v-model="form.warp_enabled"
+            title="启用 MediaWarp 中间件"
+            desc="随插件启停，自动下载 MediaWarp 二进制并生成配置"
+          />
+
+          <v-expand-transition>
+            <div v-if="form.warp_enabled">
+              <v-row dense class="mt-2">
+                <v-col cols="12" sm="4">
+                  <v-text-field v-model="form.warp_port" label="监听端口" placeholder="9096" prepend-inner-icon="mdi-ethernet" />
+                </v-col>
+                <v-col cols="12" sm="8">
+                  <v-text-field
+                    v-model="form.warp_mediaserver"
+                    label="上游媒体服务器"
+                    placeholder="emby"
+                    prepend-inner-icon="mdi-server"
+                    hint="与 MoviePilot「媒体服务器」中的名称一致；留空则不启动"
+                    persistent-hint
+                  />
+                </v-col>
+              </v-row>
+
+              <div class="features mt-4">
+                <SwitchRow v-model="form.httpstrm_enabled" title="HTTPStrm 直链重定向" desc="Strm 内容为 HTTP URL 时生效" />
+                <v-expand-transition>
+                  <div v-if="form.httpstrm_enabled" class="pl-6 pb-2">
+                    <v-textarea
+                      v-model="form.media_strm_path"
+                      label="Strm 文件前缀"
+                      placeholder="/data"
+                      rows="1"
+                      auto-grow
+                      hint="每行一个；符合前缀的 Strm 才会走 HTTPStrm"
+                      persistent-hint
+                      density="compact"
+                    />
+                    <SwitchRow v-model="form.httpstrm_final_url" title="FinalURL" desc="重定向到最终直链，适合公网播放局域网地址" />
+                  </div>
+                </v-expand-transition>
+
+                <SwitchRow v-model="form.aliststrm_enabled" title="AlistStrm 直链重定向" desc="Strm 内容为 Alist 文件路径时生效" bordered />
+                <v-expand-transition>
+                  <div v-if="form.aliststrm_enabled" class="pl-6 pb-2">
+                    <v-textarea
+                      v-model="form.alist_list"
+                      label="Alist 服务列表（YAML）"
+                      rows="5"
+                      auto-grow
+                      hint="仅适配 Alist V3；每项含 ADDR 与 Username/Password 或 Token，及 PrefixList"
+                      persistent-hint
+                      density="compact"
+                    />
+                  </div>
+                </v-expand-transition>
+
+                <SwitchRow v-model="form.video_together" title="共同观影" desc="VideoTogether，网页端同步播放进度" bordered />
+                <SwitchRow v-model="form.client_filter_enabled" title="客户端黑白名单" desc="只对名单内 / 外的客户端生效" color="warning" bordered />
+                <v-expand-transition>
+                  <div v-if="form.client_filter_enabled" class="pl-6 pb-2">
+                    <v-row dense>
+                      <v-col cols="12" sm="4">
+                        <v-select
+                          v-model="form.client_filter_mode"
+                          label="过滤模式"
+                          :items="filterModes"
+                          density="compact"
+                          hide-details
+                        />
+                      </v-col>
+                      <v-col cols="12" sm="8">
+                        <v-textarea
+                          v-model="form.client_filter_list"
+                          label="客户端名单"
+                          placeholder="Fileball、Infuse"
+                          rows="1"
+                          auto-grow
+                          density="compact"
+                          hide-details
+                        />
+                      </v-col>
+                    </v-row>
+                  </div>
+                </v-expand-transition>
+              </div>
+            </div>
+          </v-expand-transition>
+        </SectionCard>
+      </v-col>
+    </v-row>
+
+    <!-- 操作栏 -->
+    <v-sheet rounded="xl" border class="actions pa-3 px-4 mt-4 d-flex align-center flex-wrap ga-3">
+      <div class="flex-grow-1 d-flex align-center ga-2 flex-wrap" style="min-width: 200px">
+        <v-icon icon="mdi-history" size="18" class="text-medium-emphasis" />
+        <span class="text-caption text-medium-emphasis">{{ scanSummary }}</span>
+      </div>
+      <v-btn variant="text" size="small" prepend-icon="mdi-refresh" @click="loadStatus">刷新</v-btn>
       <v-btn color="secondary" variant="tonal" prepend-icon="mdi-play-circle-outline" :loading="scanning" @click="manualScan">
         立即扫描
       </v-btn>
-      <v-btn variant="text" prepend-icon="mdi-refresh" @click="loadStatus">刷新状态</v-btn>
-    </div>
-
-    <v-card v-if="status" variant="tonal" class="mt-4">
-      <v-card-title class="text-subtitle-1 d-flex align-center ga-2">
-        <v-icon icon="mdi-chart-box-outline" size="18" />
-        最近扫描
-      </v-card-title>
-      <v-card-text>
-        <template v-if="statusText">
-          <div class="text-body-2 mb-1">{{ statusText }}</div>
-        </template>
-        <template v-if="sourceLines.length">
-          <v-divider class="my-2" />
-          <div v-for="line in sourceLines" :key="line" class="d-flex ga-1 align-center text-caption text-medium-emphasis py-1">
-            <v-icon icon="mdi-folder-outline" size="14" />
-            {{ line }}
-          </div>
-        </template>
-        <template v-else>
-          <div class="text-caption text-medium-emphasis">尚无扫描记录</div>
-        </template>
-      </v-card-text>
-    </v-card>
+      <v-btn color="primary" variant="flat" prepend-icon="mdi-content-save" @click="save">保存</v-btn>
+    </v-sheet>
   </v-form>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from "vue";
+import SectionCard from "./SectionCard.vue";
+import SwitchRow from "./SwitchRow.vue";
 
 const props = defineProps({
   pluginId: { type: String, required: true },
@@ -273,27 +264,12 @@ const cookieMasked = computed(() => {
   return c.length > 20;
 });
 
-const statusText = computed(() => {
+const scanSummary = computed(() => {
   const last = status.value?.last_scan;
-  if (!last || !last.time) return "";
-  const parts = [
-    `时间：${last.time}`,
-    `云端视频：${last.cloud_files ?? 0}`,
-    `新增：${last.created ?? 0}`,
-    `已存在：${last.skipped ?? 0}`,
-    `删除：${last.deleted ?? 0}`,
-  ];
-  if (last.error) parts.push(`错误：${last.error}`);
-  return parts.join("  |  ");
-});
-
-const sourceLines = computed(() => {
-  const sources = status.value?.last_scan?.sources || [];
-  return sources.map(
-    (s) =>
-      `${s.source}：云端 ${s.cloud_files ?? 0}，新增 ${s.created ?? 0}，` +
-      `已存在 ${s.skipped ?? 0}${s.error ? `，错误：${s.error}` : ""}`
-  );
+  if (!last || !last.time) return "尚无扫描记录";
+  const parts = [last.time, `云端 ${last.cloud_files ?? 0}`, `新增 ${last.created ?? 0}`, `已存在 ${last.skipped ?? 0}`];
+  if (last.deleted) parts.push(`删除 ${last.deleted}`);
+  return parts.join(" · ");
 });
 
 async function loadStatus() {
@@ -324,3 +300,31 @@ function save() {
 
 onMounted(loadStatus);
 </script>
+
+<style scoped>
+.hero {
+  background: linear-gradient(135deg, rgb(var(--v-theme-primary)) 0%, rgb(var(--v-theme-secondary)) 100%);
+  color: rgb(var(--v-theme-on-primary));
+}
+.hero--off {
+  background: linear-gradient(135deg, rgba(var(--v-theme-on-surface), 0.45), rgba(var(--v-theme-on-surface), 0.25));
+  color: rgb(var(--v-theme-on-surface));
+}
+.hero__icon,
+.hero__switch {
+  background: rgba(255, 255, 255, 0.18);
+}
+.hero__sub {
+  opacity: 0.85;
+}
+.features {
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.08);
+  border-radius: 12px;
+  padding: 0 16px;
+}
+.actions {
+  position: sticky;
+  bottom: 8px;
+  background: rgb(var(--v-theme-surface));
+}
+</style>
