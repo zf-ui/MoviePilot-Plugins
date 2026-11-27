@@ -300,9 +300,9 @@ def _enabled_plugin(host, **overrides):
     return plugin
 
 
-def _record(date, success=True, money="100", content="签到成功"):
+def _record(date, success=True, money="100", content="签到成功", reward=None, streak=None):
     """构造一条签到历史记录。"""
-    return {
+    record = {
         "date": date,
         "username": "tester",
         "totalContinuousCheckIn": 1,
@@ -310,6 +310,11 @@ def _record(date, success=True, money="100", content="签到成功"):
         "content": content,
         "success": success,
     }
+    if reward is not None:
+        record["reward"] = reward
+    if streak is not None:
+        record["streak"] = streak
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +593,19 @@ def test_analyze_history_on_empty_input(host):
 
 
 def test_analyze_history_success_rate_and_money(host):
-    """成功率与大洋统计应按成功记录计算。"""
+    """累计/平均大洋按本次奖励计算，余额不参与求和。
+
+    ``money`` 是签到后的账户余额，旧实现把余额相加（100+200=300）当成「累计大洋」，
+    实际两天的奖励只有 3+7=10。新记录读 ``reward``，旧记录没有该字段时从响应原文解析。
+    """
     plugin = _enabled_plugin(host)
     history = [
-        _record("2026-09-01 07:00:00", money="100"),
-        _record("2026-09-02 08:00:00", money="200"),
+        _record("2026-09-01 07:00:00", money="100", reward=3),
+        _record(
+            "2026-09-02 08:00:00",
+            money="107",
+            content="恭喜你签到成功!获得随机奖励 大洋 7 .",
+        ),
         _record("2026-09-03 09:00:00", success=False, money="0", content="未获取到用户名"),
     ]
 
@@ -602,9 +615,24 @@ def test_analyze_history_success_rate_and_money(host):
     assert stats["success_days"] == 2
     assert stats["fail_days"] == 1
     assert stats["success_rate"] == "66.7%"
-    assert stats["total_money"] == 300
-    assert stats["avg_money"] == "150.0"
+    assert stats["total_money"] == 10
+    assert stats["avg_money"] == "5.0"
     assert stats["best_time"] == "07:00"
+
+
+def test_analyze_history_money_ignores_failed_records(host):
+    """失败记录的余额与未知奖励都不计入大洋统计。"""
+    plugin = _enabled_plugin(host)
+    history = [
+        _record("2026-09-01 07:00:00", money="100", reward=5),
+        _record("2026-09-02 07:00:00", money="105", content="签到成功"),
+        _record("2026-09-03 07:00:00", success=False, money="105", content="Cookie 已失效"),
+    ]
+
+    stats = plugin._analyze_history(history)
+
+    assert stats["total_money"] == 5
+    assert stats["avg_money"] == "5.0"
 
 
 def test_analyze_history_tracks_continuous_streak(host):
@@ -623,6 +651,41 @@ def test_analyze_history_tracks_continuous_streak(host):
 
     assert stats["max_continuous"] == 3
     assert stats["current_continuous"] == 2
+
+
+def test_analyze_history_current_streak_uses_site_value(host):
+    """历史被裁剪后，当前连续天数以站点给出的 streak 为底数，不被历史长度截短。"""
+    plugin = _enabled_plugin(host)
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    history = [
+        _record(f"{yesterday} 07:00:00", streak=22),
+        _record(f"{today} 07:00:00", streak=23),
+    ]
+
+    stats = plugin._analyze_history(history)
+
+    assert stats["current_continuous"] == 23
+
+
+def test_streak_pattern_tolerates_missing_day_suffix(host):
+    """连续签到文案没有「天」字时也能读出天数。"""
+    module = host.module
+    page = "<p>您已经连续签到: <b>23</b></p>"
+
+    assert module._pick_int(page, module.STREAK_PATTERN) == 23
+
+
+def test_streak_hint_extracts_related_text(host):
+    """读不到天数时，诊断片段给出页面里与连续/累计签到相关的原文。"""
+    module = host.module
+    page = "<p>您已经连续签到 23 天</p><p>本月已累计签到: 23</p>"
+
+    hint = module.CnlangSigninV3._streak_hint(page)
+
+    assert "连续签到 23 天" in hint
+    assert "本月已累计签到" in hint
+    assert module.CnlangSigninV3._streak_hint("") == "无"
 
 
 def test_is_success_falls_back_to_legacy_content(host):

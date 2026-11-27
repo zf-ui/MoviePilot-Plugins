@@ -110,7 +110,10 @@ SIGN_MOOD = "kx"
 # 「连续签到」在不同模板里有「您已经连续签到 N 天」「连续签到：N 天」「已连续签到 N 天」
 # 几种写法，去标签后统一成「连续签到 + 可选冒号 + 数字 + 天」即可全部覆盖。
 MONTH_SIGNS_PATTERN = r"本月已累计签到\s*[:：]?\s*(\d+)"
-STREAK_PATTERN = r"连续签到\s*[:：]?\s*(\d+)\s*天"
+# 「天」不作为必要条件：实战里签到后的页面拿不到连续天数（记录里 streak 一直是 0），
+# 站点文案很可能没有「天」字；放宽后读不到时由诊断日志把页面原文片段打出来。
+STREAK_PATTERN = r"连续签到\s*[:：]?\s*(\d+)"
+STREAK_HINT_PATTERN = r".{0,24}(?:连续|累计).{0,32}"
 # 签到响应里的奖励金额，例如「恭喜你签到成功!获得随机奖励 大洋 7 .」
 REWARD_PATTERN = r"随机奖励\s*大洋\s*(\d+)"
 
@@ -343,8 +346,9 @@ BQL_SUBMIT_SCRIPT = r"""
 
   // 连续签到天数：先去标签再匹配，站点把数字包在 <b> 里、冒号和空格也不统一
   const plainRoot = root.replace(/<[^>]+>/g, " ");
-  const streakRoot = plainRoot.match(/连续签到\s*[:：]?\s*(\d+)\s*天/);
+  const streakRoot = plainRoot.match(/连续签到\s*[:：]?\s*(\d+)/);
   if (streakRoot) out.streak = streakRoot[1];
+  out.streakHint = (plainRoot.match(/.{0,24}(?:连续|累计).{0,32}/g) || []).slice(0, 4).join(" | ");
 
   // A) 是否还停在「整页挑战」。
   //
@@ -478,8 +482,10 @@ BQL_SUBMIT_SCRIPT = r"""
     const after = await fetch("__SIGN_PAGE_URL__", {credentials: "include"});
     const afterHtml = await after.text();
     const afterText = afterHtml.replace(/<[^>]+>/g, " ");
-    const streakMatch = afterText.match(/连续签到\s*[:：]?\s*(\d+)\s*天/);
+    const streakMatch = afterText.match(/连续签到\s*[:：]?\s*(\d+)/);
     if (streakMatch) out.streak = streakMatch[1];
+    else if (out.streak) out.streak = String(Number(out.streak) + 1);  // 提交前的页面是昨天的值
+    out.streakHint = (afterText.match(/.{0,24}(?:连续|累计).{0,32}/g) || []).slice(0, 4).join(" | ") || out.streakHint;
     const monthMatch = afterText.match(/本月已累计签到\s*[:：]?\s*(\d+)/);
     if (monthMatch) out.month = monthMatch[1];
   } catch (err) {}
@@ -1291,7 +1297,7 @@ class CnlangSigninV3(_PluginBase):
         "/refs/heads/main/icons/cnlang.png"
     )
     # 插件版本，必须与 package.v3.json 中的 version 保持一致
-    plugin_version = "3.9.6"
+    plugin_version = "3.9.7"
     # 插件作者（本仓库维护者；不再沿用上游 xijin285）
     plugin_author = "zf-ui"
     # 作者主页
@@ -1800,6 +1806,8 @@ class CnlangSigninV3(_PluginBase):
         streak = _pick_int(after_page, STREAK_PATTERN) or 0
         if streak:
             logger.info(f"连续签到：{streak} 天")
+        else:
+            logger.warning(f"签到后回读未取到连续签到天数，页面相关文案：{self._streak_hint(after_page)}")
         month_after = _pick_int(after_page, MONTH_SIGNS_PATTERN)
         if month_after:
             total_signs = max(total_signs, month_after)
@@ -2927,6 +2935,8 @@ class CnlangSigninV3(_PluginBase):
         logger.info(f"Browserless 签到响应：{content}")
         if streak:
             logger.info(f"Browserless 连续签到：{streak} 天")
+        else:
+            logger.warning(f"云端浏览器未取到连续签到天数，页面相关文案：{page.get('streakHint') or '无'}")
         return self._record_success(
             username=username,
             total_signs=total_signs,
@@ -3740,11 +3750,14 @@ class CnlangSigninV3(_PluginBase):
             }
         )
         history = self._prune_history(history)
-        self.save_data(KEY_HISTORY, history)
 
         # 站点没给出连续签到天数时，用历史记录推算，别让通知里固定显示 0 天
         if not streak:
             streak = int(self._analyze_history(history).get("current_continuous") or 0)
+            # 推算值也写回历史：详情页「连续签到次数」列与后续推算都以它为基准，
+            # 否则每条记录都存 0，那一列只能回落到「本月累计」，看着像连续天数其实是月累计。
+            history[-1]["streak"] = streak
+        self.save_data(KEY_HISTORY, history)
 
         detail = (
             f"签到账号：{username}\n"
@@ -4485,13 +4498,17 @@ class CnlangSigninV3(_PluginBase):
         success_days = len(success_records)
         success_rate = f"{success_days / total_days * 100:.1f}%"
 
-        money_values = [
-            int(record["money"])
-            for record in history
-            if str(record.get("money", "")).isdigit()
+        # 「累计大洋」是签到**拿到**的奖励之和，不是余额之和：历史里的 money 是
+        # 每次签到后的账户余额（320、324、328…），直接相加会虚高成余额×天数。
+        # 优先读 reward 字段，旧记录没有该字段时从响应原文里解析「随机奖励 大洋 N」。
+        reward_values = [
+            reward
+            for reward in (self._record_reward(record) for record in success_records)
+            if reward is not None
         ]
-        total_money = sum(money_values)
-        avg_money = f"{total_money / success_days:.1f}" if success_days else 0
+        reward_days = len(reward_values)
+        total_money = sum(reward_values)
+        avg_money = f"{total_money / reward_days:.1f}" if reward_days else 0
 
         # 成功签到的日期集合（同一天多次签到只算一天），按时间倒序
         success_day_list = sorted(
@@ -4517,7 +4534,10 @@ class CnlangSigninV3(_PluginBase):
             previous_day = day
             max_continuous = max(max_continuous, streak)
 
-        # 当前连续签到：从最新一条成功记录起逐日回溯，遇到断档即停止
+        # 当前连续签到：从最新一条成功记录起逐日回溯，遇到断档即停止。
+        # 历史只保留 N 天，纯按历史数会把站点上更长的连续天数截短（站点连续 23 天、
+        # 历史只剩 14 条时显示 14）；因此以最新一条记录里站点给出的 streak 为底数，
+        # 再与历史回溯结果取大。
         current_continuous = 0
         expected_day = None
         for day in success_day_list:
@@ -4528,6 +4548,15 @@ class CnlangSigninV3(_PluginBase):
             else:
                 break
             expected_day = day - timedelta(days=1)
+        site_streak = 0
+        if success_day_list:
+            newest_day = success_day_list[0]
+            for record in success_records:
+                record_date = self._parse_date(record.get("date"))
+                value = str(record.get("streak") or "")
+                if record_date is not None and record_date.date() == newest_day and value.isdigit():
+                    site_streak = max(site_streak, int(value))
+        current_continuous = max(current_continuous, site_streak)
 
         # 统计签到成功次数最多的时段
         hour_stats: Dict[int, int] = {}
@@ -4552,6 +4581,20 @@ class CnlangSigninV3(_PluginBase):
             "best_time": f"{best_hour:02d}:00" if best_hour is not None else "无",
             "month_stats": {},
         }
+
+    @staticmethod
+    def _record_reward(record: Dict[str, Any]) -> Optional[int]:
+        """取一条成功记录的本次奖励大洋；没有 ``reward`` 字段时从响应原文解析。"""
+        value = str(record.get("reward") or "")
+        if value.isdigit():
+            return int(value)
+        return _pick_int(record.get("content") or "", REWARD_PATTERN)
+
+    @staticmethod
+    def _streak_hint(text: str) -> str:
+        """截取页面里与连续/累计签到相关的文案片段，供读不到天数时排查。"""
+        plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or ""))
+        return " | ".join(re.findall(STREAK_HINT_PATTERN, plain)[:4]) or "无"
 
     # ------------------------------------------------------------------
     # 配置页面
