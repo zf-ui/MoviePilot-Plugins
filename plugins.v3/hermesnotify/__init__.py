@@ -20,7 +20,7 @@ class HermesNotify(_PluginBase):
     # 插件图标
     plugin_icon = "https://hermes-agent.nousresearch.com/img/icon.png"
     # 插件版本
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "zf-ui"
     # 作者主页
@@ -426,8 +426,8 @@ class HermesNotify(_PluginBase):
             return
 
         content = f"{text}\n{link}" if link else text
-        channel = msg_type.value if msg_type else ""
-        full_title = f"{title}（{channel}）" if channel else title
+        # 标题保持原样，不再拼接消息类型后缀（如「（插件）」）
+        full_title = title
 
         if self._wecom_enabled and self._wecom_url and self._wecom_secret:
             self._push(self._wecom_url, self._wecom_secret, full_title, content)
